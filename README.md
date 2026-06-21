@@ -2,8 +2,8 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.1-blue)
-![Phase](https://img.shields.io/badge/phase-1%2F14-yellow)
+![Version](https://img.shields.io/badge/version-0.0.2-blue)
+![Phase](https://img.shields.io/badge/phase-2%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
@@ -27,7 +27,8 @@ software-rendered, all on a stack written end-to-end in asm.
 | # | Phase | Status |
 |---|-------|--------|
 | 1 | Connection setup + Unix socket bind | ✓ shipped |
-| 2 | DRM/KMS backend (legacy modeset) | next |
+| 2 | DRM/KMS probe (read-only ioctls, no master) | ✓ shipped |
+| 2b | DRM/KMS modeset (CreateDumb + AddFB + SetCRTC, needs VT) | next |
 | 3 | evdev input + KeyPress / Motion routing | |
 | 4 | Window tree + Configure / Reparent / SubstructureRedirect | |
 | 5 | Atoms + GetProperty / ChangeProperty / selections | |
@@ -64,6 +65,30 @@ emits a structurally valid setup reply describing:
 Subsequent requests are logged to stderr (`req opcode=N len=M`) and
 silently dropped. Real dispatch lands in phase 4 once the wire is
 proven and the DRM backend is in.
+
+## Phase 2: DRM/KMS probe
+
+```bash
+./frame --probe
+```
+
+Opens `/dev/dri/cardN`, enumerates resources, lists connectors:
+
+```
+frame: opened /dev/dri/card1, driver i915 v1.6.0
+frame: resources: 4 CRTCs, 5 connectors, 21 encoders
+frame: framebuffer range 0x0 to 16384x16384
+  connector 507: eDP-1 → connected, 1 modes, preferred 1920x1200 @ 120 Hz
+  connector 516: DisplayPort-1 → disconnected, 0 modes
+  ...
+```
+
+Uses three read-only ioctls — `DRM_IOCTL_VERSION`,
+`DRM_IOCTL_MODE_GETRESOURCES`, `DRM_IOCTL_MODE_GETCONNECTOR`. None
+require DRM master, so this runs safely alongside an active Xorg.
+Proves the kernel-interface struct layouts and ioctl encoding ahead
+of phase 2b's `CREATE_DUMB` + `ADDFB` + `SETCRTC` (which do need
+master, hence a VT for testing).
 
 ## How it's built
 

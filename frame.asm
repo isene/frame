@@ -39,10 +39,33 @@ DEFAULT REL
 %define SYS_ACCEPT      43
 %define SYS_GETSOCKNAME 51
 %define SYS_RECVFROM    45
+%define SYS_IOCTL       16
 
 %define AF_UNIX         1
 %define SOCK_STREAM     1
 %define DEFAULT_DISPLAY 7
+%define O_RDWR          0x2
+
+; ---- DRM/KMS ABI ----------------------------------------------------------
+; Linux ioctl encoding: (dir<<30) | (size<<16) | (type<<8) | nr
+; type 'd' = 0x64, dir _IOWR = 3.
+;
+; struct drm_version            = 64 bytes  → 0xC0406400
+; struct drm_mode_card_res      = 64 bytes  → 0xC04064A0
+; struct drm_mode_get_connector = 80 bytes  → 0xC05064A7
+%define DRM_IOCTL_VERSION              0xC0406400
+%define DRM_IOCTL_MODE_GETRESOURCES    0xC04064A0
+%define DRM_IOCTL_MODE_GETCONNECTOR    0xC05064A7
+
+%define DRM_MODE_CONNECTED      1
+%define DRM_MODE_DISCONNECTED   2
+%define DRM_MODE_UNKNOWNCONN    3
+
+; drm_mode_modeinfo size — 68 bytes per mode
+%define DRM_MODE_INFO_SIZE      68
+%define DRM_MAX_MODES           64
+%define DRM_MAX_PROPS           64
+%define DRM_MAX_IDS             32
 
 ; ---- X11 protocol constants ------------------------------------------------
 %define X_PROTO_MAJOR        11
@@ -106,6 +129,27 @@ log_scratch:        resb 64
 req_buf:            resb 65536
 req_pos:            resq 1               ; how many bytes are buffered
 
+; ---- DRM probe state ------------------------------------------------------
+drm_fd:             resq 1
+; drm_version struct (64 bytes) + name/date/desc buffers
+drm_version_buf:    resb 64
+drm_name_buf:       resb 64
+drm_date_buf:       resb 64
+drm_desc_buf:       resb 128
+; drm_mode_card_res (64 bytes) + ID arrays
+drm_res_buf:        resb 64
+drm_fb_ids:         resd DRM_MAX_IDS
+drm_crtc_ids:       resd DRM_MAX_IDS
+drm_conn_ids:       resd DRM_MAX_IDS
+drm_enc_ids:        resd DRM_MAX_IDS
+; drm_mode_get_connector (80 bytes) + dependent arrays
+drm_conn_buf:       resb 80
+drm_modes_buf:      resb (DRM_MODE_INFO_SIZE * DRM_MAX_MODES)
+drm_enc_arr:        resd DRM_MAX_IDS
+drm_props_arr:      resd DRM_MAX_PROPS
+drm_propvals_arr:   resq DRM_MAX_PROPS
+drm_card_path:      resb 32
+
 ; ============================================================================
 ; RODATA — setup reply template, vendor string, log prefixes
 ; ============================================================================
@@ -130,6 +174,89 @@ log_bind_fail_len  equ $ - log_bind_fail
 log_setup_bad:      db "frame: malformed setup request, hanging up", 10
 log_setup_bad_len  equ $ - log_setup_bad
 
+; ---- probe-mode strings ---------------------------------------------------
+probe_card_pre:     db "/dev/dri/card", 0
+probe_open_fail:    db "frame: no DRM card under /dev/dri/cardN found", 10
+probe_open_fail_len equ $ - probe_open_fail
+probe_open_ok_pre:  db "frame: opened ", 0
+probe_open_ok_len   equ $ - probe_open_ok_pre - 1
+probe_version_pre:  db ", driver ", 0
+probe_version_pre_len equ $ - probe_version_pre - 1
+probe_version_sep:  db " v", 0
+probe_version_sep_len equ $ - probe_version_sep - 1
+probe_version_dot:  db "."
+probe_version_nl:   db 10
+probe_res_pre:      db "frame: resources: ", 0
+probe_res_pre_len   equ $ - probe_res_pre - 1
+probe_res_crtc:     db " CRTCs, ", 0
+probe_res_crtc_len  equ $ - probe_res_crtc - 1
+probe_res_conn:     db " connectors, ", 0
+probe_res_conn_len  equ $ - probe_res_conn - 1
+probe_res_enc:      db " encoders", 10
+probe_res_enc_len   equ $ - probe_res_enc
+probe_res_size:     db "frame: framebuffer range ", 0
+probe_res_size_len  equ $ - probe_res_size - 1
+probe_res_to:       db " to ", 0
+probe_res_to_len    equ $ - probe_res_to - 1
+probe_res_x:        db "x", 0
+probe_conn_pre:     db "  connector ", 0
+probe_conn_pre_len  equ $ - probe_conn_pre - 1
+probe_conn_type:    db ": ", 0
+probe_conn_type_len equ $ - probe_conn_type - 1
+probe_conn_arr:     db " ", 0xE2, 0x86, 0x92, " ", 0   ; " → "
+probe_conn_arr_len  equ $ - probe_conn_arr - 1
+probe_conn_modes:   db ", ", 0
+probe_conn_modes_len equ $ - probe_conn_modes - 1
+probe_conn_mcount:  db " modes", 0
+probe_conn_mcount_len equ $ - probe_conn_mcount - 1
+probe_conn_pref:    db ", preferred ", 0
+probe_conn_pref_len equ $ - probe_conn_pref - 1
+probe_conn_at:      db " @ ", 0
+probe_conn_at_len   equ $ - probe_conn_at - 1
+probe_conn_hz:      db " Hz", 10
+probe_conn_hz_len   equ $ - probe_conn_hz
+probe_conn_nl:      db 10
+probe_state_conn:  db "connected", 0
+probe_state_disc:  db "disconnected", 0
+probe_state_unk:   db "unknown", 0
+ioctl_err:         db "frame: ioctl failed", 10
+ioctl_err_len      equ $ - ioctl_err
+
+; Connector type names — indexed by drm_mode_get_connector.connector_type.
+; (drm_mode.h, "DRM_MODE_CONNECTOR_*", values 0..21.)
+conn_type_0:  db "Unknown", 0
+conn_type_1:  db "VGA", 0
+conn_type_2:  db "DVI-I", 0
+conn_type_3:  db "DVI-D", 0
+conn_type_4:  db "DVI-A", 0
+conn_type_5:  db "Composite", 0
+conn_type_6:  db "SVIDEO", 0
+conn_type_7:  db "LVDS", 0
+conn_type_8:  db "Component", 0
+conn_type_9:  db "9PinDIN", 0
+conn_type_10: db "DisplayPort", 0
+conn_type_11: db "HDMI-A", 0
+conn_type_12: db "HDMI-B", 0
+conn_type_13: db "TV", 0
+conn_type_14: db "eDP", 0
+conn_type_15: db "Virtual", 0
+conn_type_16: db "DSI", 0
+conn_type_17: db "DPI", 0
+conn_type_18: db "Writeback", 0
+conn_type_19: db "SPI", 0
+conn_type_20: db "USB", 0
+conn_type_unknown: db "Type?", 0
+
+align 8
+conn_type_table:
+    dq conn_type_0,  conn_type_1,  conn_type_2,  conn_type_3
+    dq conn_type_4,  conn_type_5,  conn_type_6,  conn_type_7
+    dq conn_type_8,  conn_type_9,  conn_type_10, conn_type_11
+    dq conn_type_12, conn_type_13, conn_type_14, conn_type_15
+    dq conn_type_16, conn_type_17, conn_type_18, conn_type_19
+    dq conn_type_20
+conn_type_max equ 20
+
 ; ============================================================================
 ; TEXT
 ; ============================================================================
@@ -146,6 +273,20 @@ _start:
     cmp rax, 2
     jl .main
     mov rdi, [rsp + 16]
+    ; "--probe" → exercise DRM enumeration and exit, leave the listening
+    ; server untouched. Lets us validate the kernel interface without
+    ; having to drop the running Xorg.
+    cmp dword [rdi], '--pr'
+    jne .check_num
+    cmp dword [rdi + 4], 'obe'
+    jne .check_num
+    cmp byte [rdi + 7], 0
+    jne .check_num
+    call do_probe
+    xor edi, edi
+    mov rax, SYS_EXIT
+    syscall
+.check_num:
     call atoi_or_default
     mov [display_num], rax
 
@@ -681,3 +822,459 @@ write_stderr:
     mov rdi, 2
     syscall
     ret
+
+; ============================================================================
+; write_str_stderr — rsi = NUL-terminated C-string. Writes everything up to
+; the NUL.
+; ============================================================================
+write_str_stderr:
+    push rbx
+    push rsi
+    mov rbx, rsi
+    xor ecx, ecx
+.ws_len:
+    cmp byte [rbx + rcx], 0
+    je .ws_emit
+    inc rcx
+    jmp .ws_len
+.ws_emit:
+    mov rdx, rcx
+    pop rsi
+    call write_stderr
+    pop rbx
+    ret
+
+; ============================================================================
+; write_u64_stderr — rax = number. Writes it as decimal.
+; ============================================================================
+write_u64_stderr:
+    call format_u64
+    mov rsi, log_scratch
+    mov edx, eax
+    jmp write_stderr
+
+; ============================================================================
+; do_probe — phase 2 DRM/KMS enumeration. Opens /dev/dri/cardN (first one
+; that accepts), runs DRM_IOCTL_VERSION + MODE_GETRESOURCES + per-connector
+; MODE_GETCONNECTOR, logs everything to stderr, closes the fd, returns.
+; All ioctls are read-only — no DRM master needed, safe alongside Xorg.
+; ============================================================================
+do_probe:
+    push rbx
+    push r12
+    push r13
+
+    call drm_try_open
+    test rax, rax
+    js .dp_open_fail
+    mov [drm_fd], rax
+
+    call drm_probe_version
+    call drm_probe_resources
+    call drm_probe_connectors
+
+    mov rax, SYS_CLOSE
+    mov rdi, [drm_fd]
+    syscall
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.dp_open_fail:
+    mov rsi, probe_open_fail
+    mov rdx, probe_open_fail_len
+    call write_stderr
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; drm_try_open — try /dev/dri/card0..card9. Returns the first fd that opens
+; cleanly in rax; -1 if none.
+; ============================================================================
+drm_try_open:
+    push rbx
+    xor ebx, ebx                         ; card index
+.dt_loop:
+    cmp ebx, 10
+    jge .dt_miss
+    ; build "/dev/dri/cardN"
+    lea rdi, [drm_card_path]
+    lea rsi, [probe_card_pre]
+.dt_cp:
+    mov al, [rsi]
+    test al, al
+    jz .dt_cp_done
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    jmp .dt_cp
+.dt_cp_done:
+    mov eax, ebx
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    mov byte [rdi], 0
+    ; open
+    mov rax, SYS_OPEN
+    lea rdi, [drm_card_path]
+    mov esi, O_RDWR
+    xor edx, edx
+    syscall
+    test rax, rax
+    jns .dt_ok
+    inc ebx
+    jmp .dt_loop
+.dt_ok:
+    push rax
+    mov rsi, probe_open_ok_pre
+    call write_str_stderr
+    mov rsi, drm_card_path
+    call write_str_stderr
+    pop rax
+    pop rbx
+    ret
+.dt_miss:
+    mov rax, -1
+    pop rbx
+    ret
+
+; ============================================================================
+; drm_probe_version — DRM_IOCTL_VERSION twice (first call learns lengths,
+; second call fills the name/date/desc buffers we point it at).
+; ============================================================================
+drm_probe_version:
+    push rbx
+    ; Zero the 64-byte drm_version struct.
+    lea rdi, [drm_version_buf]
+    xor eax, eax
+    mov ecx, 8
+    rep stosq
+
+    ; First call: only counts are filled in.
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_VERSION
+    lea rdx, [drm_version_buf]
+    syscall
+    test rax, rax
+    js .dv_err
+
+    ; Cap name/date/desc lengths to our buffer sizes.
+    mov rax, [drm_version_buf + 16]      ; name_len
+    cmp rax, 63
+    jbe .dv_n_ok
+    mov rax, 63
+.dv_n_ok:
+    mov [drm_version_buf + 16], rax
+    lea rax, [drm_name_buf]
+    mov [drm_version_buf + 24], rax
+    mov rax, [drm_version_buf + 32]      ; date_len
+    cmp rax, 63
+    jbe .dv_d_ok
+    mov rax, 63
+.dv_d_ok:
+    mov [drm_version_buf + 32], rax
+    lea rax, [drm_date_buf]
+    mov [drm_version_buf + 40], rax
+    mov rax, [drm_version_buf + 48]      ; desc_len
+    cmp rax, 127
+    jbe .dv_x_ok
+    mov rax, 127
+.dv_x_ok:
+    mov [drm_version_buf + 48], rax
+    lea rax, [drm_desc_buf]
+    mov [drm_version_buf + 56], rax
+
+    ; Second call: kernel fills the buffers.
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_VERSION
+    lea rdx, [drm_version_buf]
+    syscall
+    test rax, rax
+    js .dv_err
+
+    ; Print ", driver NAME vMAJ.MIN.PATCH\n"
+    mov rsi, probe_version_pre
+    mov rdx, probe_version_pre_len
+    call write_stderr
+    mov rsi, drm_name_buf
+    call write_str_stderr
+    mov rsi, probe_version_sep
+    mov rdx, probe_version_sep_len
+    call write_stderr
+    mov eax, [drm_version_buf]
+    call write_u64_stderr
+    lea rsi, [probe_version_dot]
+    mov rdx, 1
+    call write_stderr
+    mov eax, [drm_version_buf + 4]
+    call write_u64_stderr
+    lea rsi, [probe_version_dot]
+    mov rdx, 1
+    call write_stderr
+    mov eax, [drm_version_buf + 8]
+    call write_u64_stderr
+    lea rsi, [probe_version_nl]
+    mov rdx, 1
+    call write_stderr
+    pop rbx
+    ret
+.dv_err:
+    mov rsi, ioctl_err
+    mov rdx, ioctl_err_len
+    call write_stderr
+    pop rbx
+    ret
+
+; ============================================================================
+; drm_probe_resources — DRM_IOCTL_MODE_GETRESOURCES twice. First call gets
+; the counts; we plug our ID-array pointers in; second call fills them.
+; ============================================================================
+drm_probe_resources:
+    push rbx
+    lea rdi, [drm_res_buf]
+    xor eax, eax
+    mov ecx, 8
+    rep stosq
+
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_GETRESOURCES
+    lea rdx, [drm_res_buf]
+    syscall
+    test rax, rax
+    js .dr_err
+
+    ; Cap counts to DRM_MAX_IDS and point arrays.
+    mov eax, [drm_res_buf + 32]          ; count_fbs
+    cmp eax, DRM_MAX_IDS
+    jbe .dr_fb_ok
+    mov eax, DRM_MAX_IDS
+.dr_fb_ok:
+    mov [drm_res_buf + 32], eax
+    lea rax, [drm_fb_ids]
+    mov [drm_res_buf + 0], rax
+    mov eax, [drm_res_buf + 36]          ; count_crtcs
+    cmp eax, DRM_MAX_IDS
+    jbe .dr_c_ok
+    mov eax, DRM_MAX_IDS
+.dr_c_ok:
+    mov [drm_res_buf + 36], eax
+    lea rax, [drm_crtc_ids]
+    mov [drm_res_buf + 8], rax
+    mov eax, [drm_res_buf + 40]          ; count_connectors
+    cmp eax, DRM_MAX_IDS
+    jbe .dr_n_ok
+    mov eax, DRM_MAX_IDS
+.dr_n_ok:
+    mov [drm_res_buf + 40], eax
+    lea rax, [drm_conn_ids]
+    mov [drm_res_buf + 16], rax
+    mov eax, [drm_res_buf + 44]          ; count_encoders
+    cmp eax, DRM_MAX_IDS
+    jbe .dr_e_ok
+    mov eax, DRM_MAX_IDS
+.dr_e_ok:
+    mov [drm_res_buf + 44], eax
+    lea rax, [drm_enc_ids]
+    mov [drm_res_buf + 24], rax
+
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_GETRESOURCES
+    lea rdx, [drm_res_buf]
+    syscall
+    test rax, rax
+    js .dr_err
+
+    ; Print "frame: resources: N CRTCs, M connectors, K encoders"
+    mov rsi, probe_res_pre
+    mov rdx, probe_res_pre_len
+    call write_stderr
+    mov eax, [drm_res_buf + 36]
+    call write_u64_stderr
+    mov rsi, probe_res_crtc
+    mov rdx, probe_res_crtc_len
+    call write_stderr
+    mov eax, [drm_res_buf + 40]
+    call write_u64_stderr
+    mov rsi, probe_res_conn
+    mov rdx, probe_res_conn_len
+    call write_stderr
+    mov eax, [drm_res_buf + 44]
+    call write_u64_stderr
+    mov rsi, probe_res_enc
+    mov rdx, probe_res_enc_len
+    call write_stderr
+    ; framebuffer min/max
+    mov rsi, probe_res_size
+    mov rdx, probe_res_size_len
+    call write_stderr
+    mov eax, [drm_res_buf + 48]          ; min_width
+    call write_u64_stderr
+    mov rsi, probe_res_x
+    mov rdx, 1
+    call write_stderr
+    mov eax, [drm_res_buf + 56]          ; min_height
+    call write_u64_stderr
+    mov rsi, probe_res_to
+    mov rdx, probe_res_to_len
+    call write_stderr
+    mov eax, [drm_res_buf + 52]          ; max_width
+    call write_u64_stderr
+    mov rsi, probe_res_x
+    mov rdx, 1
+    call write_stderr
+    mov eax, [drm_res_buf + 60]          ; max_height
+    call write_u64_stderr
+    lea rsi, [probe_conn_nl]
+    mov rdx, 1
+    call write_stderr
+    pop rbx
+    ret
+.dr_err:
+    mov rsi, ioctl_err
+    mov rdx, ioctl_err_len
+    call write_stderr
+    pop rbx
+    ret
+
+; ============================================================================
+; drm_probe_connectors — iterate the drm_conn_ids array and call
+; DRM_IOCTL_MODE_GETCONNECTOR for each, printing type, state, mode count,
+; and the preferred (first) mode if connected.
+; ============================================================================
+drm_probe_connectors:
+    push rbx
+    push r12
+    push r13
+    mov r13d, [drm_res_buf + 40]         ; count_connectors
+    xor ebx, ebx                         ; index
+.dc_loop:
+    cmp ebx, r13d
+    jge .dc_done
+    mov eax, [drm_conn_ids + rbx*4]
+    mov r12d, eax                        ; connector_id
+
+    ; Zero the 80-byte struct, then plug our ID and array pointers in.
+    lea rdi, [drm_conn_buf]
+    xor eax, eax
+    mov ecx, 10
+    rep stosq
+    mov [drm_conn_buf + 32], dword DRM_MAX_MODES   ; count_modes (request)
+    mov [drm_conn_buf + 36], dword DRM_MAX_PROPS   ; count_props
+    mov [drm_conn_buf + 40], dword DRM_MAX_IDS     ; count_encoders
+    mov [drm_conn_buf + 48], r12d                  ; connector_id
+    lea rax, [drm_enc_arr]
+    mov [drm_conn_buf + 0], rax                    ; encoders_ptr
+    lea rax, [drm_modes_buf]
+    mov [drm_conn_buf + 8], rax                    ; modes_ptr
+    lea rax, [drm_props_arr]
+    mov [drm_conn_buf + 16], rax                   ; props_ptr
+    lea rax, [drm_propvals_arr]
+    mov [drm_conn_buf + 24], rax                   ; prop_values_ptr
+
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_GETCONNECTOR
+    lea rdx, [drm_conn_buf]
+    syscall
+    test rax, rax
+    js .dc_skip
+
+    ; "  connector ID: TYPE-N -> state, M modes[, preferred WxH @ Hz]"
+    mov rsi, probe_conn_pre
+    mov rdx, probe_conn_pre_len
+    call write_stderr
+    mov eax, r12d
+    call write_u64_stderr
+    mov rsi, probe_conn_type
+    mov rdx, probe_conn_type_len
+    call write_stderr
+    ; type name
+    mov eax, [drm_conn_buf + 52]                   ; connector_type
+    cmp eax, conn_type_max
+    jbe .dc_type_ok
+    lea rsi, [conn_type_unknown]
+    jmp .dc_type_emit
+.dc_type_ok:
+    lea rdi, [conn_type_table]
+    mov rsi, [rdi + rax*8]
+.dc_type_emit:
+    call write_str_stderr
+    lea rsi, [.dc_dash]
+    mov rdx, 1
+    call write_stderr
+    mov eax, [drm_conn_buf + 56]                   ; connector_type_id
+    call write_u64_stderr
+    mov rsi, probe_conn_arr
+    mov rdx, probe_conn_arr_len
+    call write_stderr
+    ; state
+    mov eax, [drm_conn_buf + 60]
+    cmp eax, DRM_MODE_CONNECTED
+    je .dc_state_conn
+    cmp eax, DRM_MODE_DISCONNECTED
+    je .dc_state_disc
+    lea rsi, [probe_state_unk]
+    jmp .dc_state_done
+.dc_state_conn:
+    lea rsi, [probe_state_conn]
+    jmp .dc_state_done
+.dc_state_disc:
+    lea rsi, [probe_state_disc]
+.dc_state_done:
+    call write_str_stderr
+    ; ", N modes"
+    mov rsi, probe_conn_modes
+    mov rdx, probe_conn_modes_len
+    call write_stderr
+    mov eax, [drm_conn_buf + 32]
+    call write_u64_stderr
+    mov rsi, probe_conn_mcount
+    mov rdx, probe_conn_mcount_len
+    call write_stderr
+    ; if connected and at least 1 mode -> print mode 0 dims + refresh
+    mov eax, [drm_conn_buf + 60]
+    cmp eax, DRM_MODE_CONNECTED
+    jne .dc_endl
+    mov eax, [drm_conn_buf + 32]
+    test eax, eax
+    jz .dc_endl
+    mov rsi, probe_conn_pref
+    mov rdx, probe_conn_pref_len
+    call write_stderr
+    ; mode 0: hdisplay at +4, vdisplay at +14, vrefresh at +24
+    movzx eax, word [drm_modes_buf + 4]
+    call write_u64_stderr
+    mov rsi, probe_res_x
+    mov rdx, 1
+    call write_stderr
+    movzx eax, word [drm_modes_buf + 14]
+    call write_u64_stderr
+    mov rsi, probe_conn_at
+    mov rdx, probe_conn_at_len
+    call write_stderr
+    mov eax, [drm_modes_buf + 24]
+    call write_u64_stderr
+    mov rsi, probe_conn_hz
+    mov rdx, probe_conn_hz_len
+    call write_stderr
+    jmp .dc_skip
+.dc_endl:
+    lea rsi, [probe_conn_nl]
+    mov rdx, 1
+    call write_stderr
+.dc_skip:
+    inc ebx
+    jmp .dc_loop
+.dc_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.dc_dash: db "-"
