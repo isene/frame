@@ -54,8 +54,24 @@ DEFAULT REL
 ; struct drm_mode_card_res      = 64 bytes  → 0xC04064A0
 ; struct drm_mode_get_connector = 80 bytes  → 0xC05064A7
 %define DRM_IOCTL_VERSION              0xC0406400
+%define DRM_IOCTL_SET_MASTER           0x0000641E
+%define DRM_IOCTL_DROP_MASTER          0x0000641F
 %define DRM_IOCTL_MODE_GETRESOURCES    0xC04064A0
+%define DRM_IOCTL_MODE_GETCRTC         0xC06864A1
+%define DRM_IOCTL_MODE_SETCRTC         0xC06864A2
+%define DRM_IOCTL_MODE_GETENCODER      0xC01464A6
 %define DRM_IOCTL_MODE_GETCONNECTOR    0xC05064A7
+%define DRM_IOCTL_MODE_ADDFB           0xC01C64AE
+%define DRM_IOCTL_MODE_RMFB            0xC00464AF
+%define DRM_IOCTL_MODE_CREATE_DUMB     0xC02064B2
+%define DRM_IOCTL_MODE_MAP_DUMB        0xC01064B3
+%define DRM_IOCTL_MODE_DESTROY_DUMB    0xC00464B4
+
+%define SYS_MMAP        9
+%define SYS_MUNMAP      11
+%define SYS_NANOSLEEP   35
+%define PROT_RW         3            ; PROT_READ | PROT_WRITE
+%define MAP_SHARED      1
 
 %define DRM_MODE_CONNECTED      1
 %define DRM_MODE_DISCONNECTED   2
@@ -150,6 +166,25 @@ drm_props_arr:      resd DRM_MAX_PROPS
 drm_propvals_arr:   resq DRM_MAX_PROPS
 drm_card_path:      resb 32
 
+; ---- DRM modeset state ----------------------------------------------------
+drm_encoder_buf:    resb 20             ; struct drm_mode_get_encoder
+drm_crtc_save:      resb 104            ; struct drm_mode_crtc (GETCRTC)
+drm_crtc_set:       resb 104            ; struct drm_mode_crtc (SETCRTC)
+drm_dumb_create:    resb 32             ; struct drm_mode_create_dumb
+drm_dumb_map:       resb 16             ; struct drm_mode_map_dumb
+drm_dumb_destroy:   resb 8              ; struct drm_mode_destroy_dumb (+pad)
+drm_fb_cmd:         resb 28             ; struct drm_mode_fb_cmd
+drm_set_conn_id:    resd 1              ; connector ID array (just one)
+drm_fb_id:          resd 1
+drm_dumb_handle:    resd 1
+drm_dumb_pitch:     resd 1
+drm_dumb_size:      resq 1
+drm_dumb_offset:    resq 1
+drm_dumb_addr:      resq 1
+drm_chosen_crtc:    resd 1
+drm_chosen_conn:    resd 1
+nanosleep_ts:       resq 2
+
 ; ============================================================================
 ; RODATA — setup reply template, vendor string, log prefixes
 ; ============================================================================
@@ -222,6 +257,50 @@ probe_state_unk:   db "unknown", 0
 ioctl_err:         db "frame: ioctl failed", 10
 ioctl_err_len      equ $ - ioctl_err
 
+; ---- modeset strings ------------------------------------------------------
+ms_master_ok:      db "frame: SET_MASTER OK", 10
+ms_master_ok_len   equ $ - ms_master_ok
+ms_master_fail:    db "frame: SET_MASTER failed (need root, and X must be stopped: 'sudo systemctl stop display-manager' or kill X from a VT)", 10
+ms_master_fail_len equ $ - ms_master_fail
+ms_no_conn:        db "frame: no connected display found", 10
+ms_no_conn_len     equ $ - ms_no_conn
+ms_using_pre:      db "frame: using connector ", 0
+ms_using_pre_len   equ $ - ms_using_pre - 1
+ms_using_crtc:     db " on CRTC ", 0
+ms_using_crtc_len  equ $ - ms_using_crtc - 1
+ms_using_mode:     db ", mode ", 0
+ms_using_mode_len  equ $ - ms_using_mode - 1
+ms_create_pre:     db "frame: created dumb buffer, ", 0
+ms_create_pre_len  equ $ - ms_create_pre - 1
+ms_create_bytes:   db " bytes", 10
+ms_create_bytes_len equ $ - ms_create_bytes
+ms_fill_ok:        db "frame: filled with purple", 10
+ms_fill_ok_len     equ $ - ms_fill_ok
+ms_addfb_ok:       db "frame: added framebuffer ", 0
+ms_addfb_ok_len    equ $ - ms_addfb_ok - 1
+ms_setcrtc_ok:     db "frame: SETCRTC OK — displaying for 5 seconds", 10
+ms_setcrtc_ok_len  equ $ - ms_setcrtc_ok
+ms_restore_ok:     db "frame: restored original CRTC, cleanup done", 10
+ms_restore_ok_len  equ $ - ms_restore_ok
+ms_err_step:       db "frame: failed at step: ", 0
+ms_err_step_len    equ $ - ms_err_step - 1
+ms_err_open:       db "open", 10
+ms_err_open_len    equ $ - ms_err_open
+ms_err_master:     db "SET_MASTER", 10
+ms_err_master_len  equ $ - ms_err_master
+ms_err_getcrtc:    db "GETCRTC", 10
+ms_err_getcrtc_len equ $ - ms_err_getcrtc
+ms_err_dumb:       db "CREATE_DUMB", 10
+ms_err_dumb_len    equ $ - ms_err_dumb
+ms_err_mapdumb:    db "MAP_DUMB", 10
+ms_err_mapdumb_len equ $ - ms_err_mapdumb
+ms_err_mmap:       db "mmap", 10
+ms_err_mmap_len    equ $ - ms_err_mmap
+ms_err_addfb:      db "ADDFB", 10
+ms_err_addfb_len   equ $ - ms_err_addfb
+ms_err_setcrtc:    db "SETCRTC", 10
+ms_err_setcrtc_len equ $ - ms_err_setcrtc
+
 ; Connector type names — indexed by drm_mode_get_connector.connector_type.
 ; (drm_mode.h, "DRM_MODE_CONNECTOR_*", values 0..21.)
 conn_type_0:  db "Unknown", 0
@@ -277,12 +356,23 @@ _start:
     ; server untouched. Lets us validate the kernel interface without
     ; having to drop the running Xorg.
     cmp dword [rdi], '--pr'
-    jne .check_num
+    jne .check_modeset
     cmp dword [rdi + 4], 'obe'
-    jne .check_num
+    jne .check_modeset
     cmp byte [rdi + 7], 0
-    jne .check_num
+    jne .check_modeset
     call do_probe
+    xor edi, edi
+    mov rax, SYS_EXIT
+    syscall
+.check_modeset:
+    cmp dword [rdi], '--mo'
+    jne .check_num
+    cmp dword [rdi + 4], 'dese'
+    jne .check_num
+    cmp word [rdi + 8], 't'              ; 't' + NUL
+    jne .check_num
+    call do_modeset
     xor edi, edi
     mov rax, SYS_EXIT
     syscall
@@ -1278,3 +1368,462 @@ drm_probe_connectors:
     pop rbx
     ret
 .dc_dash: db "-"
+
+; ============================================================================
+; do_modeset — phase 2b. Takes DRM master, finds the first connected
+; connector, creates a dumb buffer at the connector's preferred mode size,
+; fills it solid purple, SETCRTC's it, sleeps 5s, restores the original CRTC
+; state, and frees everything. Requires root (CAP_SYS_ADMIN) and that no
+; other client holds DRM master — run from a VT after stopping X.
+; ============================================================================
+do_modeset:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    call drm_try_open
+    test rax, rax
+    js .ms_e_open
+    mov [drm_fd], rax
+    ; drm_try_open leaves its log line open so probe mode can extend it
+    ; with ", driver foo vX.Y.Z". Modeset mode wants a clean newline.
+    lea rsi, [probe_conn_nl]
+    mov rdx, 1
+    call write_stderr
+
+    ; SET_MASTER. Fails if Xorg or another DRM master is still active,
+    ; or if we lack CAP_SYS_ADMIN.
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_SET_MASTER
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .ms_e_master
+    mov rsi, ms_master_ok
+    mov rdx, ms_master_ok_len
+    call write_stderr
+
+    ; Resources + connectors (reuses the probe helpers; they print along
+    ; the way, which is what we want — situational awareness).
+    call drm_probe_version
+    call drm_probe_resources
+
+    ; Find first connected connector (silent, sets r12 = connector_id,
+    ; leaves drm_conn_buf populated and mode-0 at drm_modes_buf[0..68]).
+    call modeset_find_connector
+    test eax, eax
+    jz .ms_e_no_conn
+    mov [drm_chosen_conn], r12d
+
+    ; GETENCODER for connector's encoder_id (drm_conn_buf+44).
+    lea rdi, [drm_encoder_buf]
+    xor eax, eax
+    mov ecx, 5
+    rep stosd
+    mov eax, [drm_conn_buf + 44]
+    mov [drm_encoder_buf], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_GETENCODER
+    lea rdx, [drm_encoder_buf]
+    syscall
+    test rax, rax
+    js .ms_e_getcrtc
+
+    ; Choose a CRTC. Prefer the encoder's current crtc_id; fall back to
+    ; the first bit set in possible_crtcs.
+    mov eax, [drm_encoder_buf + 8]
+    test eax, eax
+    jnz .ms_have_crtc
+    mov ecx, [drm_encoder_buf + 12]
+    bsf rdx, rcx
+    mov eax, [drm_crtc_ids + rdx*4]
+.ms_have_crtc:
+    mov r13d, eax
+    mov [drm_chosen_crtc], eax
+
+    ; Announce choice.
+    mov rsi, ms_using_pre
+    mov rdx, ms_using_pre_len
+    call write_stderr
+    mov eax, [drm_chosen_conn]
+    call write_u64_stderr
+    mov rsi, ms_using_crtc
+    mov rdx, ms_using_crtc_len
+    call write_stderr
+    mov eax, [drm_chosen_crtc]
+    call write_u64_stderr
+    mov rsi, ms_using_mode
+    mov rdx, ms_using_mode_len
+    call write_stderr
+    movzx eax, word [drm_modes_buf + 4]
+    call write_u64_stderr
+    mov rsi, probe_res_x
+    mov rdx, 1
+    call write_stderr
+    movzx eax, word [drm_modes_buf + 14]
+    call write_u64_stderr
+    lea rsi, [probe_conn_nl]
+    mov rdx, 1
+    call write_stderr
+
+    ; GETCRTC to save current state for restore on cleanup.
+    lea rdi, [drm_crtc_save]
+    xor eax, eax
+    mov ecx, 13
+    rep stosq
+    mov [drm_crtc_save + 12], r13d
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_GETCRTC
+    lea rdx, [drm_crtc_save]
+    syscall
+    test rax, rax
+    js .ms_e_getcrtc
+
+    ; CREATE_DUMB: width × height @ 32 bpp.
+    lea rdi, [drm_dumb_create]
+    xor eax, eax
+    mov ecx, 4
+    rep stosq
+    movzx eax, word [drm_modes_buf + 4]      ; hdisplay → width
+    mov [drm_dumb_create + 4], eax
+    movzx eax, word [drm_modes_buf + 14]     ; vdisplay → height
+    mov [drm_dumb_create + 0], eax
+    mov dword [drm_dumb_create + 8], 32      ; bpp
+    mov dword [drm_dumb_create + 12], 0      ; flags
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_CREATE_DUMB
+    lea rdx, [drm_dumb_create]
+    syscall
+    test rax, rax
+    js .ms_e_dumb
+    mov eax, [drm_dumb_create + 16]
+    mov [drm_dumb_handle], eax
+    mov eax, [drm_dumb_create + 20]
+    mov [drm_dumb_pitch], eax
+    mov rax, [drm_dumb_create + 24]
+    mov [drm_dumb_size], rax
+
+    mov rsi, ms_create_pre
+    mov rdx, ms_create_pre_len
+    call write_stderr
+    mov rax, [drm_dumb_size]
+    call write_u64_stderr
+    mov rsi, ms_create_bytes
+    mov rdx, ms_create_bytes_len
+    call write_stderr
+
+    ; MAP_DUMB: get the mmap offset to use for the dumb buffer.
+    lea rdi, [drm_dumb_map]
+    xor eax, eax
+    mov ecx, 2
+    rep stosq
+    mov eax, [drm_dumb_handle]
+    mov [drm_dumb_map], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_MAP_DUMB
+    lea rdx, [drm_dumb_map]
+    syscall
+    test rax, rax
+    js .ms_e_mapdumb
+    mov rax, [drm_dumb_map + 8]
+    mov [drm_dumb_offset], rax
+
+    ; mmap(NULL, size, PROT_RW, MAP_SHARED, fd, offset)
+    mov rax, SYS_MMAP
+    xor edi, edi
+    mov rsi, [drm_dumb_size]
+    mov edx, PROT_RW
+    mov r10d, MAP_SHARED
+    mov r8, [drm_fd]
+    mov r9, [drm_dumb_offset]
+    syscall
+    cmp rax, -4096
+    ja .ms_e_mmap
+    mov [drm_dumb_addr], rax
+
+    ; Fill: solid purple in XRGB8888. Little-endian memory bytes B,G,R,X.
+    ; 0xFFAA00FF: A=FF (ignored), R=AA, G=00, B=FF → magenta-ish.
+    mov rdi, [drm_dumb_addr]
+    mov rcx, [drm_dumb_size]
+    shr rcx, 2
+    mov eax, 0xFFAA00FF
+    rep stosd
+
+    mov rsi, ms_fill_ok
+    mov rdx, ms_fill_ok_len
+    call write_stderr
+
+    ; ADDFB.
+    lea rdi, [drm_fb_cmd]
+    xor eax, eax
+    mov ecx, 7
+    rep stosd
+    mov eax, [drm_dumb_create + 4]           ; width
+    mov [drm_fb_cmd + 4], eax
+    mov eax, [drm_dumb_create + 0]           ; height
+    mov [drm_fb_cmd + 8], eax
+    mov eax, [drm_dumb_pitch]
+    mov [drm_fb_cmd + 12], eax
+    mov dword [drm_fb_cmd + 16], 32          ; bpp
+    mov dword [drm_fb_cmd + 20], 24          ; depth
+    mov eax, [drm_dumb_handle]
+    mov [drm_fb_cmd + 24], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_ADDFB
+    lea rdx, [drm_fb_cmd]
+    syscall
+    test rax, rax
+    js .ms_e_addfb
+    mov eax, [drm_fb_cmd]
+    mov [drm_fb_id], eax
+
+    mov rsi, ms_addfb_ok
+    mov rdx, ms_addfb_ok_len
+    call write_stderr
+    mov eax, [drm_fb_id]
+    call write_u64_stderr
+    lea rsi, [probe_conn_nl]
+    mov rdx, 1
+    call write_stderr
+
+    ; SETCRTC: point r13's CRTC at our new fb, with the preferred mode,
+    ; connected to drm_chosen_conn.
+    mov eax, [drm_chosen_conn]
+    mov [drm_set_conn_id], eax
+    lea rdi, [drm_crtc_set]
+    xor eax, eax
+    mov ecx, 13
+    rep stosq
+    lea rax, [drm_set_conn_id]
+    mov [drm_crtc_set + 0], rax              ; set_connectors_ptr
+    mov dword [drm_crtc_set + 8], 1          ; count_connectors
+    mov [drm_crtc_set + 12], r13d            ; crtc_id
+    mov eax, [drm_fb_id]
+    mov [drm_crtc_set + 16], eax             ; fb_id
+    mov dword [drm_crtc_set + 32], 1         ; mode_valid
+    ; Copy 68-byte modeinfo (mode 0 = preferred) into struct+36.
+    lea rsi, [drm_modes_buf]
+    lea rdi, [drm_crtc_set + 36]
+    mov ecx, 17                              ; 68/4
+    rep movsd
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_SETCRTC
+    lea rdx, [drm_crtc_set]
+    syscall
+    test rax, rax
+    js .ms_e_setcrtc
+
+    mov rsi, ms_setcrtc_ok
+    mov rdx, ms_setcrtc_ok_len
+    call write_stderr
+
+    ; Sleep 5 seconds.
+    lea rdi, [nanosleep_ts]
+    mov qword [rdi], 5
+    mov qword [rdi + 8], 0
+    mov rax, SYS_NANOSLEEP
+    xor esi, esi
+    syscall
+
+    ; Restore the original CRTC. drm_crtc_save came back from GETCRTC with
+    ; the original mode + fb_id; replaying it via SETCRTC puts things back
+    ; the way they were. set_connectors_ptr in the save struct is 0,
+    ; which DRM treats as "use the CRTC's previously-bound connectors".
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_SETCRTC
+    lea rdx, [drm_crtc_save]
+    syscall
+
+    ; Cleanup: RMFB, munmap, DESTROY_DUMB, DROP_MASTER, close.
+    mov eax, [drm_fb_id]
+    mov [drm_dumb_destroy], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_RMFB
+    lea rdx, [drm_dumb_destroy]
+    syscall
+
+    mov rax, SYS_MUNMAP
+    mov rdi, [drm_dumb_addr]
+    mov rsi, [drm_dumb_size]
+    syscall
+
+    mov eax, [drm_dumb_handle]
+    mov [drm_dumb_destroy], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_DESTROY_DUMB
+    lea rdx, [drm_dumb_destroy]
+    syscall
+
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_DROP_MASTER
+    xor edx, edx
+    syscall
+
+    mov rax, SYS_CLOSE
+    mov rdi, [drm_fd]
+    syscall
+
+    mov rsi, ms_restore_ok
+    mov rdx, ms_restore_ok_len
+    call write_stderr
+    jmp .ms_done
+
+.ms_e_open:
+    mov rsi, probe_open_fail
+    mov rdx, probe_open_fail_len
+    call write_stderr
+    jmp .ms_done
+.ms_e_master:
+    mov rsi, ms_master_fail
+    mov rdx, ms_master_fail_len
+    call write_stderr
+    mov rax, SYS_CLOSE
+    mov rdi, [drm_fd]
+    syscall
+    jmp .ms_done
+.ms_e_no_conn:
+    mov rsi, ms_no_conn
+    mov rdx, ms_no_conn_len
+    call write_stderr
+    jmp .ms_close_master
+.ms_e_getcrtc:
+    mov rsi, ms_err_step
+    mov rdx, ms_err_step_len
+    call write_stderr
+    mov rsi, ms_err_getcrtc
+    mov rdx, ms_err_getcrtc_len
+    call write_stderr
+    jmp .ms_close_master
+.ms_e_dumb:
+    mov rsi, ms_err_step
+    mov rdx, ms_err_step_len
+    call write_stderr
+    mov rsi, ms_err_dumb
+    mov rdx, ms_err_dumb_len
+    call write_stderr
+    jmp .ms_close_master
+.ms_e_mapdumb:
+    mov rsi, ms_err_step
+    mov rdx, ms_err_step_len
+    call write_stderr
+    mov rsi, ms_err_mapdumb
+    mov rdx, ms_err_mapdumb_len
+    call write_stderr
+    jmp .ms_close_master
+.ms_e_mmap:
+    mov rsi, ms_err_step
+    mov rdx, ms_err_step_len
+    call write_stderr
+    mov rsi, ms_err_mmap
+    mov rdx, ms_err_mmap_len
+    call write_stderr
+    jmp .ms_close_master
+.ms_e_addfb:
+    mov rsi, ms_err_step
+    mov rdx, ms_err_step_len
+    call write_stderr
+    mov rsi, ms_err_addfb
+    mov rdx, ms_err_addfb_len
+    call write_stderr
+    jmp .ms_close_master
+.ms_e_setcrtc:
+    mov rsi, ms_err_step
+    mov rdx, ms_err_step_len
+    call write_stderr
+    mov rsi, ms_err_setcrtc
+    mov rdx, ms_err_setcrtc_len
+    call write_stderr
+    jmp .ms_close_master
+.ms_close_master:
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_DROP_MASTER
+    xor edx, edx
+    syscall
+    mov rax, SYS_CLOSE
+    mov rdi, [drm_fd]
+    syscall
+.ms_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; modeset_find_connector — silent variant of drm_probe_connectors. Loops the
+; ID array, GETCONNECTOR each one, stops at the first connected with
+; count_modes > 0. Returns rax=1 (found) or rax=0 (none), and on found:
+; r12d = connector_id, drm_conn_buf populated, drm_modes_buf[0..68] = mode 0.
+; ============================================================================
+modeset_find_connector:
+    push rbx
+    push r13
+    mov r13d, [drm_res_buf + 40]              ; count_connectors
+    xor ebx, ebx
+.mf_loop:
+    cmp ebx, r13d
+    jge .mf_none
+    mov eax, [drm_conn_ids + rbx*4]
+    mov r12d, eax
+
+    ; Zero + plug in our arrays + connector_id (same shape as the
+    ; probe path's per-connector call).
+    lea rdi, [drm_conn_buf]
+    xor eax, eax
+    mov ecx, 10
+    rep stosq
+    mov [drm_conn_buf + 32], dword DRM_MAX_MODES
+    mov [drm_conn_buf + 36], dword DRM_MAX_PROPS
+    mov [drm_conn_buf + 40], dword DRM_MAX_IDS
+    mov [drm_conn_buf + 48], r12d
+    lea rax, [drm_enc_arr]
+    mov [drm_conn_buf + 0], rax
+    lea rax, [drm_modes_buf]
+    mov [drm_conn_buf + 8], rax
+    lea rax, [drm_props_arr]
+    mov [drm_conn_buf + 16], rax
+    lea rax, [drm_propvals_arr]
+    mov [drm_conn_buf + 24], rax
+
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_GETCONNECTOR
+    lea rdx, [drm_conn_buf]
+    syscall
+    test rax, rax
+    js .mf_skip
+
+    mov eax, [drm_conn_buf + 60]              ; connection state
+    cmp eax, DRM_MODE_CONNECTED
+    jne .mf_skip
+    mov eax, [drm_conn_buf + 32]              ; count_modes
+    test eax, eax
+    jz .mf_skip
+
+    mov eax, 1
+    pop r13
+    pop rbx
+    ret
+.mf_skip:
+    inc ebx
+    jmp .mf_loop
+.mf_none:
+    xor eax, eax
+    pop r13
+    pop rbx
+    ret

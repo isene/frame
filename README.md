@@ -2,8 +2,8 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.2-blue)
-![Phase](https://img.shields.io/badge/phase-2%2F14-yellow)
+![Version](https://img.shields.io/badge/version-0.0.3-blue)
+![Phase](https://img.shields.io/badge/phase-2b%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
@@ -28,7 +28,7 @@ software-rendered, all on a stack written end-to-end in asm.
 |---|-------|--------|
 | 1 | Connection setup + Unix socket bind | ✓ shipped |
 | 2 | DRM/KMS probe (read-only ioctls, no master) | ✓ shipped |
-| 2b | DRM/KMS modeset (CreateDumb + AddFB + SetCRTC, needs VT) | next |
+| 2b | DRM/KMS modeset (CreateDumb + AddFB + SetCRTC) | ✓ shipped |
 | 3 | evdev input + KeyPress / Motion routing | |
 | 4 | Window tree + Configure / Reparent / SubstructureRedirect | |
 | 5 | Atoms + GetProperty / ChangeProperty / selections | |
@@ -86,9 +86,74 @@ frame: framebuffer range 0x0 to 16384x16384
 Uses three read-only ioctls — `DRM_IOCTL_VERSION`,
 `DRM_IOCTL_MODE_GETRESOURCES`, `DRM_IOCTL_MODE_GETCONNECTOR`. None
 require DRM master, so this runs safely alongside an active Xorg.
-Proves the kernel-interface struct layouts and ioctl encoding ahead
-of phase 2b's `CREATE_DUMB` + `ADDFB` + `SETCRTC` (which do need
-master, hence a VT for testing).
+
+## Phase 2b: DRM/KMS modeset
+
+```bash
+sudo ./frame --modeset
+```
+
+Pure-asm path: takes DRM master, picks the first connected
+connector, queries its preferred mode, allocates a dumb buffer
+(`DRM_IOCTL_MODE_CREATE_DUMB`), mmap's it (`DRM_IOCTL_MODE_MAP_DUMB`
++ `mmap`), fills it solid purple, binds it as a framebuffer
+(`DRM_IOCTL_MODE_ADDFB`), and points the CRTC at it
+(`DRM_IOCTL_MODE_SETCRTC`). Holds the picture for 5 seconds, then
+restores the CRTC's prior state and frees everything in reverse.
+
+### Test recipe
+
+Needs DRM master, which Xorg holds while it's running. From a TTY,
+after stopping the display manager:
+
+```bash
+# 1. Switch to a TTY
+Ctrl+Alt+F2
+
+# 2. Login as geir, navigate to the repo
+cd ~/Main/G/GIT-isene/frame
+
+# 3. Stop X (whichever applies — pick one)
+sudo systemctl stop sddm           # if KDE plasma
+sudo systemctl stop gdm            # if GNOME
+sudo systemctl stop lightdm        # if XFCE/MATE
+# or, if X was started manually from this TTY, just kill it
+
+# 4. Run the modeset
+sudo ./frame --modeset
+
+# 5. Wait ~5 seconds, screen turns solid purple, then restores
+
+# 6. Restart your session
+sudo systemctl start sddm      # or however you start
+```
+
+Expected stderr:
+
+```
+frame: opened /dev/dri/card1
+frame: SET_MASTER OK
+frame: resources: 4 CRTCs, 5 connectors, 21 encoders
+frame: framebuffer range 0x0 to 16384x16384
+frame: using connector 507 on CRTC 79, mode 1920x1200
+frame: created dumb buffer, 9216000 bytes
+frame: filled with purple
+frame: added framebuffer 84
+frame: SETCRTC OK — displaying for 5 seconds
+frame: restored original CRTC, cleanup done
+```
+
+The seconds in between are the proof: a CHasm asm binary putting
+pixels on the physical panel through nothing but raw DRM ioctls. No
+libdrm, no Mesa, no display server — just frame talking directly to
+the kernel through the same ABI Xorg uses.
+
+### Safety
+
+The full cleanup path always runs (RMFB → munmap → DESTROY_DUMB →
+DROP_MASTER → close), and the CRTC is restored to its prior state.
+Worst case if something goes wrong: the screen stays purple until
+the kernel reprograms it (the next X start does this).
 
 ## How it's built
 
