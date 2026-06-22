@@ -288,6 +288,20 @@ windows:            resb MAX_WINDOWS * WINDOW_REC_SIZE
 %define GC_REC_SIZE      16
 gcs:                resb MAX_GCS * GC_REC_SIZE
 
+; ---- Phase 4h pixmap table ------------------------------------------------
+; pixmaps[MAX_PIXMAPS] — offscreen drawables. Like a window's backing
+; store but with no position/mapping. CopyArea and the drawing ops treat
+; windows and pixmaps uniformly via drawable_get_backing.
+;   +0  pid (u32)           0 = empty slot
+;   +4  width (u16)
+;   +6  height (u16)
+;   +8  depth (u8)
+;   +9  pad (7)
+;   +16 backing_ptr (q)     — mmap'd ARGB buffer (w*h*4)
+%define MAX_PIXMAPS      256
+%define PIXMAP_REC_SIZE  24
+pixmaps:            resb MAX_PIXMAPS * PIXMAP_REC_SIZE
+
 ; ---- Phase 4c property table ----------------------------------------------
 ; properties[1024] — flat list of (window, atom) → value records. xid = 0
 ; marks an empty slot. Value bytes live in a separate append-only pool
@@ -829,6 +843,7 @@ _start:
     call init_clients
     call init_windows
     call init_gcs
+    call init_pixmaps
     call init_properties
     call init_keysyms
     call init_input
@@ -3068,10 +3083,20 @@ dispatch_request:
     je .dr_unmap_window
     cmp eax, 12
     je .dr_configure_window
+    cmp eax, 53
+    je .dr_create_pixmap
+    cmp eax, 54
+    je .dr_free_pixmap
     cmp eax, 56
     je .dr_change_gc
     cmp eax, 60
     je .dr_free_gc
+    cmp eax, 61
+    je .dr_clear_area
+    cmp eax, 62
+    je .dr_copy_area
+    cmp eax, 67
+    je .dr_poly_rectangle
     cmp eax, 70
     je .dr_poly_fill_rectangle
     cmp eax, 72
@@ -3195,6 +3220,32 @@ dispatch_request:
     mov rsi, r12
     mov edx, r13d
     call handle_put_image
+    jmp .dr_done
+
+.dr_create_pixmap:
+    mov rsi, r12
+    call handle_create_pixmap
+    jmp .dr_done
+
+.dr_free_pixmap:
+    mov rsi, r12
+    call handle_free_pixmap
+    jmp .dr_done
+
+.dr_clear_area:
+    mov rsi, r12
+    call handle_clear_area
+    jmp .dr_done
+
+.dr_copy_area:
+    mov rsi, r12
+    call handle_copy_area
+    jmp .dr_done
+
+.dr_poly_rectangle:
+    mov rsi, r12
+    mov edx, r13d
+    call handle_poly_rectangle
     jmp .dr_done
 
 .dr_query_extension:
@@ -7468,6 +7519,526 @@ blit_window:
     jmp .bw_row
 .bw_done:
     add rsp, 64
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; ============================================================================
+; PHASE 4h — pixmaps + CopyArea + ClearArea + PolyRectangle.
+; ============================================================================
+; Offscreen pixmap drawables, the copy/clear ops every toolkit uses, and
+; rectangle outlines. drawable_get_backing unifies windows and pixmaps so
+; the drawing ops work on either.
+; ============================================================================
+
+; ----------------------------------------------------------------------------
+; init_pixmaps — zero the pixmap table.
+; ----------------------------------------------------------------------------
+init_pixmaps:
+    push rbx
+    lea rdi, [pixmaps]
+    xor eax, eax
+    mov ecx, MAX_PIXMAPS * PIXMAP_REC_SIZE
+    rep stosb
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; pixmap_lookup — edi = pid. Returns record ptr in rax, or 0.
+; ----------------------------------------------------------------------------
+pixmap_lookup:
+    push rbx
+    xor ebx, ebx
+.pxl_loop:
+    cmp ebx, MAX_PIXMAPS
+    jge .pxl_miss
+    mov rax, rbx
+    imul rax, PIXMAP_REC_SIZE
+    lea rax, [pixmaps + rax]
+    cmp [rax], edi
+    je .pxl_hit
+    inc ebx
+    jmp .pxl_loop
+.pxl_hit:
+    pop rbx
+    ret
+.pxl_miss:
+    xor eax, eax
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; drawable_get_backing — edi = drawable xid. Resolves either a window
+; (ensuring its backing) or a pixmap. Returns:
+;   rax = backing ptr (0 if not found / no backing)
+;   edx = width (pixels, = stride)
+;   ecx = height
+; ----------------------------------------------------------------------------
+drawable_get_backing:
+    push rbx
+    ; Try window first.
+    push rdi
+    call window_lookup
+    pop rdi
+    test rax, rax
+    jz .dgb_pixmap
+    ; It's a window — ensure backing.
+    cmp dword [rax], X_ROOT_WINDOW
+    je .dgb_none                             ; root has no backing buffer
+    mov rbx, rax
+    push rbx
+    mov rdi, rbx
+    call window_ensure_backing
+    pop rbx
+    test rax, rax
+    jz .dgb_none
+    movzx edx, word [rbx + 40]               ; backing_w
+    movzx ecx, word [rbx + 42]               ; backing_h
+    pop rbx
+    ret
+.dgb_pixmap:
+    call pixmap_lookup
+    test rax, rax
+    jz .dgb_none
+    movzx edx, word [rax + 4]                ; width
+    movzx ecx, word [rax + 6]                ; height
+    mov rax, [rax + 16]                      ; backing ptr
+    test rax, rax
+    jz .dgb_none
+    pop rbx
+    ret
+.dgb_none:
+    xor eax, eax
+    xor edx, edx
+    xor ecx, ecx
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; handle_create_pixmap — rsi = req ptr.
+;   +1 depth   +4 pid   +8 drawable   +12 width u16   +14 height u16
+; mmap a w*h*4 backing buffer (zero-filled by the kernel). No reply.
+; ----------------------------------------------------------------------------
+handle_create_pixmap:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, rsi
+    mov edi, [rbx + 4]                        ; pid
+    test edi, edi
+    jz .cpx_done
+    movzx r13d, word [rbx + 12]              ; width
+    movzx r14d, word [rbx + 14]              ; height
+    test r13d, r13d
+    jz .cpx_done
+    test r14d, r14d
+    jz .cpx_done
+
+    ; Find an empty pixmap slot.
+    xor ecx, ecx
+.cpx_find:
+    cmp ecx, MAX_PIXMAPS
+    jge .cpx_done
+    mov rax, rcx
+    imul rax, PIXMAP_REC_SIZE
+    lea rax, [pixmaps + rax]
+    cmp dword [rax], 0
+    je .cpx_take
+    inc ecx
+    jmp .cpx_find
+.cpx_take:
+    mov r12, rax                             ; record ptr
+    ; mmap w*h*4
+    mov eax, r13d
+    imul eax, r14d
+    shl eax, 2
+    push rax                                  ; bytes (for fill count via shr)
+    mov rsi, rax
+    mov rax, SYS_MMAP
+    xor edi, edi
+    mov edx, PROT_RW
+    mov r10d, MAP_PRIVATE | MAP_ANONYMOUS
+    mov r8, -1
+    xor r9, r9
+    syscall
+    pop rcx                                   ; bytes (unused now)
+    cmp rax, -4096
+    ja .cpx_done
+    ; Fill the record.
+    mov ecx, [rbx + 4]
+    mov [r12 + 0], ecx                        ; pid
+    mov [r12 + 4], r13w                       ; width
+    mov [r12 + 6], r14w                       ; height
+    movzx ecx, byte [rbx + 1]
+    mov [r12 + 8], cl                         ; depth
+    mov [r12 + 16], rax                       ; backing ptr
+.cpx_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; handle_free_pixmap — rsi = req ptr (+4 pixmap). munmap + clear. No reply.
+; ----------------------------------------------------------------------------
+handle_free_pixmap:
+    push rbx
+    mov edi, [rsi + 4]
+    call pixmap_lookup
+    test rax, rax
+    jz .fpx_done
+    mov rbx, rax
+    ; munmap w*h*4
+    mov rdi, [rbx + 16]
+    movzx esi, word [rbx + 4]
+    movzx ecx, word [rbx + 6]
+    imul esi, ecx
+    shl esi, 2
+    mov rax, SYS_MUNMAP
+    syscall
+    mov dword [rbx], 0                        ; clear slot
+    mov qword [rbx + 16], 0
+.fpx_done:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; handle_clear_area — rsi = req ptr.
+;   +1 exposures   +4 window   +8 x s16   +10 y s16   +12 w u16   +14 h u16
+; Fills the region in the window's backing with its back_pixel. A w or h
+; of 0 means "to the edge of the window". No reply.
+; ----------------------------------------------------------------------------
+handle_clear_area:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rsi
+    mov edi, [rbx + 4]                        ; window
+    call window_lookup
+    test rax, rax
+    jz .ca_done
+    mov r12, rax
+    cmp dword [r12], X_ROOT_WINDOW
+    je .ca_done
+    mov rdi, r12
+    call window_ensure_backing
+    test rax, rax
+    jz .ca_done
+    mov r13, rax                             ; backing
+
+    ; geometry
+    movsx eax, word [rbx + 8]                ; x
+    movsx r8d, word [rbx + 10]               ; y
+    movzx r9d, word [rbx + 12]               ; w
+    movzx r10d, word [rbx + 14]              ; h
+    ; w==0 → backing_w - x ; h==0 → backing_h - y
+    test r9d, r9d
+    jnz .ca_w_ok
+    movzx r9d, word [r12 + 40]
+    sub r9d, eax
+.ca_w_ok:
+    test r10d, r10d
+    jnz .ca_h_ok
+    movzx r10d, word [r12 + 42]
+    sub r10d, r8d
+.ca_h_ok:
+    mov rdi, r13
+    movzx esi, word [r12 + 40]               ; backing_w (stride)
+    movzx edx, word [r12 + 42]               ; backing_h
+    mov r11d, [r12 + 44]                      ; back_pixel
+    call fb_fill
+    call recomposite_screen
+.ca_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; handle_copy_area — rsi = req ptr.
+;   +4 src-drawable  +8 dst-drawable  +12 gc
+;   +16 src-x s16  +18 src-y s16  +20 dst-x s16  +22 dst-y s16
+;   +24 width u16  +26 height u16
+; Copies a rect from src backing to dst backing, clipped to both. If the
+; dst is a window, recomposites. No reply.
+;
+; Stack frame holds loop-invariant scalars; pointers in callee-saved regs.
+;   +0 src_ptr  +8 dst_ptr  +16 src_stride  +24 dst_stride
+;   +32 src_h   +40 dst_h   +48 sx  +56 sy  +64 dx  +72 dy
+;   +80 copy_w  +88 copy_h
+; ----------------------------------------------------------------------------
+handle_copy_area:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 112
+    mov rbx, rsi                             ; req ptr
+
+    ; Resolve src.
+    mov edi, [rbx + 4]
+    call drawable_get_backing
+    test rax, rax
+    jz .cpa_done
+    mov [rsp + 0], rax                       ; src_ptr
+    mov [rsp + 16], edx                      ; src_stride (=width)
+    mov [rsp + 32], ecx                      ; src_h
+    ; Resolve dst.
+    mov edi, [rbx + 8]
+    call drawable_get_backing
+    test rax, rax
+    jz .cpa_done
+    mov [rsp + 8], rax                       ; dst_ptr
+    mov [rsp + 24], edx                      ; dst_stride
+    mov [rsp + 40], ecx                      ; dst_h
+
+    ; Coords.
+    movsx eax, word [rbx + 16]
+    mov [rsp + 48], eax                      ; sx
+    movsx eax, word [rbx + 18]
+    mov [rsp + 56], eax                      ; sy
+    movsx eax, word [rbx + 20]
+    mov [rsp + 64], eax                      ; dx
+    movsx eax, word [rbx + 22]
+    mov [rsp + 72], eax                      ; dy
+    movzx eax, word [rbx + 24]
+    mov [rsp + 80], eax                      ; copy_w
+    movzx eax, word [rbx + 26]
+    mov [rsp + 88], eax                      ; copy_h
+
+    ; --- Clip. We adjust sx/sy/dx/dy/copy_w/copy_h so both src and dst
+    ; rects stay in bounds. Handle negative src/dst origins by trimming
+    ; from the top-left.
+    ; Left edge: shift = max(0, -sx, -dx)
+    xor ecx, ecx
+    mov eax, [rsp + 48]
+    neg eax
+    cmp eax, ecx
+    cmovg ecx, eax
+    mov eax, [rsp + 64]
+    neg eax
+    cmp eax, ecx
+    cmovg ecx, eax                           ; ecx = left shift
+    add [rsp + 48], ecx
+    add [rsp + 64], ecx
+    sub [rsp + 80], ecx
+    ; Top edge: shift = max(0, -sy, -dy)
+    xor ecx, ecx
+    mov eax, [rsp + 56]
+    neg eax
+    cmp eax, ecx
+    cmovg ecx, eax
+    mov eax, [rsp + 72]
+    neg eax
+    cmp eax, ecx
+    cmovg ecx, eax
+    add [rsp + 56], ecx
+    add [rsp + 72], ecx
+    sub [rsp + 88], ecx
+    ; Right edge: copy_w = min(copy_w, src_stride - sx, dst_stride - dx)
+    mov eax, [rsp + 16]
+    sub eax, [rsp + 48]
+    mov edx, [rsp + 80]
+    cmp eax, edx
+    cmovl edx, eax
+    mov eax, [rsp + 24]
+    sub eax, [rsp + 64]
+    cmp eax, edx
+    cmovl edx, eax
+    mov [rsp + 80], edx
+    cmp edx, 0
+    jle .cpa_done
+    ; Bottom edge: copy_h = min(copy_h, src_h - sy, dst_h - dy)
+    mov eax, [rsp + 32]
+    sub eax, [rsp + 56]
+    mov edx, [rsp + 88]
+    cmp eax, edx
+    cmovl edx, eax
+    mov eax, [rsp + 40]
+    sub eax, [rsp + 72]
+    cmp eax, edx
+    cmovl edx, eax
+    mov [rsp + 88], edx
+    cmp edx, 0
+    jle .cpa_done
+
+    ; --- Copy rows. r12d = row 0..copy_h-1
+    xor r12d, r12d
+.cpa_row:
+    cmp r12d, [rsp + 88]
+    jge .cpa_blit_done
+    ; src row ptr = src_ptr + ((sy+row)*src_stride + sx)*4
+    mov eax, [rsp + 56]
+    add eax, r12d
+    imul eax, [rsp + 16]
+    add eax, [rsp + 48]
+    mov rsi, [rsp + 0]
+    lea rsi, [rsi + rax*4]
+    ; dst row ptr = dst_ptr + ((dy+row)*dst_stride + dx)*4
+    mov eax, [rsp + 72]
+    add eax, r12d
+    imul eax, [rsp + 24]
+    add eax, [rsp + 64]
+    mov rdi, [rsp + 8]
+    lea rdi, [rdi + rax*4]
+    mov ecx, [rsp + 80]                      ; copy_w
+    rep movsd
+    inc r12d
+    jmp .cpa_row
+.cpa_blit_done:
+    ; If dst is a window, recomposite.
+    mov edi, [rbx + 8]
+    call window_lookup
+    test rax, rax
+    jz .cpa_done
+    call recomposite_screen
+.cpa_done:
+    add rsp, 112
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+; ----------------------------------------------------------------------------
+; rect_outline — draw a 1px rectangle outline via 4 fb_fill calls.
+;   rdi = buf, esi = stride, edx = bufh, r8d = x, r9d = y, r10d = w,
+;   r11d = h, ecx = colour.
+; All inputs latched into a stack frame; fb_fill is called four times.
+; ----------------------------------------------------------------------------
+rect_outline:
+    push rbx
+    push rbp
+    sub rsp, 64
+    mov [rsp + 0], rdi                       ; buf
+    mov [rsp + 8], esi                       ; stride
+    mov [rsp + 12], edx                      ; bufh
+    mov [rsp + 16], r8d                      ; x
+    mov [rsp + 20], r9d                      ; y
+    mov [rsp + 24], r10d                     ; w
+    mov [rsp + 28], r11d                     ; h
+    mov [rsp + 32], ecx                      ; colour
+
+    ; top edge: (x, y, w, 1)
+    mov rdi, [rsp + 0]
+    mov esi, [rsp + 8]
+    mov edx, [rsp + 12]
+    mov eax, [rsp + 16]
+    mov r8d, [rsp + 20]
+    mov r9d, [rsp + 24]
+    mov r10d, 1
+    mov r11d, [rsp + 32]
+    call fb_fill
+    ; bottom edge: (x, y+h-1, w, 1)
+    mov rdi, [rsp + 0]
+    mov esi, [rsp + 8]
+    mov edx, [rsp + 12]
+    mov eax, [rsp + 16]
+    mov r8d, [rsp + 20]
+    add r8d, [rsp + 28]
+    dec r8d
+    mov r9d, [rsp + 24]
+    mov r10d, 1
+    mov r11d, [rsp + 32]
+    call fb_fill
+    ; left edge: (x, y, 1, h)
+    mov rdi, [rsp + 0]
+    mov esi, [rsp + 8]
+    mov edx, [rsp + 12]
+    mov eax, [rsp + 16]
+    mov r8d, [rsp + 20]
+    mov r9d, 1
+    mov r10d, [rsp + 28]
+    mov r11d, [rsp + 32]
+    call fb_fill
+    ; right edge: (x+w-1, y, 1, h)
+    mov rdi, [rsp + 0]
+    mov esi, [rsp + 8]
+    mov edx, [rsp + 12]
+    mov eax, [rsp + 16]
+    add eax, [rsp + 24]
+    dec eax
+    mov r8d, [rsp + 20]
+    mov r9d, 1
+    mov r10d, [rsp + 28]
+    mov r11d, [rsp + 32]
+    call fb_fill
+
+    add rsp, 64
+    pop rbp
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; handle_poly_rectangle — edi = slot (unused), rsi = req ptr, edx = bytes.
+;   +4 drawable  +8 gc  +12 rectangles[] (x s16, y s16, w u16, h u16)
+; Draws each rect's outline into the drawable's backing with the GC
+; foreground. No reply.
+;
+;   rbx = req ptr   r12 = rect cursor   r13 = backing ptr
+;   r14d = stride   r15d = bufh   rbp = (low) colour ; rect count on stack
+; ----------------------------------------------------------------------------
+handle_poly_rectangle:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 16
+    mov rbx, rsi                             ; req ptr
+    mov [rsp + 0], edx                        ; req bytes
+
+    mov edi, [rbx + 4]
+    call drawable_get_backing
+    test rax, rax
+    jz .prr_done
+    mov r13, rax                             ; backing
+    mov r14d, edx                            ; stride
+    mov r15d, ecx                            ; bufh
+
+    mov edi, [rbx + 8]
+    call gc_lookup
+    test rax, rax
+    jz .prr_done
+    mov ebp, [rax + 4]                        ; fg colour
+
+    ; rect count = (bytes - 12) / 8
+    mov eax, [rsp + 0]
+    sub eax, 12
+    jle .prr_done
+    shr eax, 3
+    mov [rsp + 4], eax                        ; remaining rects
+    lea r12, [rbx + 12]
+.prr_loop:
+    cmp dword [rsp + 4], 0
+    jle .prr_recomp
+    mov rdi, r13
+    mov esi, r14d
+    mov edx, r15d
+    movsx r8d, word [r12 + 0]                ; x
+    movsx r9d, word [r12 + 2]                ; y
+    movzx r10d, word [r12 + 4]               ; w
+    movzx r11d, word [r12 + 6]               ; h
+    mov ecx, ebp                             ; colour
+    call rect_outline
+    add r12, 8
+    dec dword [rsp + 4]
+    jmp .prr_loop
+.prr_recomp:
+    call recomposite_screen
+.prr_done:
+    add rsp, 16
     pop rbp
     pop r15
     pop r14

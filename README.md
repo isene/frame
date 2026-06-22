@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.20-blue)
+![Version](https://img.shields.io/badge/version-0.0.21-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -22,7 +22,7 @@ software-rendered, all on a stack written end-to-end in asm.
 
 <br clear="left"/>
 
-## Status: phase 1 of 14
+## Status: phase 4 of 14 (core protocol + compositor + drawing)
 
 | # | Phase | Status |
 |---|-------|--------|
@@ -38,6 +38,7 @@ software-rendered, all on a stack written end-to-end in asm.
 | 4e | SubstructureRedirect routing + ReparentWindow | ✓ shipped |
 | 4f | Software compositor — solid-colour rects on the panel via `--display` | ✓ shipped |
 | 4g | GCs + window backing store + PolyFillRectangle / PutImage | ✓ shipped |
+| 4h | Pixmaps + CopyArea / ClearArea / PolyRectangle | ✓ shipped |
 | 5 | Atoms + GetProperty / ChangeProperty / selections | |
 | 6 | SHAPE extension | |
 | 7 | GCs + drawing primitives | |
