@@ -157,7 +157,13 @@ display_num:        resq 1
 ;   +5 pad (3)
 ;   +8 seq (u32)         next sequence number to assign
 ;   +12 buf_used (u32)   bytes valid in this client's read buffer
-%define MAX_CLIENTS      16
+; Sized to fit Geir's actual session: tile + strip + 12+ glass + firefox
+; + kastrup + tock + spot + nm-applet + polkit-gnome + ... often pushes
+; well past 32 concurrent X clients. Each idle slot costs nothing (BSS
+; demand-pages; the kernel never allocates physical RAM for an 8 KB buf
+; the client never connects on). Committed cost at startup is ~2 KB
+; (clients_meta is touched by init_clients).
+%define MAX_CLIENTS      128
 %define CLIENT_META_SIZE 16
 %define CLIENT_BUF_SIZE  8192
 %define CSTATE_SETUP     0
@@ -182,8 +188,11 @@ atom_off:           resd MAX_ATOMS
 atom_len:           resd MAX_ATOMS
 atom_strings:       resb ATOM_STRINGS_CAP
 
-; Scratch reply buffer (32-byte X11 reply header + small bodies).
-reply_buf:          resb 64
+; Scratch reply buffer. 32-byte reply header + room for bodies up to a
+; few KB (GetKeyboardMapping returns count × keysyms_per_keycode × 4
+; bytes — at the full keycode range plus 1 keysym/keycode that's ~1 KB;
+; future reply types like QueryFont return more).
+reply_buf:          resb 16384
 
 ; sockaddr_un used for both bind() and the unlink() path on shutdown.
 sockaddr_buf:       resb 128
@@ -275,7 +284,7 @@ log_setup_bad_len  equ $ - log_setup_bad
 ; ---- phase 4 multi-client log strings -------------------------------------
 log_serve_ready:    db "serve loop ready, polling listen + clients", 10
 log_serve_ready_len equ $ - log_serve_ready
-log_max_clients:    db "refusing connection, all 16 client slots in use", 10
+log_max_clients:    db "refusing connection, all 128 client slots in use", 10
 log_max_clients_len equ $ - log_max_clients
 log_atom_new:       db "  intern-atom new id=", 0
 log_atom_new_len   equ $ - log_atom_new - 1
@@ -2785,10 +2794,40 @@ dispatch_request:
     pop rdx
     pop rax
 
+    cmp eax, 3
+    je .dr_get_window_attributes
+    cmp eax, 14
+    je .dr_get_geometry
+    cmp eax, 15
+    je .dr_query_tree
     cmp eax, 16
     je .dr_intern_atom
+    cmp eax, 20
+    je .dr_get_property
+    cmp eax, 43
+    je .dr_get_input_focus
+    cmp eax, 55
+    je .dr_create_gc
+    cmp eax, 97
+    je .dr_query_best_size
     cmp eax, 98
     je .dr_query_extension
+    cmp eax, 99
+    je .dr_list_extensions
+    cmp eax, 101
+    je .dr_get_keyboard_mapping
+    cmp eax, 103
+    je .dr_get_keyboard_control
+    cmp eax, 106
+    je .dr_get_pointer_control
+    cmp eax, 108
+    je .dr_get_screen_saver
+    cmp eax, 110
+    je .dr_list_hosts
+    cmp eax, 117
+    je .dr_get_pointer_mapping
+    cmp eax, 119
+    je .dr_get_modifier_mapping
     ; Unhandled — already logged.
     jmp .dr_done
 
@@ -2797,9 +2836,87 @@ dispatch_request:
     call handle_intern_atom
     jmp .dr_done
 
+.dr_get_property:
+    mov edi, ebx
+    call handle_get_property
+    jmp .dr_done
+
+.dr_create_gc:
+    ; No reply needed; we don't track GC state yet (phase 4f). Silently
+    ; accept so clients that always create a GC at startup (xdpyinfo,
+    ; libX11 internals) proceed instead of hanging on the next round-trip.
+    jmp .dr_done
+
 .dr_query_extension:
     mov edi, ebx
     call handle_query_extension
+    jmp .dr_done
+
+.dr_get_geometry:
+    mov edi, ebx
+    call handle_get_geometry
+    jmp .dr_done
+
+.dr_query_tree:
+    mov edi, ebx
+    call handle_query_tree
+    jmp .dr_done
+
+.dr_get_input_focus:
+    mov edi, ebx
+    call handle_get_input_focus
+    jmp .dr_done
+
+.dr_list_extensions:
+    mov edi, ebx
+    call handle_list_extensions
+    jmp .dr_done
+
+.dr_get_keyboard_mapping:
+    mov edi, ebx
+    mov rsi, r12                             ; request ptr
+    call handle_get_keyboard_mapping
+    jmp .dr_done
+
+.dr_get_window_attributes:
+    mov edi, ebx
+    call handle_get_window_attributes
+    jmp .dr_done
+
+.dr_query_best_size:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_query_best_size
+    jmp .dr_done
+
+.dr_get_keyboard_control:
+    mov edi, ebx
+    call handle_get_keyboard_control
+    jmp .dr_done
+
+.dr_get_pointer_control:
+    mov edi, ebx
+    call handle_get_pointer_control
+    jmp .dr_done
+
+.dr_get_screen_saver:
+    mov edi, ebx
+    call handle_get_screen_saver
+    jmp .dr_done
+
+.dr_list_hosts:
+    mov edi, ebx
+    call handle_list_hosts
+    jmp .dr_done
+
+.dr_get_pointer_mapping:
+    mov edi, ebx
+    call handle_get_pointer_mapping
+    jmp .dr_done
+
+.dr_get_modifier_mapping:
+    mov edi, ebx
+    call handle_get_modifier_mapping
     jmp .dr_done
 
 .dr_done:
@@ -2919,6 +3036,679 @@ handle_query_extension:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
+    syscall
+
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_get_property — edi = slot. Phase 4a stand-in: every property is
+; reported as "doesn't exist" (format=0, type=None, length=0). Real
+; property storage lands in phase 4c (window tree + properties).
+;
+; Reply (32 bytes):
+;   +0 1 (Reply)          +1 format (0 = doesn't exist)
+;   +2 seq (u16)          +4 reply length (4u, = 0)
+;   +8 type (ATOM, 0 = None)
+;   +12 bytes-after (u32)
+;   +16 value length (u32)
+;   +20..31 pad
+; ============================================================================
+handle_get_property:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 0                    ; format = 0
+    mov ecx, [r12 + 8]                       ; seq
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 0
+    mov dword [rdi + 8], 0                   ; type = None
+    mov dword [rdi + 12], 0                  ; bytes-after
+    mov dword [rdi + 16], 0                  ; value length
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_get_geometry — edi = slot. Phase 4a stand-in: returns root-window
+; geometry for every drawable (no window table yet). Real per-window
+; geometry lands in phase 4b.
+;
+; Reply (32 bytes):
+;   +0 1 (Reply)          +1 depth (CARD8)
+;   +2 seq                +4 reply length (= 0)
+;   +8 root (WINDOW)      +12 x (INT16)
+;   +14 y (INT16)         +16 width (CARD16)
+;   +18 height (CARD16)   +20 border-width (CARD16)
+;   +22..31 pad
+; ============================================================================
+handle_get_geometry:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 24                   ; depth
+    mov ecx, [r12 + 8]
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 0
+    mov dword [rdi + 8], X_ROOT_WINDOW
+    mov word [rdi + 12], 0                   ; x
+    mov word [rdi + 14], 0                   ; y
+    mov word [rdi + 16], X_SCREEN_W
+    mov word [rdi + 18], X_SCREEN_H
+    mov word [rdi + 20], 0                   ; border-width
+    mov word [rdi + 22], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_query_tree — edi = slot. Phase 4a stand-in: every query returns
+; "root = X_ROOT_WINDOW, parent = None, no children". Real tree lands in
+; phase 4b.
+;
+; Reply (32 bytes — n=0):
+;   +0 1                  +1 0
+;   +2 seq                +4 reply length n (= 0)
+;   +8 root               +12 parent (0 = None)
+;   +16 num-children u16  +18 pad
+;   +20..31 pad
+; ============================================================================
+handle_query_tree:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 0
+    mov ecx, [r12 + 8]
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 0                   ; reply length (no children)
+    mov dword [rdi + 8], X_ROOT_WINDOW
+    mov dword [rdi + 12], 0                  ; parent = None
+    mov word [rdi + 16], 0                   ; num-children
+    mov word [rdi + 18], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_get_input_focus — edi = slot. Phase 4a stand-in: replies focus =
+; PointerRoot (1), revert-to = PointerRoot (1). Real focus model lands in
+; phase 4d (input).
+;
+; Reply (32 bytes):
+;   +0 1                  +1 revert-to (PointerRoot=1)
+;   +2 seq                +4 reply length 0
+;   +8 focus (PointerRoot=1)
+;   +12..31 pad
+; ============================================================================
+; ============================================================================
+; handle_list_extensions — edi = slot. Always replies "zero extensions".
+; Pairs with QueryExtension to cover the two ways clients enumerate.
+;
+; Reply (32 bytes for empty list):
+;   +0 1                  +1 nExtensions (CARD8 = 0)
+;   +2 seq                +4 reply length 0
+;   +8..31 pad
+; ============================================================================
+handle_list_extensions:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 0                    ; nExtensions
+    mov ecx, [r12 + 8]
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 0
+    mov dword [rdi + 8], 0
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+
+    pop r12
+    pop rbx
+    ret
+
+handle_get_input_focus:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 1                    ; revert-to = PointerRoot
+    mov ecx, [r12 + 8]
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 0
+    mov dword [rdi + 8], 1                   ; focus = PointerRoot
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_get_keyboard_mapping — edi = slot, rsi = request ptr. The request
+; specifies first-keycode + count; we reply with `count` keycodes' worth
+; of keysyms, 1 keysym per keycode (all NoSymbol for now). Real
+; layout-driven keysyms land in phase 4d (input) + phase 11 (XKB).
+;
+; Request:
+;   +0 opcode (101)       +1 0
+;   +2 length (4u)        +4 first-keycode (u8)
+;   +5 count (u8)         +6 pad (2)
+;
+; Reply (32 + count*4 bytes; keysyms-per-keycode = 1):
+;   +0 1                  +1 keysyms-per-keycode (= 1)
+;   +2 seq                +4 reply length (= count, since one CARD32 each)
+;   +8..31 pad
+;   +32..32+count*4 keysyms (all 0 = NoSymbol)
+; ============================================================================
+handle_get_keyboard_mapping:
+    push rbx
+    push r12
+    push r13
+    mov ebx, edi                             ; slot
+    mov r13, rsi                             ; request ptr
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+
+    movzx ecx, byte [r13 + 5]                ; count of keycodes requested
+    ; Clamp at 1024 to keep the reply within reply_buf (16 KB) with
+    ; room to spare. count is u8 max 255 → 1020 bytes — safely under.
+
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 1                    ; keysyms-per-keycode
+    mov edx, [r12 + 8]                       ; seq
+    mov [rdi + 2], dx
+    mov [rdi + 4], ecx                       ; reply length in 4-byte units
+    mov dword [rdi + 8], 0
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+
+    ; Body: count CARD32 zeros (= NoSymbol). Just clear the bytes.
+    push rcx
+    add rdi, 32
+    mov eax, 0
+    shl rcx, 2                               ; bytes (count * 4)
+    push rcx
+    rep stosb
+    pop rcx
+    add rcx, 32                              ; total bytes to write
+    mov rdx, rcx
+    pop rcx
+
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    syscall
+
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; reply_canned32(rdi = meta_ptr) — write a 32-byte reply that's already
+; been laid out in reply_buf (bytes 0,1 plus seq, with everything else
+; zeroed by caller as needed). Used by the cheap stub handlers below.
+; Doesn't touch reply_buf, just the seq slot at +2.
+; ============================================================================
+emit_canned_reply32:
+    push rax
+    push rsi
+    push rdx
+    mov ecx, [rdi + 8]                       ; seq
+    lea rsi, [reply_buf]
+    mov [rsi + 2], cx
+    mov edi, [rdi]                           ; fd
+    mov rax, SYS_WRITE
+    mov rdx, 32
+    syscall
+    pop rdx
+    pop rsi
+    pop rax
+    ret
+
+; ============================================================================
+; handle_get_window_attributes — edi = slot. Returns default attrs for
+; any window (the phase 4a stub doesn't track windows). The reply is
+; 44 bytes (32 header + 12 body extras), so reply length field = 3.
+;
+; Body fields chosen for "nothing surprising":
+;   backing-store = NotUseful, visual = root visual, class = InputOutput,
+;   map-state = Viewable, override-redirect = False, all event masks = 0.
+; ============================================================================
+handle_get_window_attributes:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 0                    ; backing-store = NotUseful
+    mov ecx, [r12 + 8]
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 3                   ; reply length = 3 (12 extra bytes)
+    mov dword [rdi + 8], X_ROOT_VISUAL_24    ; visual
+    mov word [rdi + 12], 1                   ; class = InputOutput
+    mov byte [rdi + 14], 0                   ; bit-gravity = Forget
+    mov byte [rdi + 15], 1                   ; win-gravity = NorthWest
+    mov dword [rdi + 16], 0                  ; backing-planes
+    mov dword [rdi + 20], 0                  ; backing-pixel
+    mov byte [rdi + 24], 0                   ; save-under
+    mov byte [rdi + 25], 1                   ; map-is-installed
+    mov byte [rdi + 26], 2                   ; map-state = Viewable
+    mov byte [rdi + 27], 0                   ; override-redirect = False
+    mov dword [rdi + 28], X_DEFAULT_CMAP     ; colormap
+    mov dword [rdi + 32], 0                  ; all-event-masks
+    mov dword [rdi + 36], 0                  ; your-event-mask
+    mov word [rdi + 40], 0                   ; do-not-propagate-mask
+    mov word [rdi + 42], 0                   ; pad
+
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 44
+    syscall
+
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_query_best_size — edi = slot, rsi = request ptr. Echoes the
+; client's requested width/height as the "best" size. Acceptable for
+; cursor/tile/stipple queries until real backing-store logic exists.
+; ============================================================================
+handle_query_best_size:
+    push rbx
+    push r12
+    push r13
+    mov ebx, edi
+    mov r13, rsi                             ; request ptr
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+
+    movzx edx, word [r13 + 8]                ; requested width
+    movzx ecx, word [r13 + 10]               ; requested height
+
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 0
+    mov eax, [r12 + 8]
+    mov [rdi + 2], ax
+    mov dword [rdi + 4], 0
+    mov [rdi + 8], dx                        ; width
+    mov [rdi + 10], cx                       ; height
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_get_keyboard_control — edi = slot. Defaults: bells off,
+; auto-repeat off, no LEDs.
+;
+; Reply (52 bytes; 5 = (52-32)/4):
+;   +0 1                  +1 global-auto-repeat (Off=0)
+;   +2 seq                +4 reply length 5
+;   +8 led-mask (CARD32)
+;   +12 key-click-percent (CARD8)
+;   +13 bell-percent (CARD8)
+;   +14 bell-pitch (CARD16)
+;   +16 bell-duration (CARD16)
+;   +18 pad (2)
+;   +20 auto-repeats (32 bytes = 256 bits, one per keycode 0..255)
+;   +52
+; ============================================================================
+handle_get_keyboard_control:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 0                    ; global-auto-repeat Off
+    mov ecx, [r12 + 8]
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 5
+    mov dword [rdi + 8], 0                   ; led-mask
+    mov byte [rdi + 12], 0                   ; key-click %
+    mov byte [rdi + 13], 0                   ; bell %
+    mov word [rdi + 14], 400                 ; bell pitch (Hz)
+    mov word [rdi + 16], 100                 ; bell duration (ms)
+    mov word [rdi + 18], 0
+    ; Auto-repeats: 32 bytes of zero (auto-repeat disabled on every key).
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+    mov dword [rdi + 32], 0
+    mov dword [rdi + 36], 0
+    mov dword [rdi + 40], 0
+    mov dword [rdi + 44], 0
+    mov dword [rdi + 48], 0
+
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 52
+    syscall
+
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_get_pointer_control — edi = slot. Defaults: linear acceleration.
+;
+; Reply (32 bytes):
+;   +0 1                  +1 0
+;   +2 seq                +4 reply length 0
+;   +8 accel-numerator (u16)
+;   +10 accel-denominator (u16)
+;   +12 threshold (u16)
+;   +14..31 pad
+; ============================================================================
+handle_get_pointer_control:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 0
+    mov ecx, [r12 + 8]
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 0
+    mov word [rdi + 8], 1                    ; accel num
+    mov word [rdi + 10], 1                   ; accel denom
+    mov word [rdi + 12], 4                   ; threshold
+    mov word [rdi + 14], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_get_screen_saver — edi = slot. Screensaver disabled.
+;
+; Reply (32 bytes):
+;   +0 1                  +1 0
+;   +2 seq                +4 reply length 0
+;   +8 timeout (u16)      +10 interval (u16)
+;   +12 prefer-blanking (Yes=1, No=0, Default=2)
+;   +13 allow-exposures
+;   +14..31 pad
+; ============================================================================
+handle_get_screen_saver:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 0
+    mov ecx, [r12 + 8]
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 0
+    mov word [rdi + 8], 0                    ; timeout 0 = disabled
+    mov word [rdi + 10], 0
+    mov byte [rdi + 12], 0                   ; prefer-blanking
+    mov byte [rdi + 13], 0                   ; allow-exposures
+    mov word [rdi + 14], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_list_hosts — edi = slot. Access control list always empty,
+; access control disabled.
+;
+; Reply (32 bytes for empty list):
+;   +0 1                  +1 mode (0 = disabled)
+;   +2 seq                +4 reply length 0
+;   +8 nHosts (u16)       +10 pad
+;   +12..31 pad
+; ============================================================================
+handle_list_hosts:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 0                    ; mode = disabled
+    mov ecx, [r12 + 8]
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 0
+    mov word [rdi + 8], 0                    ; nHosts
+    mov word [rdi + 10], 0
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_get_pointer_mapping — edi = slot. Identity mapping for 3
+; buttons (1=1, 2=2, 3=3). Padded to 4 bytes so reply length = 1.
+;
+; Reply (36 bytes):
+;   +0 1                  +1 nMap (CARD8 = 3)
+;   +2 seq                +4 reply length (CARD32 = 1, ceil(3/4))
+;   +8..31 pad            +32 map (3 bytes: 1,2,3) + 1 pad
+; ============================================================================
+handle_get_pointer_mapping:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 3                    ; nMap
+    mov ecx, [r12 + 8]
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 1                   ; reply length
+    mov dword [rdi + 8], 0
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+    mov byte [rdi + 32], 1
+    mov byte [rdi + 33], 2
+    mov byte [rdi + 34], 3
+    mov byte [rdi + 35], 0
+
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 36
+    syscall
+
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_get_modifier_mapping — edi = slot. Empty modifier map (no keys
+; map to any modifier). 8 modifier classes × keycodes-per-modifier (we
+; pick 2) = 16 bytes of body.
+;
+; Reply (32 + 16 = 48 bytes):
+;   +0 1                  +1 keycodes-per-modifier (CARD8 = 2)
+;   +2 seq                +4 reply length (= 4)
+;   +8..31 pad            +32..47 modifier→keycode (16 bytes, all 0)
+; ============================================================================
+handle_get_modifier_mapping:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 2                    ; keycodes-per-modifier
+    mov ecx, [r12 + 8]
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 4                   ; reply length
+    mov dword [rdi + 8], 0
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+    mov dword [rdi + 32], 0
+    mov dword [rdi + 36], 0
+    mov dword [rdi + 40], 0
+    mov dword [rdi + 44], 0
+
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 48
     syscall
 
     pop r12
