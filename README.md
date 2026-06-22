@@ -2,8 +2,8 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.8-blue)
-![Phase](https://img.shields.io/badge/phase-4c%2F14-yellow)
+![Version](https://img.shields.io/badge/version-0.0.9-blue)
+![Phase](https://img.shields.io/badge/phase-4d.1%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
@@ -33,6 +33,8 @@ software-rendered, all on a stack written end-to-end in asm.
 | 4a | Multi-client serve loop + dispatch + 16 opcode handlers | ✓ shipped |
 | 4b | Window tree + CreateWindow / MapWindow / ConfigureWindow | ✓ shipped |
 | 4c | Properties — ChangeProperty / GetProperty / GetAtomName | ✓ shipped |
+| 4d.1 | Input API — GrabKey / GrabKeyboard / real US keysym table | ✓ shipped |
+| 4d.2 | evdev → KeyPress event delivery | |
 | 4e | SubstructureRedirect routing + ReparentWindow | |
 | 5 | Atoms + GetProperty / ChangeProperty / selections | |
 | 6 | SHAPE extension | |

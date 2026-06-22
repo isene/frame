@@ -267,6 +267,30 @@ properties:         resb MAX_PROPERTIES * PROPERTY_REC_SIZE
 property_values:    resb PROPERTY_VALUES_CAP
 property_values_used: resd 1
 
+; ---- Phase 4d input state -------------------------------------------------
+; keysym_table — flat per-X11-keycode keysym table. 2 keysyms per keycode
+; (unshifted + shifted). Indexed by (kc - X_MIN_KEYCODE) * 8 + offset.
+;
+; Range: X11 keycodes 8..255 → (255 - 8 + 1) × 8 = 1984 bytes.
+%define KEYCODE_RANGE        (X_MAX_KEYCODE - X_MIN_KEYCODE + 1)
+keysym_table:       resb KEYCODE_RANGE * 8
+
+; key_grabs[256] — per-grab record (16 B):
+;   +0  window (u32)     0 = empty slot
+;   +4  client_slot (u32)
+;   +8  keycode (u8)     X11 keycode (= evdev code + 8)
+;   +9  pad (1)
+;   +10 modifiers (u16)
+;   +12 pad (4)
+%define MAX_KEY_GRABS        256
+%define KEY_GRAB_SIZE        16
+key_grabs:          resb MAX_KEY_GRABS * KEY_GRAB_SIZE
+
+; Active keyboard grab — set by GrabKeyboard, cleared by
+; UngrabKeyboard. -1 = no active grab.
+active_kbd_slot:    resd 1
+active_kbd_window:  resd 1
+
 ; ---- ConfigureWindow / ChangeWindowAttributes value-mask bits -------------
 ; (numeric defines used by the handlers; not in BSS)
 
@@ -709,6 +733,8 @@ _start:
     call init_clients
     call init_windows
     call init_properties
+    call init_keysyms
+    call init_input
     jmp serve_loop
 
 .die_bind:
@@ -2893,6 +2919,18 @@ dispatch_request:
     je .dr_unmap_window
     cmp eax, 12
     je .dr_configure_window
+    cmp eax, 26
+    je .dr_grab_pointer
+    cmp eax, 27
+    je .dr_ungrab_pointer
+    cmp eax, 31
+    je .dr_grab_keyboard
+    cmp eax, 32
+    je .dr_ungrab_keyboard
+    cmp eax, 33
+    je .dr_grab_key
+    cmp eax, 34
+    je .dr_ungrab_key
     cmp eax, 14
     je .dr_get_geometry
     cmp eax, 15
@@ -3013,6 +3051,37 @@ dispatch_request:
     mov edi, ebx
     mov rsi, r12
     call handle_get_window_attributes
+    jmp .dr_done
+
+.dr_grab_pointer:
+    mov edi, ebx
+    call handle_grab_pointer
+    jmp .dr_done
+
+.dr_ungrab_pointer:
+    ; No-op (we don't track pointer grabs yet); no reply.
+    jmp .dr_done
+
+.dr_grab_keyboard:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_grab_keyboard
+    jmp .dr_done
+
+.dr_ungrab_keyboard:
+    mov dword [active_kbd_slot], -1
+    mov dword [active_kbd_window], 0
+    jmp .dr_done
+
+.dr_grab_key:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_grab_key
+    jmp .dr_done
+
+.dr_ungrab_key:
+    mov rsi, r12
+    call handle_ungrab_key
     jmp .dr_done
 
 .dr_create_window:
@@ -3610,22 +3679,25 @@ handle_get_keyboard_mapping:
     push rbx
     push r12
     push r13
-    mov ebx, edi                             ; slot
-    mov r13, rsi                             ; request ptr
+    push r14
+    mov ebx, edi
+    mov r13, rsi
     mov eax, ebx
     call client_meta_addr
     mov r12, rax
 
-    movzx ecx, byte [r13 + 5]                ; count of keycodes requested
-    ; Clamp at 1024 to keep the reply within reply_buf (16 KB) with
-    ; room to spare. count is u8 max 255 → 1020 bytes — safely under.
+    movzx r14d, byte [r13 + 4]               ; first-keycode
+    movzx ecx, byte [r13 + 5]                ; count
 
+    ; Header.
     lea rdi, [reply_buf]
     mov byte [rdi + 0], 1
-    mov byte [rdi + 1], 1                    ; keysyms-per-keycode
-    mov edx, [r12 + 8]                       ; seq
+    mov byte [rdi + 1], 2                    ; keysyms-per-keycode = 2
+    mov edx, [r12 + 8]
     mov [rdi + 2], dx
-    mov [rdi + 4], ecx                       ; reply length in 4-byte units
+    mov edx, ecx
+    shl edx, 1                               ; reply length = count × 2 (each keysym = 1 4u)
+    mov [rdi + 4], edx
     mov dword [rdi + 8], 0
     mov dword [rdi + 12], 0
     mov dword [rdi + 16], 0
@@ -3633,23 +3705,38 @@ handle_get_keyboard_mapping:
     mov dword [rdi + 24], 0
     mov dword [rdi + 28], 0
 
-    ; Body: count CARD32 zeros (= NoSymbol). Just clear the bytes.
+    ; Body: count × 2 keysyms from keysym_table.
+    ; For each requested keycode k (first..first+count-1):
+    ;   reply[+0] = keysym_table[(k - X_MIN_KEYCODE) * 8 + 0]
+    ;   reply[+4] = keysym_table[(k - X_MIN_KEYCODE) * 8 + 4]
+    test ecx, ecx
+    jz .gkm_write
     push rcx
     add rdi, 32
-    mov eax, 0
-    shl rcx, 2                               ; bytes (count * 4)
-    push rcx
-    rep stosb
+    mov esi, r14d
+    sub esi, X_MIN_KEYCODE                   ; table index in keycode units
+    shl esi, 3                               ; bytes (8 per keycode)
+    lea r9, [keysym_table + rsi]             ; source ptr
+.gkm_emit:
+    mov eax, [r9]
+    mov [rdi], eax
+    mov eax, [r9 + 4]
+    mov [rdi + 4], eax
+    add r9, 8
+    add rdi, 8
+    dec ecx
+    jnz .gkm_emit
     pop rcx
-    add rcx, 32                              ; total bytes to write
-    mov rdx, rcx
-    pop rcx
-
+.gkm_write:
+    mov edx, ecx
+    shl edx, 3                               ; body bytes = count × 8
+    add edx, 32                              ; total reply bytes
     mov edi, [r12]
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     syscall
 
+    pop r14
     pop r13
     pop r12
     pop rbx
@@ -4941,6 +5028,317 @@ handle_list_properties:
     pop r15
     pop r14
     pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; ============================================================================
+; PHASE 4d.1 — input API surface (grab tables + real keysym table).
+; ============================================================================
+; This phase ships the X-side API a WM uses to set up its input model:
+; GrabKey records a key/modifier combination as routed-to-this-client;
+; GrabKeyboard claims exclusive keyboard access; GetKeyboardMapping
+; returns real US-layout keysyms instead of NoSymbol stubs. Phase 4d.2
+; (next commit) wires the kernel evdev fds into the serve loop so
+; physical key presses actually become KeyPress events.
+; ============================================================================
+
+; ----------------------------------------------------------------------------
+; KS — set keysym_table[X11_KC]'s unshifted + shifted values.
+; ----------------------------------------------------------------------------
+%macro KS 3
+    mov dword [keysym_table + (%1 - X_MIN_KEYCODE) * 8 + 0], %2
+    mov dword [keysym_table + (%1 - X_MIN_KEYCODE) * 8 + 4], %3
+%endmacro
+
+; X11 keysym values (subset of keysymdef.h we use).
+%define XK_BackSpace    0xFF08
+%define XK_Tab          0xFF09
+%define XK_Return       0xFF0D
+%define XK_Escape       0xFF1B
+%define XK_space        0x0020
+%define XK_F1           0xFFBE
+%define XK_F2           0xFFBF
+%define XK_F3           0xFFC0
+%define XK_F4           0xFFC1
+%define XK_F5           0xFFC2
+%define XK_F6           0xFFC3
+%define XK_F7           0xFFC4
+%define XK_F8           0xFFC5
+%define XK_F9           0xFFC6
+%define XK_F10          0xFFC7
+%define XK_F11          0xFFC8
+%define XK_F12          0xFFC9
+%define XK_Caps_Lock    0xFFE5
+%define XK_Shift_L      0xFFE1
+%define XK_Shift_R      0xFFE2
+%define XK_Control_L    0xFFE3
+%define XK_Control_R    0xFFE4
+%define XK_Alt_L        0xFFE9
+%define XK_Alt_R        0xFFEA
+%define XK_Super_L      0xFFEB
+%define XK_Super_R      0xFFEC
+%define XK_Left         0xFF51
+%define XK_Up           0xFF52
+%define XK_Right        0xFF53
+%define XK_Down         0xFF54
+
+; ----------------------------------------------------------------------------
+; init_keysyms — populate keysym_table with US layout. Sparse population:
+; keycodes not listed here stay at the all-zeros init (= NoSymbol).
+; ----------------------------------------------------------------------------
+init_keysyms:
+    lea rdi, [keysym_table]
+    xor eax, eax
+    mov ecx, KEYCODE_RANGE * 2
+    rep stosd
+
+    ; X11 keycode = evdev keycode + 8.
+    KS 9,  XK_Escape, XK_Escape
+    KS 10, '1', '!'
+    KS 11, '2', '@'
+    KS 12, '3', '#'
+    KS 13, '4', '$'
+    KS 14, '5', '%'
+    KS 15, '6', '^'
+    KS 16, '7', '&'
+    KS 17, '8', '*'
+    KS 18, '9', '('
+    KS 19, '0', ')'
+    KS 20, '-', '_'
+    KS 21, '=', '+'
+    KS 22, XK_BackSpace, XK_BackSpace
+    KS 23, XK_Tab, XK_Tab
+    KS 24, 'q', 'Q'
+    KS 25, 'w', 'W'
+    KS 26, 'e', 'E'
+    KS 27, 'r', 'R'
+    KS 28, 't', 'T'
+    KS 29, 'y', 'Y'
+    KS 30, 'u', 'U'
+    KS 31, 'i', 'I'
+    KS 32, 'o', 'O'
+    KS 33, 'p', 'P'
+    KS 34, '[', '{'
+    KS 35, ']', '}'
+    KS 36, XK_Return, XK_Return
+    KS 37, XK_Control_L, XK_Control_L
+    KS 38, 'a', 'A'
+    KS 39, 's', 'S'
+    KS 40, 'd', 'D'
+    KS 41, 'f', 'F'
+    KS 42, 'g', 'G'
+    KS 43, 'h', 'H'
+    KS 44, 'j', 'J'
+    KS 45, 'k', 'K'
+    KS 46, 'l', 'L'
+    KS 47, ';', ':'
+    KS 48, "'", '"'
+    KS 49, '`', '~'
+    KS 50, XK_Shift_L, XK_Shift_L
+    KS 51, '\', '|'
+    KS 52, 'z', 'Z'
+    KS 53, 'x', 'X'
+    KS 54, 'c', 'C'
+    KS 55, 'v', 'V'
+    KS 56, 'b', 'B'
+    KS 57, 'n', 'N'
+    KS 58, 'm', 'M'
+    KS 59, ',', '<'
+    KS 60, '.', '>'
+    KS 61, '/', '?'
+    KS 62, XK_Shift_R, XK_Shift_R
+    KS 64, XK_Alt_L, XK_Alt_L
+    KS 65, XK_space, XK_space
+    KS 66, XK_Caps_Lock, XK_Caps_Lock
+    KS 67, XK_F1, XK_F1
+    KS 68, XK_F2, XK_F2
+    KS 69, XK_F3, XK_F3
+    KS 70, XK_F4, XK_F4
+    KS 71, XK_F5, XK_F5
+    KS 72, XK_F6, XK_F6
+    KS 73, XK_F7, XK_F7
+    KS 74, XK_F8, XK_F8
+    KS 75, XK_F9, XK_F9
+    KS 76, XK_F10, XK_F10
+    KS 95, XK_F11, XK_F11
+    KS 96, XK_F12, XK_F12
+    KS 105, XK_Control_R, XK_Control_R
+    KS 108, XK_Alt_R, XK_Alt_R
+    KS 111, XK_Up, XK_Up
+    KS 113, XK_Left, XK_Left
+    KS 114, XK_Right, XK_Right
+    KS 116, XK_Down, XK_Down
+    KS 133, XK_Super_L, XK_Super_L
+    KS 134, XK_Super_R, XK_Super_R
+    ret
+
+; ----------------------------------------------------------------------------
+; init_input — phase 4d.1 stub. Zeros the grab tables; evdev wiring
+; arrives in 4d.2.
+; ----------------------------------------------------------------------------
+init_input:
+    lea rdi, [key_grabs]
+    xor eax, eax
+    mov ecx, MAX_KEY_GRABS * KEY_GRAB_SIZE
+    rep stosb
+    mov dword [active_kbd_slot], -1
+    mov dword [active_kbd_window], 0
+    ret
+
+; ============================================================================
+; handle_grab_key — edi = slot, rsi = req ptr.
+;
+; Request:
+;   +0 opcode (33)        +1 owner-events (BOOL)
+;   +2 length             +4 grab-window
+;   +8 modifiers (CARD16) +10 key (CARD8 = keycode)
+;   +11 pointer-mode (u8) +12 keyboard-mode (u8)
+;
+; Allocates a grab slot. No reply.
+; ============================================================================
+handle_grab_key:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov ebx, edi
+    mov r12, rsi
+
+    mov r13d, [r12 + 4]
+    movzx r14d, word [r12 + 8]
+    movzx eax, byte [r12 + 10]
+
+    xor ecx, ecx
+.gk_loop:
+    cmp ecx, MAX_KEY_GRABS
+    jge .gk_done
+    mov rdx, rcx
+    imul rdx, KEY_GRAB_SIZE
+    lea rdx, [key_grabs + rdx]
+    cmp dword [rdx], 0
+    je .gk_take
+    inc ecx
+    jmp .gk_loop
+.gk_take:
+    mov [rdx + 0], r13d
+    mov [rdx + 4], ebx
+    mov [rdx + 8], al
+    mov byte [rdx + 9], 0
+    mov [rdx + 10], r14w
+.gk_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_ungrab_key — rsi = req ptr. Clears matching grab(s). No reply.
+; ============================================================================
+handle_ungrab_key:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rsi
+    mov r12d, [rbx + 4]
+    movzx r13d, byte [rbx + 1]
+    movzx eax, word [rbx + 8]
+    mov esi, eax
+    xor ecx, ecx
+.uk_loop:
+    cmp ecx, MAX_KEY_GRABS
+    jge .uk_done
+    mov rdx, rcx
+    imul rdx, KEY_GRAB_SIZE
+    lea rdx, [key_grabs + rdx]
+    cmp dword [rdx], r12d
+    jne .uk_next
+    movzx eax, byte [rdx + 8]
+    cmp eax, r13d
+    jne .uk_next
+    movzx eax, word [rdx + 10]
+    cmp eax, esi
+    jne .uk_next
+    mov dword [rdx], 0
+.uk_next:
+    inc ecx
+    jmp .uk_loop
+.uk_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_grab_keyboard — edi = slot, rsi = req ptr. Records grab,
+; replies Success.
+; ============================================================================
+handle_grab_keyboard:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov eax, [rsi + 4]
+    mov [active_kbd_window], eax
+    mov [active_kbd_slot], ebx
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 0
+    mov ecx, [r12 + 8]
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 0
+    mov dword [rdi + 8], 0
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_grab_pointer — edi = slot. Phase 4d.1 stub: replies Success.
+; ============================================================================
+handle_grab_pointer:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 0
+    mov ecx, [r12 + 8]
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 0
+    mov dword [rdi + 8], 0
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+
     pop r12
     pop rbx
     ret
