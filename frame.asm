@@ -6301,6 +6301,18 @@ init_compositor:
     ja .ic_fail_other
     mov [drm_dumb_addr], rax
 
+    ; --- Initial background fill BEFORE ADDFB. The phase 2b modeset
+    ;     path works exactly because it does this order: fill → ADDFB
+    ;     → SETCRTC. The kernel's ADDFB sets up GTT coherency on the
+    ;     buffer's current pages; writes done AFTER ADDFB sit in CPU
+    ;     write-back cache and never reach the panel without an
+    ;     explicit flush. So we paint the initial blue here.
+    mov rdi, [drm_dumb_addr]
+    mov rcx, [drm_dumb_size]
+    shr rcx, 2
+    mov eax, COMP_BG_COLOR
+    rep stosd
+
     ; --- ADDFB ---
     lea rdi, [drm_fb_cmd]
     xor eax, eax
@@ -6503,27 +6515,20 @@ recomposite_screen:
     jmp .rs_loop
 
 .rs_done_pop:
-    ; Memory barrier — orders prior stores. NOT a cache flush.
-    mfence
-
-    ; --- DRM_IOCTL_MODE_DIRTYFB: tell the kernel the framebuffer
-    ; contents changed, so it flushes any GTT / cache state and kicks
-    ; the panel out of self-refresh. Without this, subsequent
-    ; recomposite writes can sit in CPU cache invisibly — the first
-    ; recomposite happens to propagate (cache evictions during fill),
-    ; but later ones don't until the process exits.
-    lea rdi, [drm_dirty_cmd]
-    mov eax, [drm_fb_id]
-    mov [rdi + 0], eax                       ; fb_id
-    mov dword [rdi + 4], 0                   ; flags
-    mov dword [rdi + 8], 0                   ; color
-    mov dword [rdi + 12], 0                  ; num_clips (0 = whole fb)
-    mov qword [rdi + 16], 0                  ; clips_ptr
-    mov rax, SYS_IOCTL
-    mov rdi, [drm_fd]
-    mov esi, DRM_IOCTL_MODE_DIRTYFB
-    lea rdx, [drm_dirty_cmd]
-    syscall
+    ; --- clflush the entire framebuffer. The DRM dumb-buffer mmap on
+    ; i915 is write-back cached; our rep stosd + draw_rect writes land
+    ; in CPU L1/L2 and never reach memory (and therefore never reach
+    ; the panel's scan-out) without explicit flushing. clflush is
+    ; per-64-byte cache line; we sweep the whole 9.2 MB buffer with one
+    ; `rep`-flavoured loop. ~144k cache lines, sub-ms total.
+    mov rdi, [drm_dumb_addr]
+    mov rcx, [drm_dumb_size]
+.rs_flush:
+    clflush [rdi]
+    add rdi, 64
+    sub rcx, 64
+    ja .rs_flush
+    sfence
 
     pop r13
     pop r12
