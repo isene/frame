@@ -198,9 +198,11 @@ display_num:        resq 1
 clients_meta:       resb MAX_CLIENTS * CLIENT_META_SIZE
 clients_bufs:       resb MAX_CLIENTS * CLIENT_BUF_SIZE
 
-; pollfd_buf[17] — listen_fd + up to 16 client fds. Rebuilt each poll
-; iteration (sub-microsecond — 17 × 8 = 136 bytes of writes).
-pollfd_buf:         resb (MAX_CLIENTS + 1) * 8
+; pollfd_buf — listen_fd + up to MAX_CLIENTS client fds + up to
+; MAX_INPUTS evdev devices. Rebuilt each poll iteration; ~1.2 KB of
+; writes at full census, sub-microsecond. MAX_INPUTS is defined further
+; down (16) — total = 1 + 128 + 16 = 145 entries.
+pollfd_buf:         resb (MAX_CLIENTS + 1 + 16) * 8
 
 ; Atom interning table. Atom 0 = None. Atoms 1..predef_count_max are
 ; X11's predefined set (PRIMARY, ATOM, STRING, WM_NAME, ...).
@@ -290,6 +292,15 @@ key_grabs:          resb MAX_KEY_GRABS * KEY_GRAB_SIZE
 ; UngrabKeyboard. -1 = no active grab.
 active_kbd_slot:    resd 1
 active_kbd_window:  resd 1
+
+; ---- Phase 4d.2 evdev integration -----------------------------------------
+; Up to 16 /dev/input/event* devices opened at startup. Polled
+; alongside the X11 listen + client fds. Modifier state tracked in
+; mod_state and reported in every KeyPress's state field.
+%define MAX_INPUTS       16
+input_fds:          resd MAX_INPUTS
+input_fd_count:     resd 1
+mod_state:          resd 1
 
 ; ---- ConfigureWindow / ChangeWindowAttributes value-mask bits -------------
 ; (numeric defines used by the handlers; not in BSS)
@@ -386,6 +397,10 @@ log_serve_ready:    db "serve loop ready, polling listen + clients", 10
 log_serve_ready_len equ $ - log_serve_ready
 log_max_clients:    db "refusing connection, all 128 client slots in use", 10
 log_max_clients_len equ $ - log_max_clients
+log_input_pre:      db "opened ", 0
+log_input_pre_len   equ $ - log_input_pre - 1
+log_input_suf:      db " input device(s)", 10
+log_input_suf_len   equ $ - log_input_suf
 log_atom_new:       db "  intern-atom new id=", 0
 log_atom_new_len   equ $ - log_atom_new - 1
 log_atom_known:     db "  intern-atom known id=", 0
@@ -2657,7 +2672,7 @@ serve_loop:
     xor ecx, ecx                             ; client slot index
 .sl_build:
     cmp ecx, MAX_CLIENTS
-    jge .sl_poll
+    jge .sl_build_inputs
     mov rax, rcx
     imul rax, CLIENT_META_SIZE
     mov edx, [clients_meta + rax]            ; fd (or -1)
@@ -2669,10 +2684,26 @@ serve_loop:
     mov word [pollfd_buf + rax + 6], 0
     inc ecx
     jmp .sl_build
+.sl_build_inputs:
+    ; --- Now append input device pollfds at indices
+    ;     (MAX_CLIENTS + 1) .. (MAX_CLIENTS + 1 + MAX_INPUTS - 1).
+    xor ecx, ecx
+.sl_build_in_loop:
+    cmp ecx, MAX_INPUTS
+    jge .sl_poll
+    mov edx, [input_fds + rcx*4]             ; fd (or -1)
+    mov eax, MAX_CLIENTS + 1
+    add eax, ecx
+    shl eax, 3
+    mov [pollfd_buf + rax], edx
+    mov word [pollfd_buf + rax + 4], 1       ; POLLIN
+    mov word [pollfd_buf + rax + 6], 0
+    inc ecx
+    jmp .sl_build_in_loop
 .sl_poll:
     mov rax, SYS_POLL
     lea rdi, [pollfd_buf]
-    mov esi, MAX_CLIENTS + 1
+    mov esi, MAX_CLIENTS + 1 + MAX_INPUTS
     mov edx, -1                              ; infinite timeout
     syscall
     test rax, rax
@@ -2710,7 +2741,7 @@ serve_loop:
     xor ecx, ecx
 .sl_walk:
     cmp ecx, MAX_CLIENTS
-    jge .sl_iter
+    jge .sl_walk_inputs
     push rcx
     mov rax, rcx
     inc rax
@@ -2730,6 +2761,27 @@ serve_loop:
 .sl_walk_next:
     inc ecx
     jmp .sl_walk
+.sl_walk_inputs:
+    ; --- Walk input pollfds and process anyone who has POLLIN.
+    xor ecx, ecx
+.sl_iw:
+    cmp ecx, MAX_INPUTS
+    jge .sl_iter
+    mov eax, MAX_CLIENTS + 1
+    add eax, ecx
+    shl eax, 3
+    movzx edx, word [pollfd_buf + rax + 6]
+    test edx, edx
+    jz .sl_iw_next
+    mov edi, [input_fds + rcx*4]
+    cmp edi, 0
+    js .sl_iw_next
+    push rcx
+    call process_input
+    pop rcx
+.sl_iw_next:
+    inc ecx
+    jmp .sl_iw
 
 ; ============================================================================
 ; client_process — read everything available on this client and drain
@@ -5175,16 +5227,87 @@ init_keysyms:
     ret
 
 ; ----------------------------------------------------------------------------
-; init_input — phase 4d.1 stub. Zeros the grab tables; evdev wiring
-; arrives in 4d.2.
+; init_input — phase 4d.2: zero grab tables, then walk
+; /dev/input/event0..31 and keep every fd that opens. Pre-fills the
+; first MAX_INPUTS slots with -1.
+;
+; Best-effort. When run as a regular user without input-group access,
+; every open fails with EACCES and input_fd_count stays at 0; input
+; just doesn't fire. Run as root from a VT (where the DRM modeset
+; path is anyway) for the real behaviour.
 ; ----------------------------------------------------------------------------
 init_input:
+    push rbx
+    push r12
+    push r13
+    ; Zero key-grab table + state.
     lea rdi, [key_grabs]
     xor eax, eax
     mov ecx, MAX_KEY_GRABS * KEY_GRAB_SIZE
     rep stosb
     mov dword [active_kbd_slot], -1
     mov dword [active_kbd_window], 0
+    mov dword [mod_state], 0
+    ; Pre-fill input_fds with -1.
+    lea rdi, [input_fds]
+    mov eax, -1
+    mov ecx, MAX_INPUTS
+    rep stosd
+    mov dword [input_fd_count], 0
+
+    ; Walk event0..event31; stash openable fds.
+    xor ebx, ebx
+.ii_loop:
+    cmp ebx, INPUT_DEV_MAX
+    jge .ii_done
+    cmp dword [input_fd_count], MAX_INPUTS
+    jge .ii_done
+    ; Build "/dev/input/eventN" in input_dev_path.
+    lea rdi, [input_dev_path]
+    lea rsi, [input_dev_pre]
+.ii_cp:
+    mov al, [rsi]
+    test al, al
+    jz .ii_cp_done
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    jmp .ii_cp
+.ii_cp_done:
+    mov eax, ebx
+    call u64_to_ascii
+    mov byte [rdi], 0
+    ; open O_RDONLY | O_NONBLOCK = 0 | 0x800
+    mov rax, SYS_OPEN
+    lea rdi, [input_dev_path]
+    mov esi, 0x800                            ; O_NONBLOCK
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .ii_next
+    ; Store the fd.
+    mov r13d, [input_fd_count]
+    mov [input_fds + r13*4], eax
+    inc dword [input_fd_count]
+.ii_next:
+    inc ebx
+    jmp .ii_loop
+.ii_done:
+    ; Log how many we got.
+    mov rsi, log_prefix
+    mov rdx, 7
+    call write_stderr
+    mov rsi, log_input_pre
+    mov rdx, log_input_pre_len
+    call write_stderr
+    mov eax, [input_fd_count]
+    call write_u64_stderr
+    mov rsi, log_input_suf
+    mov rdx, log_input_suf_len
+    call write_stderr
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; ============================================================================
@@ -5339,6 +5462,225 @@ handle_grab_pointer:
     mov rdx, 32
     syscall
 
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; ============================================================================
+; PHASE 4d.2 — evdev → KeyPress event delivery.
+; ============================================================================
+
+; Modifier-bit defines matching X11's "state" field in KeyPress events.
+%define MOD_SHIFT       0x01
+%define MOD_LOCK        0x02
+%define MOD_CONTROL     0x04
+%define MOD_MOD1        0x08
+%define MOD_MOD4        0x40
+
+; ----------------------------------------------------------------------------
+; process_input — edi = fd. Reads up to INPUT_BATCH_BYTES worth of
+; input_event records and dispatches each.
+; ----------------------------------------------------------------------------
+process_input:
+    push rbx
+    push r12
+    push r13
+    mov r12d, edi                            ; fd
+    ; read()
+    mov rax, SYS_READ
+    mov rdi, r12
+    lea rsi, [input_event_batch]
+    mov rdx, INPUT_BATCH_BYTES
+    syscall
+    test rax, rax
+    jle .pi_done                             ; 0=EOF, <0=error/EAGAIN
+    mov r13, rax                             ; total bytes
+    xor ebx, ebx
+.pi_event:
+    cmp rbx, r13
+    jge .pi_done
+    lea rdi, [input_event_batch + rbx]
+    call dispatch_input_event
+    add rbx, INPUT_EVENT_SIZE
+    jmp .pi_event
+.pi_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; dispatch_input_event — rdi = pointer to 24-byte input_event. We only
+; care about EV_KEY events: update modifier state if it's a modifier
+; key, then check key_grabs[] for a matching grab.
+; ----------------------------------------------------------------------------
+dispatch_input_event:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    movzx eax, word [rbx + 16]               ; type
+    cmp eax, EV_KEY
+    jne .die_done
+
+    movzx r12d, word [rbx + 18]              ; code (evdev keycode)
+    mov r13d, [rbx + 20]                     ; value (0=rel,1=press,2=repeat)
+
+    ; If modifier key: adjust mod_state. (Key repeats don't toggle.)
+    cmp r12d, 29
+    je .die_ctrl
+    cmp r12d, 97
+    je .die_ctrl
+    cmp r12d, 42
+    je .die_shift
+    cmp r12d, 54
+    je .die_shift
+    cmp r12d, 56
+    je .die_alt
+    cmp r12d, 100
+    je .die_alt
+    cmp r12d, 125
+    je .die_mod4
+    cmp r12d, 126
+    je .die_mod4
+    jmp .die_check_grab
+
+.die_ctrl:
+    mov al, MOD_CONTROL
+    jmp .die_apply_mod
+.die_shift:
+    mov al, MOD_SHIFT
+    jmp .die_apply_mod
+.die_alt:
+    mov al, MOD_MOD1
+    jmp .die_apply_mod
+.die_mod4:
+    mov al, MOD_MOD4
+.die_apply_mod:
+    test r13d, r13d
+    jz .die_mod_release
+    cmp r13d, 1
+    jne .die_check_grab                       ; ignore repeat for mod
+    movzx ecx, byte [mod_state]
+    or ecx, eax
+    mov [mod_state], ecx
+    jmp .die_check_grab
+.die_mod_release:
+    movzx ecx, byte [mod_state]
+    not eax
+    and ecx, eax
+    mov [mod_state], ecx
+
+.die_check_grab:
+    ; Only fire on press (value=1) for the grab check.
+    cmp r13d, 1
+    jne .die_done
+
+    ; x11_keycode = evdev_code + 8.
+    mov eax, r12d
+    add eax, 8
+
+    ; Find a matching grab.
+    push rax                                  ; save x11_keycode
+    mov edi, eax
+    movzx esi, byte [mod_state]
+    call find_key_grab
+    pop rdx                                   ; rdx = x11_keycode
+    test rax, rax
+    jz .die_done                              ; no grab — drop
+
+    ; rax = grab record ptr. Send KeyPress to its client.
+    mov ebx, [rax + 0]                       ; window
+    mov edi, [rax + 4]                       ; client slot
+    mov esi, edx                              ; keycode
+    movzx ecx, byte [mod_state]
+    mov edx, ebx                             ; window
+    call send_key_press
+
+.die_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; find_key_grab — edi = x11 keycode, esi = mod state. Returns matching
+; grab record ptr in rax, or 0.
+; ----------------------------------------------------------------------------
+find_key_grab:
+    push rbx
+    push r12
+    push r13
+    mov r12d, edi
+    mov r13d, esi
+    xor ebx, ebx
+.fkg_loop:
+    cmp ebx, MAX_KEY_GRABS
+    jge .fkg_miss
+    mov rax, rbx
+    imul rax, KEY_GRAB_SIZE
+    lea rax, [key_grabs + rax]
+    cmp dword [rax], 0
+    je .fkg_next
+    movzx ecx, byte [rax + 8]
+    cmp ecx, r12d
+    jne .fkg_next
+    movzx ecx, word [rax + 10]
+    cmp ecx, r13d
+    jne .fkg_next
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.fkg_next:
+    inc ebx
+    jmp .fkg_loop
+.fkg_miss:
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; send_key_press — edi = client slot, esi = x11 keycode, ecx = mod
+; state, edx = grab_window. Emits a 32-byte KeyPress event on the
+; client's fd.
+; ----------------------------------------------------------------------------
+send_key_press:
+    push rbx
+    push r12
+    push r13
+    mov ebx, edi
+    mov r12d, esi
+    mov r13d, edx
+    push rcx                                  ; mod_state on stack
+    mov eax, ebx
+    call client_meta_addr
+    mov rdi, rax                              ; meta ptr
+
+    lea rsi, [reply_buf]
+    mov byte [rsi + 0], 2                     ; KeyPress
+    mov [rsi + 1], r12b                       ; detail (keycode)
+    mov eax, [rdi + 8]
+    mov [rsi + 2], ax                         ; seq (client's last)
+    mov dword [rsi + 4], 0                    ; time
+    mov dword [rsi + 8], X_ROOT_WINDOW        ; root
+    mov [rsi + 12], r13d                      ; event window
+    mov dword [rsi + 16], 0                   ; child
+    mov dword [rsi + 20], 0                   ; root-x, root-y
+    mov dword [rsi + 24], 0                   ; event-x, event-y
+    pop rax                                   ; mod_state
+    mov [rsi + 28], ax                        ; state
+    mov byte [rsi + 30], 1                    ; same-screen
+    mov byte [rsi + 31], 0
+
+    mov edi, [rdi]                            ; client fd
+    mov rax, SYS_WRITE
+    mov rdx, 32
+    syscall
+    pop r13
     pop r12
     pop rbx
     ret
