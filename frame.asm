@@ -414,6 +414,13 @@ log_input_pre:      db "opened ", 0
 log_input_pre_len   equ $ - log_input_pre - 1
 log_input_suf:      db " input device(s)", 10
 log_input_suf_len   equ $ - log_input_suf
+log_comp_pre:       db "compositor: mode ", 0
+log_comp_pre_len    equ $ - log_comp_pre - 1
+log_comp_x:         db "x"
+log_comp_pitch:     db ", pitch ", 0
+log_comp_pitch_len  equ $ - log_comp_pitch - 1
+log_comp_size:      db ", size ", 0
+log_comp_size_len   equ $ - log_comp_size - 1
 log_atom_new:       db "  intern-atom new id=", 0
 log_atom_new_len   equ $ - log_atom_new - 1
 log_atom_known:     db "  intern-atom known id=", 0
@@ -6331,6 +6338,35 @@ init_compositor:
     js .ic_fail_other
 
     mov byte [compositor_active], 1
+
+    ; Log what we got so we can verify mode/pitch/size after the fact.
+    mov rsi, log_prefix
+    mov rdx, 7
+    call write_stderr
+    mov rsi, log_comp_pre
+    mov rdx, log_comp_pre_len
+    call write_stderr
+    movzx eax, word [drm_modes_buf + 4]
+    call write_u64_stderr
+    mov rsi, log_comp_x
+    mov rdx, 1
+    call write_stderr
+    movzx eax, word [drm_modes_buf + 14]
+    call write_u64_stderr
+    mov rsi, log_comp_pitch
+    mov rdx, log_comp_pitch_len
+    call write_stderr
+    mov eax, [drm_dumb_pitch]
+    call write_u64_stderr
+    mov rsi, log_comp_size
+    mov rdx, log_comp_size_len
+    call write_stderr
+    mov rax, [drm_dumb_size]
+    call write_u64_stderr
+    lea rsi, [probe_conn_nl]
+    mov rdx, 1
+    call write_stderr
+
     call recomposite_screen
     xor eax, eax
     pop r13
@@ -6365,9 +6401,10 @@ init_compositor:
     ret
 
 ; ----------------------------------------------------------------------------
-; recomposite_screen — paint background, then walk every mapped window
-; and draw its rect in a per-XID colour. No-op if compositor_active
-; is 0.
+; recomposite_screen — paint background (via rep stosd over the whole
+; dumb buffer — proven to work in do_modeset), then walk every mapped
+; non-root window and draw its rect in a per-XID colour. No-op if
+; compositor_active is 0.
 ; ----------------------------------------------------------------------------
 recomposite_screen:
     cmp byte [compositor_active], 0
@@ -6375,71 +6412,51 @@ recomposite_screen:
     push rbx
     push r12
     push r13
-    push r14
-    push r15
 
-    ; --- Fill background: write pixels by row to respect pitch.
-    movzx r12d, word [drm_modes_buf + 4]     ; width
-    movzx r13d, word [drm_modes_buf + 14]    ; height
-    mov r14d, [drm_dumb_pitch]
-    mov r15, [drm_dumb_addr]
-    xor ecx, ecx                              ; row
-.rs_bg_row:
-    cmp ecx, r13d
-    jge .rs_walk
-    mov rdi, r15
-    mov eax, ecx
-    imul eax, r14d
-    add rdi, rax                              ; row start
+    ; --- Background fill across the whole buffer. drm_dumb_size always
+    ;     covers height × pitch (with any kernel alignment baked in), so
+    ;     a single rep stosd covers everything that's mapped without
+    ;     needing the row-by-row math.
+    mov rdi, [drm_dumb_addr]
+    mov rcx, [drm_dumb_size]
+    shr rcx, 2
     mov eax, COMP_BG_COLOR
-    mov edx, r12d                             ; pixels per row
-    push rcx
-.rs_bg_px:
-    test edx, edx
-    jz .rs_bg_row_done
-    mov [rdi], eax
-    add rdi, 4
-    dec edx
-    jmp .rs_bg_px
-.rs_bg_row_done:
-    pop rcx
-    inc ecx
-    jmp .rs_bg_row
+    rep stosd
 
-.rs_walk:
-    ; --- Walk window table, draw each mapped non-root window.
-    xor ecx, ecx
-.rs_w_loop:
-    cmp ecx, MAX_WINDOWS
+    ; --- Walk the window table, draw every mapped non-root window.
+    xor ebx, ebx
+.rs_loop:
+    cmp ebx, MAX_WINDOWS
     jge .rs_done_pop
-    mov rax, rcx
+    mov rax, rbx
     imul rax, WINDOW_REC_SIZE
-    lea rbx, [windows + rax]
-    mov eax, [rbx]
+    lea r12, [windows + rax]
+    mov eax, [r12]
     test eax, eax
-    jz .rs_w_next
+    jz .rs_next
     cmp eax, X_ROOT_WINDOW
-    je .rs_w_next
-    cmp byte [rbx + 28], 0
-    je .rs_w_next                             ; not mapped
-    ; Got a visible window. Draw it.
-    push rcx
-    mov edi, eax                              ; xid (for colour)
+    je .rs_next
+    cmp byte [r12 + 28], 0
+    je .rs_next
+
+    ; Compute colour from xid.
+    mov edi, eax
     call window_color
-    mov edx, eax                              ; colour in edx
-    movsx eax, word [rbx + 8]                 ; x (s16)
-    movsx esi, word [rbx + 10]                ; y
-    movzx edi, word [rbx + 12]                ; width
-    movzx ecx, word [rbx + 14]                ; height
+    mov r13d, eax                            ; r13d = colour
+
+    ; Hand geometry to draw_rect: eax=x, esi=y, edi=w, ecx=h, edx=colour.
+    movsx eax, word [r12 + 8]
+    movsx esi, word [r12 + 10]
+    movzx edi, word [r12 + 12]
+    movzx ecx, word [r12 + 14]
+    mov edx, r13d
     call draw_rect
-    pop rcx
-.rs_w_next:
-    inc ecx
-    jmp .rs_w_loop
+
+.rs_next:
+    inc ebx
+    jmp .rs_loop
 
 .rs_done_pop:
-    pop r15
-    pop r14
     pop r13
     pop r12
     pop rbx
@@ -6448,12 +6465,10 @@ recomposite_screen:
 
 ; ----------------------------------------------------------------------------
 ; window_color — edi = xid. Returns a non-dark RGB colour in eax.
-; Hash via Knuth's golden-ratio constant; OR in 0x808080 so every
-; colour stays visible against the dark background.
 ; ----------------------------------------------------------------------------
 window_color:
     mov eax, edi
-    imul eax, 0x9E3779B1
+    imul eax, eax, 0x9E3779B1
     or eax, 0x808080
     and eax, 0x00FFFFFF
     ret
@@ -6461,7 +6476,19 @@ window_color:
 ; ----------------------------------------------------------------------------
 ; draw_rect — eax = x (s32), esi = y (s32), edi = w (u32), ecx = h (u32),
 ; edx = colour.
-; Clips to screen bounds before drawing.
+;
+; Cleanly clips to screen bounds, then writes one row per outer
+; iteration via rep stosd. All persistent values held in callee-saved
+; registers so the inner loop's rep stosd (which clobbers rcx/rdi)
+; can't lose them.
+;
+; Register plan:
+;   rbx = x (after clipping)
+;   r12 = current y
+;   r13 = w in pixels (after clipping)
+;   r14 = rows remaining
+;   r15 = drm_dumb_addr
+;   rbp = colour
 ; ----------------------------------------------------------------------------
 draw_rect:
     push rbx
@@ -6470,69 +6497,75 @@ draw_rect:
     push r14
     push r15
     push rbp
-    mov ebp, edx                              ; colour
+    mov ebp, edx                             ; ebp = colour
 
-    ; --- Clip ---
-    movzx r12d, word [drm_modes_buf + 4]     ; screen width
-    movzx r13d, word [drm_modes_buf + 14]    ; screen height
+    ; --- Clip x and width ---
+    movzx r12d, word [drm_modes_buf + 4]     ; screen w
+    movzx r13d, word [drm_modes_buf + 14]    ; screen h
     test eax, eax
     jns .dr_x_ok
-    add edi, eax                              ; w += x (which is negative)
-    xor eax, eax
+    add edi, eax                              ; w shrinks by |x|
+    xor eax, eax                              ; x = 0
 .dr_x_ok:
+    cmp eax, r12d
+    jge .dr_done                              ; x off-screen
+    mov edx, eax
+    add edx, edi                              ; x + w
+    cmp edx, r12d
+    jbe .dr_w_ok
+    mov edi, r12d
+    sub edi, eax                              ; w = screen_w - x
+.dr_w_ok:
+    cmp edi, 0
+    jle .dr_done                              ; w ≤ 0
+
+    ; --- Clip y and height ---
     test esi, esi
     jns .dr_y_ok
     add ecx, esi
     xor esi, esi
 .dr_y_ok:
-    mov ebx, eax
-    add ebx, edi
-    cmp ebx, r12d
-    jbe .dr_w_ok
-    mov edi, r12d
-    sub edi, eax
-.dr_w_ok:
-    mov ebx, esi
-    add ebx, ecx
-    cmp ebx, r13d
+    cmp esi, r13d
+    jge .dr_done
+    mov edx, esi
+    add edx, ecx
+    cmp edx, r13d
     jbe .dr_h_ok
     mov ecx, r13d
     sub ecx, esi
 .dr_h_ok:
-    cmp edi, 0
-    jle .dr_done
     cmp ecx, 0
     jle .dr_done
 
-    ; --- Draw ---
-    mov r14d, [drm_dumb_pitch]
+    ; --- Latch values into callee-saved registers ---
+    mov ebx, eax                              ; rbx = x
+    mov r12d, esi                             ; r12 = current y
+    mov r13d, edi                             ; r13 = w
+    mov r14d, ecx                             ; r14 = rows remaining
     mov r15, [drm_dumb_addr]
-    mov ebx, ecx                              ; remaining rows
-    mov r13d, esi                             ; current y
+
 .dr_row:
-    test ebx, ebx
+    test r14d, r14d
     jz .dr_done
+
+    ; Row start = addr + y*pitch + x*4
     mov rdi, r15
-    mov edx, r13d
-    imul edx, r14d
-    add rdi, rdx                              ; row start
-    mov edx, eax
-    shl edx, 2
-    add rdi, rdx                              ; + x*4
-    mov edx, edi                              ; columns remaining
-    mov ecx, edi                              ; (reuse: column count)
-    mov edx, eax                              ; tmp
-    mov edx, ebp                              ; colour into edx
-.dr_col_setup:
-    ; Use rep stosd: rcx = pixel count = w, eax = colour.
-    push rax
-    mov ecx, edi                              ; w pixels
+    mov eax, r12d
+    imul eax, [drm_dumb_pitch]
+    add rdi, rax
+    mov eax, ebx
+    shl eax, 2
+    add rdi, rax
+
+    ; Paint w pixels in this row.
+    mov ecx, r13d
     mov eax, ebp
     rep stosd
-    pop rax
-    inc r13d
-    dec ebx
+
+    inc r12d
+    dec r14d
     jmp .dr_row
+
 .dr_done:
     pop rbp
     pop r15
