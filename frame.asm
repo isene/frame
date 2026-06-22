@@ -127,6 +127,33 @@ DEFAULT REL
 %define X_SCREEN_W_MM        508          ; ~24" at 96 dpi (placeholder)
 %define X_SCREEN_H_MM        286
 %define X_ROOT_WINDOW        0x00000080   ; arbitrary, server-allocated
+
+; CW* (CreateWindow / ChangeWindowAttributes) value-mask bits, in the
+; order set bits are walked LSB → MSB.
+%define CW_BACK_PIXMAP       0x0001
+%define CW_BACK_PIXEL        0x0002
+%define CW_BORDER_PIXMAP     0x0004
+%define CW_BORDER_PIXEL      0x0008
+%define CW_BIT_GRAVITY       0x0010
+%define CW_WIN_GRAVITY       0x0020
+%define CW_BACKING_STORE     0x0040
+%define CW_BACKING_PLANES    0x0080
+%define CW_BACKING_PIXEL     0x0100
+%define CW_OVERRIDE_REDIRECT 0x0200
+%define CW_SAVE_UNDER        0x0400
+%define CW_EVENT_MASK        0x0800
+%define CW_DONT_PROPAGATE    0x1000
+%define CW_COLORMAP          0x2000
+%define CW_CURSOR            0x4000
+
+; ConfigureWindow value-mask bits.
+%define CFG_X                0x01
+%define CFG_Y                0x02
+%define CFG_WIDTH            0x04
+%define CFG_HEIGHT           0x08
+%define CFG_BORDER_WIDTH     0x10
+%define CFG_SIBLING          0x20
+%define CFG_STACK_MODE       0x40
 %define X_DEFAULT_CMAP       0x00000081
 %define X_ROOT_VISUAL_24     0x00000020   ; depth-24 TrueColor
 %define X_ROOT_VISUAL_32     0x00000021   ; depth-32 TrueColor + alpha
@@ -193,6 +220,33 @@ atom_strings:       resb ATOM_STRINGS_CAP
 ; bytes — at the full keycode range plus 1 keysym/keycode that's ~1 KB;
 ; future reply types like QueryFont return more).
 reply_buf:          resb 16384
+
+; ---- Phase 4b window table ------------------------------------------------
+; windows[MAX_WINDOWS] — one 32-byte record per live window. Slot 0
+; pre-occupied at startup by the root window (XID = X_ROOT_WINDOW). A
+; slot with xid = 0 is empty.
+;
+; Layout (32 bytes):
+;   +0  xid (u32)           0 = empty slot
+;   +4  parent (u32)
+;   +8  x  (s16)
+;   +10 y  (s16)
+;   +12 width  (u16)
+;   +14 height (u16)
+;   +16 border_width (u16)
+;   +18 depth  (u8)
+;   +19 class  (u8)  1=InputOutput 2=InputOnly
+;   +20 visual (u32)
+;   +24 event_mask (u32) — SubstructureRedirect / etc. for tile's root grab
+;   +28 mapped (u8)
+;   +29 override_redirect (u8)
+;   +30 pad (2)
+%define MAX_WINDOWS      512
+%define WINDOW_REC_SIZE  32
+windows:            resb MAX_WINDOWS * WINDOW_REC_SIZE
+
+; ---- ConfigureWindow / ChangeWindowAttributes value-mask bits -------------
+; (numeric defines used by the handlers; not in BSS)
 
 ; sockaddr_un used for both bind() and the unlink() path on shutdown.
 sockaddr_buf:       resb 128
@@ -624,6 +678,7 @@ _start:
     js .die_bind
     call init_atoms
     call init_clients
+    call init_windows
     jmp serve_loop
 
 .die_bind:
@@ -2794,8 +2849,20 @@ dispatch_request:
     pop rdx
     pop rax
 
+    cmp eax, 1
+    je .dr_create_window
+    cmp eax, 2
+    je .dr_change_window_attributes
     cmp eax, 3
     je .dr_get_window_attributes
+    cmp eax, 4
+    je .dr_destroy_window
+    cmp eax, 8
+    je .dr_map_window
+    cmp eax, 10
+    je .dr_unmap_window
+    cmp eax, 12
+    je .dr_configure_window
     cmp eax, 14
     je .dr_get_geometry
     cmp eax, 15
@@ -2854,6 +2921,7 @@ dispatch_request:
 
 .dr_get_geometry:
     mov edi, ebx
+    mov rsi, r12
     call handle_get_geometry
     jmp .dr_done
 
@@ -2880,7 +2948,47 @@ dispatch_request:
 
 .dr_get_window_attributes:
     mov edi, ebx
+    mov rsi, r12
     call handle_get_window_attributes
+    jmp .dr_done
+
+.dr_create_window:
+    mov edi, ebx
+    mov rsi, r12
+    mov edx, r13d
+    call handle_create_window
+    jmp .dr_done
+
+.dr_change_window_attributes:
+    mov edi, ebx
+    mov rsi, r12
+    mov edx, r13d
+    call handle_change_window_attributes
+    jmp .dr_done
+
+.dr_destroy_window:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_destroy_window
+    jmp .dr_done
+
+.dr_map_window:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_map_window
+    jmp .dr_done
+
+.dr_unmap_window:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_unmap_window
+    jmp .dr_done
+
+.dr_configure_window:
+    mov edi, ebx
+    mov rsi, r12
+    mov edx, r13d
+    call handle_configure_window
     jmp .dr_done
 
 .dr_query_best_size:
@@ -3087,9 +3195,10 @@ handle_get_property:
     ret
 
 ; ============================================================================
-; handle_get_geometry — edi = slot. Phase 4a stand-in: returns root-window
-; geometry for every drawable (no window table yet). Real per-window
-; geometry lands in phase 4b.
+; handle_get_geometry — edi = slot, rsi = request ptr. Real per-window
+; geometry from the window table. Falls back to root for unknown XIDs.
+;
+; Request: +4 drawable (WINDOW)
 ;
 ; Reply (32 bytes):
 ;   +0 1 (Reply)          +1 depth (CARD8)
@@ -3102,23 +3211,43 @@ handle_get_property:
 handle_get_geometry:
     push rbx
     push r12
+    push r13
     mov ebx, edi
+    mov r13, rsi
     mov eax, ebx
     call client_meta_addr
     mov r12, rax
 
+    mov edi, [r13 + 4]                       ; drawable xid
+    call window_lookup
+    test rax, rax
+    jnz .gg_have
+    ; Unknown XID — pretend it's the root. Real X servers would send a
+    ; Drawable error; phase 4b stays permissive so partial clients work.
+    xor eax, eax
+    mov edi, X_ROOT_WINDOW
+    call window_lookup
+.gg_have:
+    mov r13, rax                             ; window record ptr
+
     lea rdi, [reply_buf]
     mov byte [rdi + 0], 1
-    mov byte [rdi + 1], 24                   ; depth
+    movzx eax, byte [r13 + 18]
+    mov [rdi + 1], al                        ; depth
     mov ecx, [r12 + 8]
     mov [rdi + 2], cx
     mov dword [rdi + 4], 0
     mov dword [rdi + 8], X_ROOT_WINDOW
-    mov word [rdi + 12], 0                   ; x
-    mov word [rdi + 14], 0                   ; y
-    mov word [rdi + 16], X_SCREEN_W
-    mov word [rdi + 18], X_SCREEN_H
-    mov word [rdi + 20], 0                   ; border-width
+    mov ax, [r13 + 8]
+    mov [rdi + 12], ax                       ; x
+    mov ax, [r13 + 10]
+    mov [rdi + 14], ax                       ; y
+    mov ax, [r13 + 12]
+    mov [rdi + 16], ax                       ; width
+    mov ax, [r13 + 14]
+    mov [rdi + 18], ax                       ; height
+    mov ax, [r13 + 16]
+    mov [rdi + 20], ax                       ; border
     mov word [rdi + 22], 0
     mov dword [rdi + 24], 0
     mov dword [rdi + 28], 0
@@ -3129,39 +3258,86 @@ handle_get_geometry:
     mov rdx, 32
     syscall
 
+    pop r13
     pop r12
     pop rbx
     ret
 
 ; ============================================================================
-; handle_query_tree — edi = slot. Phase 4a stand-in: every query returns
-; "root = X_ROOT_WINDOW, parent = None, no children". Real tree lands in
-; phase 4b.
+; handle_query_tree — edi = slot. Walks the window table for the request's
+; window: returns parent + all windows whose parent matches.
 ;
-; Reply (32 bytes — n=0):
+; Request: +4 window (WINDOW)
+;
+; Reply (32 + 4N bytes where N = num children):
 ;   +0 1                  +1 0
-;   +2 seq                +4 reply length n (= 0)
-;   +8 root               +12 parent (0 = None)
+;   +2 seq                +4 reply length N
+;   +8 root               +12 parent
 ;   +16 num-children u16  +18 pad
-;   +20..31 pad
+;   +20..31 pad           +32..32+4N children
 ; ============================================================================
 handle_query_tree:
     push rbx
     push r12
+    push r13
+    push r14
+    push r15
     mov ebx, edi
     mov eax, ebx
     call client_meta_addr
     mov r12, rax
 
+    mov eax, ebx
+    call client_buf_addr
+    mov r13, rax                             ; request ptr
+    mov edi, [r13 + 4]                       ; window xid
+    call window_lookup
+    test rax, rax
+    jnz .qt_have
+    ; Unknown — treat as root (forgive bad XIDs in phase 4b).
+    xor eax, eax
+    mov edi, X_ROOT_WINDOW
+    call window_lookup
+.qt_have:
+    mov r13, rax                             ; window record
+    mov r14d, [r13]                          ; target xid
+
+    ; Build children list at reply_buf + 32, count in r15.
+    lea rdi, [reply_buf + 32]
+    xor r15d, r15d
+    xor ecx, ecx
+.qt_walk:
+    cmp ecx, MAX_WINDOWS
+    jge .qt_emit
+    mov rax, rcx
+    imul rax, WINDOW_REC_SIZE
+    lea rdx, [windows + rax]
+    mov eax, [rdx]                           ; xid
+    test eax, eax
+    jz .qt_walk_next
+    cmp eax, r14d
+    je .qt_walk_next                         ; don't list self
+    mov esi, [rdx + 4]                       ; parent
+    cmp esi, r14d
+    jne .qt_walk_next
+    mov [rdi], eax                           ; emit child xid
+    add rdi, 4
+    inc r15d
+.qt_walk_next:
+    inc ecx
+    jmp .qt_walk
+.qt_emit:
+    ; Header.
     lea rdi, [reply_buf]
     mov byte [rdi + 0], 1
     mov byte [rdi + 1], 0
     mov ecx, [r12 + 8]
     mov [rdi + 2], cx
-    mov dword [rdi + 4], 0                   ; reply length (no children)
+    mov [rdi + 4], r15d                      ; reply length in 4u (= N)
     mov dword [rdi + 8], X_ROOT_WINDOW
-    mov dword [rdi + 12], 0                  ; parent = None
-    mov word [rdi + 16], 0                   ; num-children
+    mov eax, [r13 + 4]                       ; parent
+    mov [rdi + 12], eax
+    mov [rdi + 16], r15w                     ; num-children
     mov word [rdi + 18], 0
     mov dword [rdi + 20], 0
     mov dword [rdi + 24], 0
@@ -3170,9 +3346,14 @@ handle_query_tree:
     mov edi, [r12]
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
-    mov rdx, 32
+    mov rdx, r15
+    shl rdx, 2
+    add rdx, 32
     syscall
 
+    pop r15
+    pop r14
+    pop r13
     pop r12
     pop rbx
     ret
@@ -3348,43 +3529,81 @@ emit_canned_reply32:
     ret
 
 ; ============================================================================
-; handle_get_window_attributes — edi = slot. Returns default attrs for
-; any window (the phase 4a stub doesn't track windows). The reply is
-; 44 bytes (32 header + 12 body extras), so reply length field = 3.
+; handle_get_window_attributes — edi = slot, rsi = request ptr. Real
+; per-window attrs from the table.
 ;
-; Body fields chosen for "nothing surprising":
-;   backing-store = NotUseful, visual = root visual, class = InputOutput,
-;   map-state = Viewable, override-redirect = False, all event masks = 0.
+; Request: +4 window (WINDOW)
+;
+; Reply (44 bytes, length 3 in 4u):
+;   +0 1                  +1 backing-store
+;   +2 seq                +4 reply length 3
+;   +8 visual (u32)
+;   +12 class (u16)       +14 bit-gravity (u8)
+;   +15 win-gravity (u8)
+;   +16 backing-planes (u32)
+;   +20 backing-pixel (u32)
+;   +24 save-under (u8)
+;   +25 map-is-installed (u8)
+;   +26 map-state (u8)
+;   +27 override-redirect (u8)
+;   +28 colormap (u32)
+;   +32 all-event-masks (u32)
+;   +36 your-event-mask (u32)
+;   +40 do-not-propagate-mask (u16)
+;   +42 pad (2)
 ; ============================================================================
 handle_get_window_attributes:
     push rbx
     push r12
+    push r13
     mov ebx, edi
+    mov r13, rsi
     mov eax, ebx
     call client_meta_addr
     mov r12, rax
+
+    mov edi, [r13 + 4]
+    call window_lookup
+    test rax, rax
+    jnz .gwa_have
+    xor eax, eax
+    mov edi, X_ROOT_WINDOW
+    call window_lookup
+.gwa_have:
+    mov r13, rax                             ; window record
 
     lea rdi, [reply_buf]
     mov byte [rdi + 0], 1
     mov byte [rdi + 1], 0                    ; backing-store = NotUseful
     mov ecx, [r12 + 8]
     mov [rdi + 2], cx
-    mov dword [rdi + 4], 3                   ; reply length = 3 (12 extra bytes)
-    mov dword [rdi + 8], X_ROOT_VISUAL_24    ; visual
-    mov word [rdi + 12], 1                   ; class = InputOutput
-    mov byte [rdi + 14], 0                   ; bit-gravity = Forget
-    mov byte [rdi + 15], 1                   ; win-gravity = NorthWest
-    mov dword [rdi + 16], 0                  ; backing-planes
-    mov dword [rdi + 20], 0                  ; backing-pixel
-    mov byte [rdi + 24], 0                   ; save-under
-    mov byte [rdi + 25], 1                   ; map-is-installed
-    mov byte [rdi + 26], 2                   ; map-state = Viewable
-    mov byte [rdi + 27], 0                   ; override-redirect = False
-    mov dword [rdi + 28], X_DEFAULT_CMAP     ; colormap
-    mov dword [rdi + 32], 0                  ; all-event-masks
-    mov dword [rdi + 36], 0                  ; your-event-mask
-    mov word [rdi + 40], 0                   ; do-not-propagate-mask
-    mov word [rdi + 42], 0                   ; pad
+    mov dword [rdi + 4], 3
+    mov eax, [r13 + 20]
+    mov [rdi + 8], eax                       ; visual
+    movzx eax, byte [r13 + 19]
+    mov [rdi + 12], ax                       ; class (u16, comes from u8 field)
+    mov byte [rdi + 14], 0
+    mov byte [rdi + 15], 1
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov byte [rdi + 24], 0
+    mov byte [rdi + 25], 1
+    movzx eax, byte [r13 + 28]
+    test eax, eax
+    jz .gwa_not_viewable
+    mov byte [rdi + 26], 2                   ; Viewable
+    jmp .gwa_view_done
+.gwa_not_viewable:
+    mov byte [rdi + 26], 0                   ; Unmapped
+.gwa_view_done:
+    movzx eax, byte [r13 + 29]
+    mov [rdi + 27], al                       ; override-redirect
+    mov dword [rdi + 28], X_DEFAULT_CMAP
+    mov dword [rdi + 32], 0
+    mov eax, [r13 + 24]
+    mov [rdi + 36], eax                      ; your-event-mask
+    mov word [rdi + 40], 0
+    mov word [rdi + 42], 0
 
     mov edi, [r12]
     mov rax, SYS_WRITE
@@ -3392,6 +3611,7 @@ handle_get_window_attributes:
     mov rdx, 44
     syscall
 
+    pop r13
     pop r12
     pop rbx
     ret
@@ -3711,6 +3931,437 @@ handle_get_modifier_mapping:
     mov rdx, 48
     syscall
 
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; ============================================================================
+; PHASE 4b — window table + 7 window-management opcodes.
+; ============================================================================
+; The window record is 32 bytes (see windows: in BSS). Slot 0 is reserved
+; for the root window at startup. Lookup is linear scan over MAX_WINDOWS
+; (512) — sub-µs for the typical desktop's ~100 windows.
+;
+; Opcodes added in this phase:
+;
+;   CreateWindow            (1)  allocate + parse CW value-list (we
+;                                care about CW_OVERRIDE_REDIRECT and
+;                                CW_EVENT_MASK; other values consumed
+;                                from the list but ignored for now)
+;   ChangeWindowAttributes  (2)  same CW value-list parse; updates an
+;                                existing window. Tile sets the root
+;                                window's event_mask here to grab
+;                                SubstructureRedirect.
+;   DestroyWindow           (4)  remove from table; cascading destroy
+;                                of children (whose parent xid matches)
+;   MapWindow               (8)  mark mapped=1
+;   UnmapWindow            (10)  mark mapped=0
+;   ConfigureWindow        (12)  update geometry / stacking from
+;                                CFG_* value-list
+;
+; Plus upgraded GetGeometry / GetWindowAttributes / QueryTree to use
+; real per-window state (see those handlers above).
+; ============================================================================
+
+; ----------------------------------------------------------------------------
+; init_windows — zero the table, then register the root window at slot 0.
+; ----------------------------------------------------------------------------
+init_windows:
+    push rbx
+    ; Zero the whole table (all slots empty).
+    lea rdi, [windows]
+    xor eax, eax
+    mov ecx, MAX_WINDOWS * WINDOW_REC_SIZE
+    rep stosb
+    ; Slot 0 = root.
+    lea rbx, [windows]
+    mov dword [rbx + 0],  X_ROOT_WINDOW
+    mov dword [rbx + 4],  0                  ; root's parent = None
+    mov word  [rbx + 8],  0                  ; x
+    mov word  [rbx + 10], 0                  ; y
+    mov word  [rbx + 12], X_SCREEN_W
+    mov word  [rbx + 14], X_SCREEN_H
+    mov word  [rbx + 16], 0                  ; border-width
+    mov byte  [rbx + 18], 24                 ; depth
+    mov byte  [rbx + 19], 1                  ; class = InputOutput
+    mov dword [rbx + 20], X_ROOT_VISUAL_24
+    mov dword [rbx + 24], 0                  ; event_mask (tile will set this)
+    mov byte  [rbx + 28], 1                  ; mapped = true
+    mov byte  [rbx + 29], 0                  ; override-redirect
+    mov word  [rbx + 30], 0
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; window_lookup — edi = xid. Returns ptr to record in rax, or 0 if not
+; found.
+; ----------------------------------------------------------------------------
+window_lookup:
+    push rbx
+    xor ebx, ebx
+.wl_loop:
+    cmp ebx, MAX_WINDOWS
+    jge .wl_miss
+    mov rax, rbx
+    imul rax, WINDOW_REC_SIZE
+    lea rax, [windows + rax]
+    cmp [rax], edi
+    je .wl_hit
+    inc ebx
+    jmp .wl_loop
+.wl_hit:
+    pop rbx
+    ret
+.wl_miss:
+    xor eax, eax
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; window_alloc — find first empty slot, mark with xid. edi = xid.
+; Returns slot ptr in rax, or 0 if table is full.
+; ----------------------------------------------------------------------------
+window_alloc:
+    push rbx
+    xor ebx, ebx
+.wa_loop:
+    cmp ebx, MAX_WINDOWS
+    jge .wa_full
+    mov rax, rbx
+    imul rax, WINDOW_REC_SIZE
+    lea rax, [windows + rax]
+    cmp dword [rax], 0
+    je .wa_take
+    inc ebx
+    jmp .wa_loop
+.wa_take:
+    mov [rax], edi
+    pop rbx
+    ret
+.wa_full:
+    xor eax, eax
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; window_destroy — edi = xid. Removes the window plus every child whose
+; parent xid matches (cascading). Skips the root (xid = X_ROOT_WINDOW)
+; defensively so a misbehaving client can't blank our state.
+; ----------------------------------------------------------------------------
+window_destroy:
+    push rbx
+    push r12
+    push r13
+    cmp edi, X_ROOT_WINDOW
+    je .wd_done
+    mov r12d, edi                            ; xid being destroyed
+    xor ebx, ebx
+.wd_walk:
+    cmp ebx, MAX_WINDOWS
+    jge .wd_done
+    mov rax, rbx
+    imul rax, WINDOW_REC_SIZE
+    lea r13, [windows + rax]
+    mov eax, [r13]
+    test eax, eax
+    jz .wd_walk_next
+    cmp eax, r12d
+    je .wd_kill                              ; the window itself
+    mov edx, [r13 + 4]
+    cmp edx, r12d
+    je .wd_recurse                           ; a child — recurse
+    jmp .wd_walk_next
+.wd_kill:
+    mov dword [r13], 0                       ; mark empty
+    jmp .wd_walk_next
+.wd_recurse:
+    push rbx
+    mov edi, eax                             ; child xid
+    call window_destroy
+    pop rbx
+    ; After recursion, this slot may now be empty (or contain a
+    ; different window if the table got re-packed — we don't re-pack,
+    ; so it's the same slot, now zeroed by the recursive call's kill).
+.wd_walk_next:
+    inc ebx
+    jmp .wd_walk
+.wd_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; apply_cw_values — common parser for CreateWindow + ChangeWindowAttributes
+; value-lists. r13 = window record ptr, ecx = value-mask, rdx = ptr to the
+; CARD32 value-list. Walks the mask LSB→MSB; for each set bit, consumes
+; one CARD32 and (for the two attrs we track) updates the record.
+; ----------------------------------------------------------------------------
+apply_cw_values:
+    push rbx
+    push r12
+    push r14
+    mov ebx, ecx                             ; remaining mask
+    mov r12, rdx                             ; value list cursor
+    xor r14d, r14d                           ; bit index
+.av_loop:
+    test ebx, ebx
+    jz .av_done
+    bt ebx, 0
+    jnc .av_skip_bit
+    ; Bit r14 is set. Get the corresponding CARD32 and dispatch.
+    mov eax, [r12]
+    cmp r14d, 9                              ; CW_OVERRIDE_REDIRECT bit pos
+    je .av_override
+    cmp r14d, 11                             ; CW_EVENT_MASK bit pos
+    je .av_event_mask
+    jmp .av_advance
+.av_override:
+    mov [r13 + 29], al                       ; u8 boolean
+    jmp .av_advance
+.av_event_mask:
+    mov [r13 + 24], eax
+.av_advance:
+    add r12, 4
+.av_skip_bit:
+    shr ebx, 1
+    inc r14d
+    jmp .av_loop
+.av_done:
+    pop r14
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_create_window — edi = slot, rsi = req ptr, edx = req size in bytes.
+;
+; Request:
+;   +0 opcode (1)         +1 depth (CARD8)
+;   +2 length             +4 wid (WINDOW)
+;   +8 parent (WINDOW)    +12 x (INT16)
+;   +14 y (INT16)         +16 width (CARD16)
+;   +18 height (CARD16)   +20 border-width (CARD16)
+;   +22 class (CARD16)    +24 visual (VISUALID)
+;   +28 value-mask        +32 value-list
+;
+; No reply (the wid is supplied by the client).
+; ============================================================================
+handle_create_window:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov ebx, edi
+    mov r12, rsi                             ; req ptr
+    mov r14, rdx
+
+    mov edi, [r12 + 4]                       ; wid
+    test edi, edi
+    jz .cw_done                              ; 0 is invalid
+    call window_alloc
+    test rax, rax
+    jz .cw_done                              ; table full — silently drop
+    mov r13, rax                             ; record ptr
+
+    ; Initialise the record.
+    movzx eax, byte [r12 + 1]
+    mov [r13 + 18], al                       ; depth
+    mov eax, [r12 + 8]
+    mov [r13 + 4], eax                       ; parent
+    mov ax, [r12 + 12]
+    mov [r13 + 8], ax                        ; x
+    mov ax, [r12 + 14]
+    mov [r13 + 10], ax                       ; y
+    mov ax, [r12 + 16]
+    mov [r13 + 12], ax                       ; width
+    mov ax, [r12 + 18]
+    mov [r13 + 14], ax                       ; height
+    mov ax, [r12 + 20]
+    mov [r13 + 16], ax                       ; border
+    mov ax, [r12 + 22]
+    mov [r13 + 19], al                       ; class
+    mov eax, [r12 + 24]
+    mov [r13 + 20], eax                      ; visual
+    mov dword [r13 + 24], 0                  ; event_mask (default 0)
+    mov byte  [r13 + 28], 0                  ; mapped (false)
+    mov byte  [r13 + 29], 0                  ; override-redirect (false)
+
+    ; Walk CW value-mask.
+    mov ecx, [r12 + 28]
+    test ecx, ecx
+    jz .cw_done
+    lea rdx, [r12 + 32]
+    call apply_cw_values
+.cw_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_change_window_attributes — edi = slot, rsi = req ptr,
+; edx = req size. Updates the named window's CW attrs.
+;
+; Request:
+;   +0 opcode (2)         +1 0
+;   +2 length             +4 window
+;   +8 value-mask         +12 value-list
+;
+; No reply.
+; ============================================================================
+handle_change_window_attributes:
+    push rbx
+    push r12
+    push r13
+    mov ebx, edi
+    mov r12, rsi
+    mov edi, [r12 + 4]
+    call window_lookup
+    test rax, rax
+    jz .cwa_done
+    mov r13, rax
+    mov ecx, [r12 + 8]
+    test ecx, ecx
+    jz .cwa_done
+    lea rdx, [r12 + 12]
+    call apply_cw_values
+.cwa_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_destroy_window — edi = slot, rsi = req ptr. Removes the named
+; window and all its descendants (cascading via window_destroy).
+;
+; Request: +4 window
+;
+; No reply.
+; ============================================================================
+handle_destroy_window:
+    push rbx
+    mov ebx, edi
+    mov edi, [rsi + 4]
+    call window_destroy
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_map_window — edi = slot, rsi = req ptr. Mark window's mapped flag.
+;
+; Request: +4 window
+;
+; No reply.
+; ============================================================================
+handle_map_window:
+    push rbx
+    mov ebx, edi
+    mov edi, [rsi + 4]
+    call window_lookup
+    test rax, rax
+    jz .mw_done
+    mov byte [rax + 28], 1
+.mw_done:
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_unmap_window — symmetric to handle_map_window.
+; ============================================================================
+handle_unmap_window:
+    push rbx
+    mov ebx, edi
+    mov edi, [rsi + 4]
+    call window_lookup
+    test rax, rax
+    jz .uw_done
+    mov byte [rax + 28], 0
+.uw_done:
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_configure_window — edi = slot, rsi = req ptr, edx = req size.
+; Updates the window's geometry / border / (stacking ignored).
+;
+; Request:
+;   +0 opcode (12)        +1 0
+;   +2 length             +4 window
+;   +8 value-mask (u16)   +10 pad (2)
+;   +12 value-list (CARD32×N)
+;
+; CFG bit → field:
+;   CFG_X (bit 0)            → x  (INT16 in low half of CARD32)
+;   CFG_Y (bit 1)            → y  (INT16)
+;   CFG_WIDTH (bit 2)        → width (CARD16)
+;   CFG_HEIGHT (bit 3)       → height (CARD16)
+;   CFG_BORDER_WIDTH (bit 4) → border (CARD16)
+;   CFG_SIBLING (bit 5)      → ignored (no stacking yet)
+;   CFG_STACK_MODE (bit 6)   → ignored
+;
+; No reply.
+; ============================================================================
+handle_configure_window:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov ebx, edi
+    mov r12, rsi
+    mov edi, [r12 + 4]
+    call window_lookup
+    test rax, rax
+    jz .cfgw_done
+    mov r13, rax                             ; record ptr
+    movzx ecx, word [r12 + 8]                ; value-mask
+    lea r14, [r12 + 12]                      ; cursor in value-list
+.cfgw_loop:
+    test ecx, CFG_X
+    jz .cfgw_y
+    mov eax, [r14]
+    mov [r13 + 8], ax                        ; x (s16)
+    add r14, 4
+.cfgw_y:
+    test ecx, CFG_Y
+    jz .cfgw_w
+    mov eax, [r14]
+    mov [r13 + 10], ax
+    add r14, 4
+.cfgw_w:
+    test ecx, CFG_WIDTH
+    jz .cfgw_h
+    mov eax, [r14]
+    mov [r13 + 12], ax
+    add r14, 4
+.cfgw_h:
+    test ecx, CFG_HEIGHT
+    jz .cfgw_b
+    mov eax, [r14]
+    mov [r13 + 14], ax
+    add r14, 4
+.cfgw_b:
+    test ecx, CFG_BORDER_WIDTH
+    jz .cfgw_skip_stacking
+    mov eax, [r14]
+    mov [r13 + 16], ax
+    add r14, 4
+.cfgw_skip_stacking:
+    ; Sibling/StackMode words are consumed only to keep the cursor honest;
+    ; phase 4b doesn't model stacking.
+    test ecx, CFG_SIBLING
+    jz .cfgw_no_sib
+    add r14, 4
+.cfgw_no_sib:
+    test ecx, CFG_STACK_MODE
+    jz .cfgw_done
+    add r14, 4
+.cfgw_done:
+    pop r14
+    pop r13
     pop r12
     pop rbx
     ret

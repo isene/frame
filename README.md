@@ -2,8 +2,8 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.6-blue)
-![Phase](https://img.shields.io/badge/phase-4a%2F14-yellow)
+![Version](https://img.shields.io/badge/version-0.0.7-blue)
+![Phase](https://img.shields.io/badge/phase-4b%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
@@ -31,7 +31,8 @@ software-rendered, all on a stack written end-to-end in asm.
 | 2b | DRM/KMS modeset (CreateDumb + AddFB + SetCRTC) | ✓ shipped |
 | 3 | evdev input + KeyPress / Motion routing | ✓ shipped |
 | 4a | Multi-client serve loop + dispatch + 16 opcode handlers | ✓ shipped |
-| 4b | Window tree + Configure / Reparent / SubstructureRedirect | |
+| 4b | Window tree + CreateWindow / MapWindow / ConfigureWindow | ✓ shipped |
+| 4e | SubstructureRedirect routing + ReparentWindow | |
 | 5 | Atoms + GetProperty / ChangeProperty / selections | |
 | 6 | SHAPE extension | |
 | 7 | GCs + drawing primitives | |
