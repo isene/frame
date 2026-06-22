@@ -6430,14 +6430,37 @@ recomposite_screen:
     rep stosd
 
     ; --- Diagnostic reference rect: pure red 100×100 at (10, 10).
-    ;     ALWAYS drawn while the compositor is active so we can see
-    ;     whether draw_rect's writes ever reach the panel — independent
-    ;     of any window-table state.
     mov eax, 10
     mov esi, 10
     mov edi, 100
     mov ecx, 100
     mov edx, 0x00FF0000                      ; pure red
+    call draw_rect
+
+    ; --- Diagnostic rects at the EXPECTED test-window positions. These
+    ; are hardcoded — they test draw_rect at those positions independent
+    ; of any window-record state. If you see them but not the actual
+    ; window rects, the bug is in CreateWindow/MapWindow/window-record
+    ; handling. If you DON'T see them, draw_rect has a position-dependent
+    ; bug. All in distinct colours we can tell apart against the dark-blue
+    ; background.
+    mov eax, 100
+    mov esi, 100
+    mov edi, 200
+    mov ecx, 150
+    mov edx, 0x0000FF00                      ; pure green at test_cw 1 pos
+    call draw_rect
+    mov eax, 600
+    mov esi, 400
+    mov edi, 150
+    mov ecx, 100
+    mov edx, 0x0000FFFF                      ; cyan at test_cw 2 pos
+    call draw_rect
+    mov eax, 1000
+    mov esi, 200
+    mov edi, 100
+    mov ecx, 100
+    mov edx, 0x00FFFF00                      ; yellow at test_cw 3 pos
     call draw_rect
 
     ; --- Walk the window table, draw every mapped non-root window.
