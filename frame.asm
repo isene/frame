@@ -33,6 +33,12 @@ DEFAULT REL
 %define SYS_LSEEK       8
 %define SYS_UNLINK      87
 %define SYS_EXIT        60
+%define SYS_RT_SIGACTION   13
+%define SYS_RT_SIGRETURN   15
+%define SIGINT          2
+%define SIGTERM         15
+%define SIGHUP          1
+%define SA_RESTORER     0x04000000
 %define SYS_SOCKET      41
 %define SYS_BIND        49
 %define SYS_LISTEN      50
@@ -381,6 +387,7 @@ drm_dirty_cmd:      resb 24
 ; ---- Phase 4f compositor state --------------------------------------------
 compositor_requested: resb 1               ; set by --display argv flag
 compositor_active:    resb 1               ; set to 1 after init_compositor wins
+sig_sa_buf:           resb 32              ; kernel struct sigaction
 
 ; ---- evdev probe / watch state --------------------------------------------
 input_dev_path:     resb 32
@@ -6338,6 +6345,21 @@ init_compositor:
     mov eax, [drm_fb_cmd]
     mov [drm_fb_id], eax
 
+    ; --- GETCRTC: save the console's current CRTC state so a clean exit
+    ;     (Ctrl+C, SIGTERM) can restore the text VT instead of leaving
+    ;     the panel showing a freed framebuffer (= black, needs a VT
+    ;     switch to recover — the "stuck screen" Geir kept hitting).
+    lea rdi, [drm_crtc_save]
+    xor eax, eax
+    mov ecx, 13
+    rep stosq
+    mov [drm_crtc_save + 12], r13d
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_GETCRTC
+    lea rdx, [drm_crtc_save]
+    syscall
+
     ; --- SETCRTC: program the CRTC to scan our buffer ---
     mov eax, [drm_chosen_conn]
     mov [drm_set_conn_id], eax
@@ -6365,6 +6387,15 @@ init_compositor:
     js .ic_fail_other
 
     mov byte [compositor_active], 1
+
+    ; Install SIGINT / SIGTERM / SIGHUP handlers so Ctrl+C (or kill)
+    ; restores the console cleanly instead of leaving a black panel.
+    mov edi, SIGINT
+    call install_exit_handler
+    mov edi, SIGTERM
+    call install_exit_handler
+    mov edi, SIGHUP
+    call install_exit_handler
 
     ; Log what we got so we can verify mode/pitch/size after the fact.
     mov rsi, log_prefix
@@ -6646,4 +6677,81 @@ draw_rect:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; ============================================================================
+; ============================================================================
+; PHASE 4f — clean exit / console restore.
+; ============================================================================
+; A compositor that holds DRM master must restore the console on exit,
+; or the panel keeps showing frame's (now freed) framebuffer — black,
+; recoverable only by a VT switch. We install handlers for SIGINT
+; (Ctrl+C), SIGTERM (kill / the test script's cleanup), and SIGHUP so
+; any of them runs compositor_shutdown before exiting.
+; ============================================================================
+
+; ----------------------------------------------------------------------------
+; install_exit_handler — edi = signal number. Installs exit_handler with
+; the kernel sigaction ABI (needs SA_RESTORER + a restorer trampoline,
+; since we're libc-free).
+; ----------------------------------------------------------------------------
+install_exit_handler:
+    push rdi
+    lea rdi, [sig_sa_buf]
+    lea rax, [exit_handler]
+    mov [rdi + 0], rax                       ; sa_handler
+    mov qword [rdi + 8], SA_RESTORER         ; sa_flags
+    lea rax, [sig_restorer]
+    mov [rdi + 16], rax                      ; sa_restorer
+    mov qword [rdi + 24], 0                  ; sa_mask
+    pop rdi                                   ; signum
+    mov rax, SYS_RT_SIGACTION
+    ; rdi = signum already
+    lea rsi, [sig_sa_buf]
+    xor edx, edx                             ; oldact = NULL
+    mov r10, 8                               ; sigsetsize
+    syscall
+    ret
+
+sig_restorer:
+    mov rax, SYS_RT_SIGRETURN
+    syscall
+
+; ----------------------------------------------------------------------------
+; exit_handler — restore the console CRTC, drop DRM master, exit 0.
+; Async-signal context, but every call here is a raw syscall (all
+; async-signal-safe) so this is fine.
+; ----------------------------------------------------------------------------
+exit_handler:
+    call compositor_shutdown
+    mov rax, SYS_EXIT
+    xor edi, edi
+    syscall
+
+; ----------------------------------------------------------------------------
+; compositor_shutdown — restore the saved CRTC (text console), drop
+; master, close the DRM fd. No-op if the compositor never activated.
+; Safe to call more than once.
+; ----------------------------------------------------------------------------
+compositor_shutdown:
+    cmp byte [compositor_active], 0
+    je .cs_done
+    mov byte [compositor_active], 0          ; idempotent guard
+
+    ; Restore the console's original CRTC. drm_crtc_save was filled by
+    ; GETCRTC in init_compositor; replaying it via SETCRTC puts the text
+    ; framebuffer back on the panel.
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_SETCRTC
+    lea rdx, [drm_crtc_save]
+    syscall
+
+    ; Drop DRM master so the next session (gdm/Xorg) can take it.
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_DROP_MASTER
+    xor edx, edx
+    syscall
+.cs_done:
     ret
