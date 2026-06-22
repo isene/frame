@@ -80,6 +80,8 @@ DEFAULT REL
 %define SYS_NANOSLEEP   35
 %define PROT_RW         3            ; PROT_READ | PROT_WRITE
 %define MAP_SHARED      1
+%define MAP_PRIVATE     2
+%define MAP_ANONYMOUS   0x20
 
 ; ---- evdev / input ABI ----------------------------------------------------
 ; struct input_event on 64-bit:
@@ -201,12 +203,19 @@ display_num:        resq 1
 ; Sized to fit Geir's actual session: tile + strip + 12+ glass + firefox
 ; + kastrup + tock + spot + nm-applet + polkit-gnome + ... often pushes
 ; well past 32 concurrent X clients. Each idle slot costs nothing (BSS
-; demand-pages; the kernel never allocates physical RAM for an 8 KB buf
+; demand-pages; the kernel never allocates physical RAM for a buffer
 ; the client never connects on). Committed cost at startup is ~2 KB
 ; (clients_meta is touched by init_clients).
+;
+; CLIENT_BUF_SIZE must hold the largest single request a client can
+; send. The setup reply advertises max-request-length = 65535 4-byte
+; units = 256 KB, so a PutImage (or any big request) can legitimately
+; be that large. An 8 KB buffer dropped clients mid-PutImage in 4g.
+; 256 KB × 128 slots = 32 MB of BSS reservation — demand-paged, so
+; only touched pages cost real memory.
 %define MAX_CLIENTS      128
 %define CLIENT_META_SIZE 16
-%define CLIENT_BUF_SIZE  8192
+%define CLIENT_BUF_SIZE  262144
 %define CSTATE_SETUP     0
 %define CSTATE_RUNNING   1
 clients_meta:       resb MAX_CLIENTS * CLIENT_META_SIZE
@@ -237,12 +246,12 @@ atom_strings:       resb ATOM_STRINGS_CAP
 ; future reply types like QueryFont return more).
 reply_buf:          resb 16384
 
-; ---- Phase 4b window table ------------------------------------------------
-; windows[MAX_WINDOWS] — one 32-byte record per live window. Slot 0
+; ---- Phase 4b/4g window table ---------------------------------------------
+; windows[MAX_WINDOWS] — one 48-byte record per live window. Slot 0
 ; pre-occupied at startup by the root window (XID = X_ROOT_WINDOW). A
 ; slot with xid = 0 is empty.
 ;
-; Layout (32 bytes):
+; Layout (48 bytes):
 ;   +0  xid (u32)           0 = empty slot
 ;   +4  parent (u32)
 ;   +8  x  (s16)
@@ -258,10 +267,26 @@ reply_buf:          resb 16384
 ;   +29 override_redirect (u8)
 ;   +30 redirect_owner (s8)  — phase 4e: slot of the WM that set
 ;                              SubstructureRedirectMask, or -1
-;   +31 pad (1)
+;   +31 has_backing (u8)     — phase 4g: 1 once backing_ptr is mmap'd
+;   +32 backing_ptr (q)      — phase 4g: per-window ARGB pixel buffer
+;                              (backing_w*backing_h*4), lazily mmap'd
+;   +40 backing_w (u16)      — backing buffer width (= stride, pixels)
+;   +42 backing_h (u16)      — backing buffer height
+;   +44 back_pixel (u32)     — CW_BACK_PIXEL; backing init colour
 %define MAX_WINDOWS      512
-%define WINDOW_REC_SIZE  32
+%define WINDOW_REC_SIZE  48
 windows:            resb MAX_WINDOWS * WINDOW_REC_SIZE
+
+; ---- Phase 4g graphics-context table --------------------------------------
+; gcs[MAX_GCS] — 16-byte records keyed by GC XID. Clients create GCs with
+; CreateGC, reference them by XID in every drawing request.
+;   +0  gcid (u32)          0 = empty slot
+;   +4  foreground (u32)
+;   +8  background (u32)
+;   +12 pad (4)
+%define MAX_GCS          256
+%define GC_REC_SIZE      16
+gcs:                resb MAX_GCS * GC_REC_SIZE
 
 ; ---- Phase 4c property table ----------------------------------------------
 ; properties[1024] — flat list of (window, atom) → value records. xid = 0
@@ -803,6 +828,7 @@ _start:
     call init_atoms
     call init_clients
     call init_windows
+    call init_gcs
     call init_properties
     call init_keysyms
     call init_input
@@ -3042,6 +3068,14 @@ dispatch_request:
     je .dr_unmap_window
     cmp eax, 12
     je .dr_configure_window
+    cmp eax, 56
+    je .dr_change_gc
+    cmp eax, 60
+    je .dr_free_gc
+    cmp eax, 70
+    je .dr_poly_fill_rectangle
+    cmp eax, 72
+    je .dr_put_image
     cmp eax, 26
     je .dr_grab_pointer
     cmp eax, 27
@@ -3133,9 +3167,34 @@ dispatch_request:
     jmp .dr_done
 
 .dr_create_gc:
-    ; No reply needed; we don't track GC state yet (phase 4f). Silently
-    ; accept so clients that always create a GC at startup (xdpyinfo,
-    ; libX11 internals) proceed instead of hanging on the next round-trip.
+    mov edi, ebx
+    mov rsi, r12
+    call handle_create_gc
+    jmp .dr_done
+
+.dr_change_gc:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_change_gc
+    jmp .dr_done
+
+.dr_free_gc:
+    mov rsi, r12
+    call handle_free_gc
+    jmp .dr_done
+
+.dr_poly_fill_rectangle:
+    mov edi, ebx
+    mov rsi, r12
+    mov edx, r13d
+    call handle_poly_fill_rectangle
+    jmp .dr_done
+
+.dr_put_image:
+    mov edi, ebx
+    mov rsi, r12
+    mov edx, r13d
+    call handle_put_image
     jmp .dr_done
 
 .dr_query_extension:
@@ -4438,7 +4497,23 @@ window_destroy:
     je .wd_recurse                           ; a child — recurse
     jmp .wd_walk_next
 .wd_kill:
+    ; Free the backing buffer if one was mmap'd.
+    cmp byte [r13 + 31], 0
+    je .wd_kill_clear
+    push rbx
+    mov rax, SYS_MUNMAP
+    mov rdi, [r13 + 32]                      ; backing_ptr
+    movzx esi, word [r13 + 40]               ; backing_w
+    movzx ecx, word [r13 + 42]               ; backing_h
+    imul esi, ecx
+    shl esi, 2                               ; bytes = w*h*4
+    syscall
+    pop rbx
+.wd_kill_clear:
     mov dword [r13], 0                       ; mark empty
+    mov byte [r13 + 31], 0                   ; has_backing = 0
+    mov qword [r13 + 32], 0
+    mov dword [r13 + 40], 0                  ; backing_w/h = 0
     jmp .wd_walk_next
 .wd_recurse:
     push rbx
@@ -4477,10 +4552,15 @@ apply_cw_values:
     jnc .av_skip_bit
     ; Bit r14 is set. Get the corresponding CARD32 and dispatch.
     mov eax, [r12]
+    cmp r14d, 1                              ; CW_BACK_PIXEL bit pos
+    je .av_back_pixel
     cmp r14d, 9                              ; CW_OVERRIDE_REDIRECT bit pos
     je .av_override
     cmp r14d, 11                             ; CW_EVENT_MASK bit pos
     je .av_event_mask
+    jmp .av_advance
+.av_back_pixel:
+    mov [r13 + 44], eax                      ; back_pixel
     jmp .av_advance
 .av_override:
     mov [r13 + 29], al                       ; u8 boolean
@@ -4553,7 +4633,10 @@ handle_create_window:
     mov byte  [r13 + 28], 0                  ; mapped (false)
     mov byte  [r13 + 29], 0                  ; override-redirect (false)
     mov byte  [r13 + 30], -1                 ; redirect_owner (none)
-    mov byte  [r13 + 31], 0
+    mov byte  [r13 + 31], 0                  ; has_backing (false)
+    mov qword [r13 + 32], 0                  ; backing_ptr
+    mov dword [r13 + 40], 0                  ; backing_cap
+    mov dword [r13 + 44], 0                  ; back_pixel (default black)
 
     ; Walk CW value-mask.
     mov ecx, [r12 + 28]
@@ -4836,6 +4919,29 @@ handle_configure_window:
     jz .cfgw_apply_done
     add r14, 4
 .cfgw_apply_done:
+    ; If the window resized and has a backing buffer at the old size,
+    ; drop it — the client will re-create it at the new size on its
+    ; next draw (standard resize → repaint flow).
+    cmp byte [r13 + 31], 0
+    je .cfgw_recomp
+    movzx eax, word [r13 + 40]               ; backing_w
+    cmp ax, [r13 + 12]                        ; width
+    jne .cfgw_drop_backing
+    movzx eax, word [r13 + 42]               ; backing_h
+    cmp ax, [r13 + 14]                        ; height
+    je .cfgw_recomp
+.cfgw_drop_backing:
+    mov rax, SYS_MUNMAP
+    mov rdi, [r13 + 32]
+    movzx esi, word [r13 + 40]
+    movzx ecx, word [r13 + 42]
+    imul esi, ecx
+    shl esi, 2
+    syscall
+    mov byte [r13 + 31], 0
+    mov qword [r13 + 32], 0
+    mov dword [r13 + 40], 0
+.cfgw_recomp:
     call recomposite_screen
 .cfgw_done:
     pop r15
@@ -6478,40 +6584,6 @@ recomposite_screen:
     mov eax, COMP_BG_COLOR
     rep stosd
 
-    ; --- Diagnostic reference rect: pure red 100×100 at (10, 10).
-    mov eax, 10
-    mov esi, 10
-    mov edi, 100
-    mov ecx, 100
-    mov edx, 0x00FF0000                      ; pure red
-    call draw_rect
-
-    ; --- Diagnostic rects at the EXPECTED test-window positions. These
-    ; are hardcoded — they test draw_rect at those positions independent
-    ; of any window-record state. If you see them but not the actual
-    ; window rects, the bug is in CreateWindow/MapWindow/window-record
-    ; handling. If you DON'T see them, draw_rect has a position-dependent
-    ; bug. All in distinct colours we can tell apart against the dark-blue
-    ; background.
-    mov eax, 100
-    mov esi, 100
-    mov edi, 200
-    mov ecx, 150
-    mov edx, 0x0000FF00                      ; pure green at test_cw 1 pos
-    call draw_rect
-    mov eax, 600
-    mov esi, 400
-    mov edi, 150
-    mov ecx, 100
-    mov edx, 0x0000FFFF                      ; cyan at test_cw 2 pos
-    call draw_rect
-    mov eax, 1000
-    mov esi, 200
-    mov edi, 100
-    mov ecx, 100
-    mov edx, 0x00FFFF00                      ; yellow at test_cw 3 pos
-    call draw_rect
-
     ; --- Walk the window table, draw every mapped non-root window.
     xor ebx, ebx
 .rs_loop:
@@ -6528,12 +6600,24 @@ recomposite_screen:
     cmp byte [r12 + 28], 0
     je .rs_next
 
-    ; Compute colour from xid.
-    mov edi, eax
-    call window_color
-    mov r13d, eax                            ; r13d = colour
+    ; If the window has a backing buffer with real content, blit it.
+    cmp byte [r12 + 31], 0
+    je .rs_flat
+    mov rdi, r12
+    call blit_window
+    jmp .rs_next
 
-    ; Hand geometry to draw_rect: eax=x, esi=y, edi=w, ecx=h, edx=colour.
+.rs_flat:
+    ; No backing yet — fill the window rect with its back_pixel, or a
+    ; per-xid hash colour if back_pixel is 0 (so a zero-background
+    ; window is still visible during development).
+    mov r13d, [r12 + 44]                     ; back_pixel
+    test r13d, r13d
+    jnz .rs_flat_draw
+    mov edi, [r12]
+    call window_color
+    mov r13d, eax
+.rs_flat_draw:
     movsx eax, word [r12 + 8]
     movsx esi, word [r12 + 10]
     movzx edi, word [r12 + 12]
@@ -6754,4 +6838,640 @@ compositor_shutdown:
     xor edx, edx
     syscall
 .cs_done:
+    ret
+
+; ============================================================================
+; ============================================================================
+; PHASE 4g — graphics contexts, window backing store, drawing primitives.
+; ============================================================================
+; Clients now draw real content. Each window gets a lazily-mmap'd ARGB
+; backing buffer; CreateGC/ChangeGC track foreground+background;
+; PolyFillRectangle and PutImage write into the backing buffer; the
+; compositor blits each window's backing onto the panel.
+; ============================================================================
+
+; ----------------------------------------------------------------------------
+; init_gcs — zero the GC table.
+; ----------------------------------------------------------------------------
+init_gcs:
+    push rbx
+    lea rdi, [gcs]
+    xor eax, eax
+    mov ecx, MAX_GCS * GC_REC_SIZE
+    rep stosb
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; gc_lookup — edi = gcid. Returns record ptr in rax, or 0.
+; ----------------------------------------------------------------------------
+gc_lookup:
+    push rbx
+    xor ebx, ebx
+.gl_loop:
+    cmp ebx, MAX_GCS
+    jge .gl_miss
+    mov rax, rbx
+    imul rax, GC_REC_SIZE
+    lea rax, [gcs + rax]
+    cmp [rax], edi
+    je .gl_hit
+    inc ebx
+    jmp .gl_loop
+.gl_hit:
+    pop rbx
+    ret
+.gl_miss:
+    xor eax, eax
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; gc_alloc — edi = gcid. Existing record if present, else first empty
+; slot marked with gcid. 0 if table full.
+; ----------------------------------------------------------------------------
+gc_alloc:
+    push rbx
+    push r12
+    mov r12d, edi
+    call gc_lookup
+    test rax, rax
+    jnz .ga_done
+    xor ebx, ebx
+.ga_loop:
+    cmp ebx, MAX_GCS
+    jge .ga_full
+    mov rax, rbx
+    imul rax, GC_REC_SIZE
+    lea rax, [gcs + rax]
+    cmp dword [rax], 0
+    je .ga_take
+    inc ebx
+    jmp .ga_loop
+.ga_take:
+    mov [rax], r12d
+    mov dword [rax + 4], 0x00FFFFFF          ; default fg = white
+    mov dword [rax + 8], 0                    ; default bg = black
+.ga_done:
+    pop r12
+    pop rbx
+    ret
+.ga_full:
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; apply_gc_values — r13 = gc record, ecx = value-mask, rdx = value-list.
+; GC value-mask: bit 2 (0x04) = foreground, bit 3 (0x08) = background.
+; Other bits are consumed (cursor advances) but ignored.
+; ----------------------------------------------------------------------------
+apply_gc_values:
+    push rbx
+    push r12
+    push r14
+    mov ebx, ecx
+    mov r12, rdx
+    xor r14d, r14d
+.agv_loop:
+    test ebx, ebx
+    jz .agv_done
+    bt ebx, 0
+    jnc .agv_skip
+    mov eax, [r12]
+    cmp r14d, 2
+    je .agv_fg
+    cmp r14d, 3
+    je .agv_bg
+    jmp .agv_adv
+.agv_fg:
+    mov [r13 + 4], eax
+    jmp .agv_adv
+.agv_bg:
+    mov [r13 + 8], eax
+.agv_adv:
+    add r12, 4
+.agv_skip:
+    shr ebx, 1
+    inc r14d
+    jmp .agv_loop
+.agv_done:
+    pop r14
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; handle_create_gc — edi = slot, rsi = req ptr.
+;   +4 cid, +8 drawable, +12 value-mask, +16 value-list
+; No reply.
+; ----------------------------------------------------------------------------
+handle_create_gc:
+    push rbx
+    push r13
+    mov rbx, rsi
+    mov edi, [rbx + 4]                        ; cid
+    test edi, edi
+    jz .cg_done
+    call gc_alloc
+    test rax, rax
+    jz .cg_done
+    mov r13, rax
+    mov ecx, [rbx + 12]                       ; value-mask
+    test ecx, ecx
+    jz .cg_done
+    lea rdx, [rbx + 16]
+    call apply_gc_values
+.cg_done:
+    pop r13
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; handle_change_gc — edi = slot, rsi = req ptr.
+;   +4 gc, +8 value-mask, +12 value-list
+; No reply.
+; ----------------------------------------------------------------------------
+handle_change_gc:
+    push rbx
+    push r13
+    mov rbx, rsi
+    mov edi, [rbx + 4]
+    call gc_lookup
+    test rax, rax
+    jz .chg_done
+    mov r13, rax
+    mov ecx, [rbx + 8]
+    test ecx, ecx
+    jz .chg_done
+    lea rdx, [rbx + 12]
+    call apply_gc_values
+.chg_done:
+    pop r13
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; handle_free_gc — rsi = req ptr (+4 gc). Clears the slot. No reply.
+; ----------------------------------------------------------------------------
+handle_free_gc:
+    push rbx
+    mov edi, [rsi + 4]
+    call gc_lookup
+    test rax, rax
+    jz .fg_done
+    mov dword [rax], 0
+.fg_done:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; window_ensure_backing — rdi = window record ptr. Guarantees a backing
+; buffer matching the window's current w×h, filled with back_pixel on
+; fresh allocation. Returns backing ptr in rax (0 on mmap failure).
+; ----------------------------------------------------------------------------
+window_ensure_backing:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, rdi                             ; record
+    movzx r12d, word [rbx + 12]              ; want w
+    movzx r13d, word [rbx + 14]              ; want h
+    ; Reuse if already allocated at the right size.
+    cmp byte [rbx + 31], 0
+    je .web_alloc
+    movzx eax, word [rbx + 40]
+    cmp eax, r12d
+    jne .web_realloc
+    movzx eax, word [rbx + 42]
+    cmp eax, r13d
+    jne .web_realloc
+    mov rax, [rbx + 32]                      ; already good
+    jmp .web_done
+.web_realloc:
+    mov rax, SYS_MUNMAP
+    mov rdi, [rbx + 32]
+    movzx esi, word [rbx + 40]
+    movzx ecx, word [rbx + 42]
+    imul esi, ecx
+    shl esi, 2
+    syscall
+    mov byte [rbx + 31], 0
+.web_alloc:
+    ; bytes = w*h*4
+    mov eax, r12d
+    imul eax, r13d
+    shl eax, 2
+    test eax, eax
+    jz .web_fail                             ; zero-size window
+    mov r14d, eax                            ; bytes
+    mov rax, SYS_MMAP
+    xor edi, edi
+    mov esi, r14d
+    mov edx, PROT_RW
+    mov r10d, MAP_PRIVATE | MAP_ANONYMOUS
+    mov r8, -1
+    xor r9, r9
+    syscall
+    cmp rax, -4096
+    ja .web_fail
+    mov [rbx + 32], rax                      ; backing_ptr
+    mov [rbx + 40], r12w                     ; backing_w
+    mov [rbx + 42], r13w                     ; backing_h
+    mov byte [rbx + 31], 1                   ; has_backing
+    ; Fill with back_pixel.
+    mov rdi, rax
+    mov ecx, r12d
+    imul ecx, r13d                           ; pixel count
+    mov eax, [rbx + 44]                      ; back_pixel
+    push rbx
+    rep stosd
+    pop rbx
+    mov rax, [rbx + 32]
+.web_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.web_fail:
+    xor eax, eax
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; handle_poly_fill_rectangle — edi = slot, rsi = req ptr, edx = req bytes.
+;   +4 drawable, +8 gc, +12 rectangles[] (each: x s16, y s16, w u16, h u16)
+; Fills each rect into the drawable window's backing buffer with the GC
+; foreground colour. No reply.
+; ----------------------------------------------------------------------------
+handle_poly_fill_rectangle:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov rbx, rsi                             ; req ptr
+    mov ebp, edx                             ; req bytes
+
+    mov edi, [rbx + 4]                        ; drawable
+    call window_lookup
+    test rax, rax
+    jz .pfr_done
+    mov r12, rax                             ; window record
+    cmp dword [r12], X_ROOT_WINDOW
+    je .pfr_done                             ; don't back the root
+
+    ; GC foreground.
+    mov edi, [rbx + 8]
+    call gc_lookup
+    test rax, rax
+    jz .pfr_done
+    mov r15d, [rax + 4]                      ; foreground colour
+
+    ; Ensure backing.
+    mov rdi, r12
+    call window_ensure_backing
+    test rax, rax
+    jz .pfr_done
+    mov r13, rax                             ; backing ptr
+
+    ; Iterate rectangles. Count = (req_bytes - 12) / 8.
+    lea r14, [rbx + 12]                       ; rect cursor
+    mov eax, ebp
+    sub eax, 12
+    jle .pfr_done
+    shr eax, 3                               ; rect count
+    mov ebp, eax                             ; reuse ebp = remaining rects
+.pfr_loop:
+    test ebp, ebp
+    jz .pfr_done
+    ; fb_fill into backing: buf=r13, bufw=backing_w, bufh=backing_h,
+    ; x,y,w,h from rect, colour=r15.
+    mov rdi, r13
+    movzx esi, word [r12 + 40]               ; backing_w (stride)
+    movzx edx, word [r12 + 42]               ; backing_h
+    movsx eax, word [r14 + 0]                ; rect x
+    movsx r8d, word [r14 + 2]                ; rect y
+    movzx r9d, word [r14 + 4]                ; rect w
+    movzx r10d, word [r14 + 6]               ; rect h
+    mov r11d, r15d                           ; colour
+    call fb_fill
+    add r14, 8
+    dec ebp
+    jmp .pfr_loop
+.pfr_done:
+    call recomposite_screen
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; fb_fill — fill a rectangle in an arbitrary 32-bpp buffer, clipped to
+; the buffer bounds.
+;   rdi = buffer base
+;   esi = buffer width  (stride, pixels)
+;   edx = buffer height
+;   eax = rect x (s32)
+;   r8d = rect y (s32)
+;   r9d = rect w
+;   r10d = rect h
+;   r11d = colour
+; ----------------------------------------------------------------------------
+fb_fill:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov rbx, rdi                             ; buf
+    mov r12d, esi                            ; stride
+    mov r13d, edx                            ; buf height
+    mov ebp, r11d                            ; colour
+
+    ; Clip x / w.
+    test eax, eax
+    jns .fbf_x_ok
+    add r9d, eax                             ; w += x
+    xor eax, eax
+.fbf_x_ok:
+    cmp eax, r12d
+    jge .fbf_ret
+    mov ecx, eax
+    add ecx, r9d
+    cmp ecx, r12d
+    jbe .fbf_w_ok
+    mov r9d, r12d
+    sub r9d, eax
+.fbf_w_ok:
+    cmp r9d, 0
+    jle .fbf_ret
+
+    ; Clip y / h.
+    test r8d, r8d
+    jns .fbf_y_ok
+    add r10d, r8d
+    xor r8d, r8d
+.fbf_y_ok:
+    cmp r8d, r13d
+    jge .fbf_ret
+    mov ecx, r8d
+    add ecx, r10d
+    cmp ecx, r13d
+    jbe .fbf_h_ok
+    mov r10d, r13d
+    sub r10d, r8d
+.fbf_h_ok:
+    cmp r10d, 0
+    jle .fbf_ret
+
+    ; Draw. r14 = x, r15 = current y, r10 = rows remaining.
+    mov r14d, eax                            ; x
+    mov r15d, r8d                            ; y
+.fbf_row:
+    test r10d, r10d
+    jz .fbf_ret
+    mov eax, r15d
+    imul eax, r12d                           ; y*stride
+    add eax, r14d                            ; + x
+    lea rdi, [rbx + rax*4]
+    mov ecx, r9d                             ; w pixels
+    mov eax, ebp
+    rep stosd
+    inc r15d
+    dec r10d
+    jmp .fbf_row
+.fbf_ret:
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+
+; ----------------------------------------------------------------------------
+; handle_put_image — edi = slot, rsi = req ptr, edx = req bytes.
+;   +1 format (2 = ZPixmap)   +4 drawable   +8 gc
+;   +12 width u16   +14 height u16   +16 dst-x s16   +18 dst-y s16
+;   +20 left-pad u8   +21 depth u8   +24 data
+; Only ZPixmap depth 24/32 (4 bytes/pixel). Copies the image into the
+; window backing at (dst-x, dst-y), clipped. No reply.
+;
+; Loop-invariant scalars live in a stack frame; pointers in callee-saved
+; registers. No pushes inside the row loop.
+;   stack: +0 imgw  +8 imgh  +16 backing_w  +24 backing_h
+;          +32 dsty  +40 dst_x0  +48 src_x0  +56 copy_w
+;   rbx = backing ptr   rbp = src data ptr   r12d = row
+; ----------------------------------------------------------------------------
+handle_put_image:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 64
+    mov r13, rsi                             ; req ptr
+
+    cmp byte [r13 + 1], 2                     ; ZPixmap?
+    jne .pi_done
+    movzx eax, byte [r13 + 21]               ; depth
+    cmp eax, 24
+    je .pi_ok_depth
+    cmp eax, 32
+    jne .pi_done
+.pi_ok_depth:
+    mov edi, [r13 + 4]                        ; drawable
+    call window_lookup
+    test rax, rax
+    jz .pi_done
+    mov r14, rax                             ; window record
+    cmp dword [r14], X_ROOT_WINDOW
+    je .pi_done
+    mov rdi, r14
+    call window_ensure_backing
+    test rax, rax
+    jz .pi_done
+    mov rbx, rax                            ; backing ptr (dst base)
+
+    lea rbp, [r13 + 24]                      ; src data ptr
+
+    ; Stash scalars.
+    movzx eax, word [r13 + 12]              ; imgw
+    mov [rsp + 0], eax
+    movzx eax, word [r13 + 14]              ; imgh
+    mov [rsp + 8], eax
+    movzx eax, word [r14 + 40]             ; backing_w
+    mov [rsp + 16], eax
+    movzx eax, word [r14 + 42]             ; backing_h
+    mov [rsp + 24], eax
+    movsx eax, word [r13 + 18]             ; dsty
+    mov [rsp + 32], eax
+
+    ; X-axis clip (row-independent). dstx in ecx.
+    movsx ecx, word [r13 + 16]             ; dstx
+    xor r8d, r8d                            ; src_x0
+    mov r9d, ecx                            ; dst_x0
+    test ecx, ecx
+    jns .pi_dx_ok
+    mov r8d, ecx
+    neg r8d                                  ; src_x0 = -dstx
+    xor r9d, r9d                             ; dst_x0 = 0
+.pi_dx_ok:
+    mov [rsp + 40], r9d                      ; dst_x0
+    mov [rsp + 48], r8d                      ; src_x0
+    ; copy_w = min(imgw - src_x0, backing_w - dst_x0)
+    mov eax, [rsp + 0]
+    sub eax, r8d
+    jle .pi_done
+    mov edx, [rsp + 16]
+    sub edx, r9d
+    jle .pi_done
+    cmp eax, edx
+    jle .pi_cw
+    mov eax, edx
+.pi_cw:
+    mov [rsp + 56], eax                      ; copy_w
+
+    xor r12d, r12d                           ; row = 0
+.pi_row:
+    mov eax, [rsp + 8]                       ; imgh
+    cmp r12d, eax
+    jge .pi_done
+    ; dy = dsty + row
+    mov eax, [rsp + 32]
+    add eax, r12d
+    js .pi_row_next
+    cmp eax, [rsp + 24]                      ; backing_h
+    jge .pi_done
+    ; dst = backing + (dy*backing_w + dst_x0)*4
+    mov ecx, eax
+    imul ecx, [rsp + 16]
+    add ecx, [rsp + 40]
+    lea rdi, [rbx + rcx*4]
+    ; src = srcdata + (row*imgw + src_x0)*4
+    mov eax, r12d
+    imul eax, [rsp + 0]
+    add eax, [rsp + 48]
+    lea rsi, [rbp + rax*4]
+    mov ecx, [rsp + 56]                      ; copy_w
+    rep movsd
+.pi_row_next:
+    inc r12d
+    jmp .pi_row
+.pi_done:
+    call recomposite_screen
+    add rsp, 64
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; blit_window — rdi = window record ptr. Copies the window's backing
+; buffer to the dumb framebuffer at (win.x, win.y), clipped to the
+; screen. Backing stride = backing_w.
+;
+;   stack: +0 backing_w  +8 backing_h  +16 win_y  +24 dst_x0
+;          +32 src_x0  +40 copy_w  +48 screen_h
+;   rbx = backing ptr   r12d = ry
+; ----------------------------------------------------------------------------
+blit_window:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 64
+    mov r13, rdi                             ; record
+
+    movsx r14d, word [r13 + 8]             ; win x
+    movsx eax, word [r13 + 10]             ; win y
+    mov [rsp + 16], eax
+    movzx eax, word [r13 + 40]            ; backing_w (stride)
+    mov [rsp + 0], eax
+    movzx eax, word [r13 + 42]            ; backing_h
+    mov [rsp + 8], eax
+    mov rbx, [r13 + 32]                    ; backing ptr
+    movzx eax, word [drm_modes_buf + 14]  ; screen h
+    mov [rsp + 48], eax
+    movzx r15d, word [drm_modes_buf + 4]  ; screen w
+
+    ; X clip. win x in r14d.
+    xor r8d, r8d                           ; src_x0
+    mov r9d, r14d                          ; dst_x0 = x
+    test r14d, r14d
+    jns .bw_dx_ok
+    mov r8d, r14d
+    neg r8d                                 ; src_x0 = -x
+    xor r9d, r9d                            ; dst_x0 = 0
+.bw_dx_ok:
+    mov [rsp + 24], r9d                     ; dst_x0
+    mov [rsp + 32], r8d                     ; src_x0
+    ; copy_w = min(backing_w - src_x0, screen_w - dst_x0)
+    mov eax, [rsp + 0]
+    sub eax, r8d
+    jle .bw_done
+    mov edx, r15d
+    sub edx, r9d
+    jle .bw_done
+    cmp eax, edx
+    jle .bw_cw
+    mov eax, edx
+.bw_cw:
+    mov [rsp + 40], eax                     ; copy_w
+
+    xor r12d, r12d                          ; ry = 0
+.bw_row:
+    mov eax, [rsp + 8]                      ; backing_h
+    cmp r12d, eax
+    jge .bw_done
+    ; dy = win_y + ry
+    mov eax, [rsp + 16]
+    add eax, r12d
+    js .bw_row_next
+    cmp eax, [rsp + 48]                     ; screen_h
+    jge .bw_done
+    ; dst = drm_dumb_addr + dy*pitch + dst_x0*4
+    mov ecx, eax
+    imul ecx, [drm_dumb_pitch]
+    mov rdi, [drm_dumb_addr]
+    add rdi, rcx
+    mov eax, [rsp + 24]                     ; dst_x0
+    lea rdi, [rdi + rax*4]
+    ; src = backing + (ry*backing_w + src_x0)*4
+    mov eax, r12d
+    imul eax, [rsp + 0]
+    add eax, [rsp + 32]
+    lea rsi, [rbx + rax*4]
+    mov ecx, [rsp + 40]                     ; copy_w
+    rep movsd
+.bw_row_next:
+    inc r12d
+    jmp .bw_row
+.bw_done:
+    add rsp, 64
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
