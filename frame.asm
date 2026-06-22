@@ -372,6 +372,10 @@ drm_chosen_crtc:    resd 1
 drm_chosen_conn:    resd 1
 nanosleep_ts:       resq 2
 
+; ---- Phase 4f compositor state --------------------------------------------
+compositor_requested: resb 1               ; set by --display argv flag
+compositor_active:    resb 1               ; set to 1 after init_compositor wins
+
 ; ---- evdev probe / watch state --------------------------------------------
 input_dev_path:     resb 32
 input_dev_name:     resb 256
@@ -709,17 +713,21 @@ _start:
 .check_probe_input:
     ; "--probe-input"
     cmp dword [rdi], '--pr'
-    jne .check_watch_input
+    jne .check_display
     cmp dword [rdi + 4], 'obe-'
-    jne .check_watch_input
+    jne .check_display
     cmp dword [rdi + 8], 'inpu'
-    jne .check_watch_input
+    jne .check_display
     cmp word [rdi + 12], 't'             ; 't' + NUL
-    jne .check_watch_input
+    jne .check_display
     call do_probe_input
     xor edi, edi
     mov rax, SYS_EXIT
     syscall
+.check_display:
+    ; Fall-through here when argv[1] isn't --probe-input. We'll do a
+    ; second pass over all argv entries below for --display, since it
+    ; can coexist with a display number.
 .check_watch_input:
     ; "--watch-input PATH"
     cmp dword [rdi], '--wa'
@@ -748,6 +756,25 @@ _start:
     call atoi_or_default
     mov [display_num], rax
 
+    ; --- Second pass over argv: pick up flags that can appear anywhere
+    ;     after argv[0]. Currently only --display.
+    mov rax, [rsp]                           ; argc
+    mov rcx, 1
+.flag_scan:
+    cmp rcx, rax
+    jge .main
+    mov rdi, [rsp + 8 + rcx*8]
+    cmp dword [rdi], '--di'
+    jne .flag_scan_next
+    cmp dword [rdi + 4], 'spla'
+    jne .flag_scan_next
+    cmp word [rdi + 8], 'y'
+    jne .flag_scan_next
+    mov byte [compositor_requested], 1
+.flag_scan_next:
+    inc rcx
+    jmp .flag_scan
+
 .main:
     call announce_listening
     call socket_setup
@@ -759,6 +786,10 @@ _start:
     call init_properties
     call init_keysyms
     call init_input
+    cmp byte [compositor_requested], 0
+    je .skip_compositor
+    call init_compositor
+.skip_compositor:
     jmp serve_loop
 
 .die_bind:
@@ -4567,6 +4598,7 @@ handle_destroy_window:
     mov ebx, edi
     mov edi, [rsi + 4]
     call window_destroy
+    call recomposite_screen
     pop rbx
     ret
 
@@ -4613,6 +4645,7 @@ handle_map_window:
     jmp .mw_done
 .mw_just_map:
     mov byte [r12 + 28], 1
+    call recomposite_screen
     ; If parent has SubstructureNotify, notify the redirect-owner subscriber.
     test r13, r13
     jz .mw_done
@@ -4651,6 +4684,7 @@ handle_unmap_window:
     jz .uw_done
     mov r12, rax
     mov byte [r12 + 28], 0
+    call recomposite_screen
     mov edi, [r12 + 4]
     call window_lookup
     test rax, rax
@@ -4770,8 +4804,10 @@ handle_configure_window:
     add r14, 4
 .cfgw_no_sib:
     test ecx, CFG_STACK_MODE
-    jz .cfgw_done
+    jz .cfgw_apply_done
     add r14, 4
+.cfgw_apply_done:
+    call recomposite_screen
 .cfgw_done:
     pop r15
     pop r14
@@ -6103,6 +6139,404 @@ send_unmap_notify:
     mov edi, ebx
     lea rsi, [reply_buf]
     call send_event_to_slot
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; ============================================================================
+; PHASE 4f — software compositor.
+; ============================================================================
+; init_compositor sets up the same DRM dumb buffer + framebuffer + CRTC
+; as the phase-2b --modeset test, but persistently (no sleep, no
+; restore). recomposite_screen walks the window tree and paints each
+; mapped window's rect into the buffer in a per-XID colour.
+;
+; For phase 4f MVP, windows are solid-colour placeholders — there's no
+; real backing pixmap or drawing primitive support yet. That arrives in
+; later phases (CreatePixmap, PutImage, PolyFillRectangle, RENDER).
+; What this commit ships: TILE'S WINDOWS SHOW UP ON THE PANEL, in their
+; right positions, and re-render when they move / appear / disappear.
+;
+; Requires --display flag + root + no other DRM master. Without that,
+; init_compositor logs a failure and the server continues network-only.
+; ============================================================================
+
+%define COMP_BG_COLOR        0x00102030     ; dark blue background
+
+; ----------------------------------------------------------------------------
+; init_compositor — persistent counterpart to do_modeset.
+;
+; On success: compositor_active = 1; drm_dumb_addr / drm_dumb_pitch /
+; drm_modes_buf populated. Returns 0.
+; On failure: prints a one-line reason and returns -1; serve_loop
+; continues network-only.
+; ----------------------------------------------------------------------------
+init_compositor:
+    push rbx
+    push r12
+    push r13
+
+    ; --- open card and take master ---
+    call drm_try_open
+    test rax, rax
+    js .ic_fail_open
+    mov [drm_fd], rax
+    lea rsi, [probe_conn_nl]
+    mov rdx, 1
+    call write_stderr
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_SET_MASTER
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .ic_fail_master
+
+    ; --- resources + first connected connector ---
+    call drm_probe_resources
+    call modeset_find_connector
+    test eax, eax
+    jz .ic_fail_no_conn
+    mov [drm_chosen_conn], r12d
+
+    ; --- GETENCODER → CRTC ---
+    lea rdi, [drm_encoder_buf]
+    xor eax, eax
+    mov ecx, 5
+    rep stosd
+    mov eax, [drm_conn_buf + 44]
+    mov [drm_encoder_buf], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_GETENCODER
+    lea rdx, [drm_encoder_buf]
+    syscall
+    test rax, rax
+    js .ic_fail_other
+    mov eax, [drm_encoder_buf + 8]
+    test eax, eax
+    jnz .ic_have_crtc
+    mov ecx, [drm_encoder_buf + 12]
+    bsf rdx, rcx
+    mov eax, [drm_crtc_ids + rdx*4]
+.ic_have_crtc:
+    mov r13d, eax
+    mov [drm_chosen_crtc], eax
+
+    ; --- CREATE_DUMB at hdisplay × vdisplay × 32 bpp ---
+    lea rdi, [drm_dumb_create]
+    xor eax, eax
+    mov ecx, 4
+    rep stosq
+    movzx eax, word [drm_modes_buf + 4]      ; hdisplay
+    mov [drm_dumb_create + 4], eax
+    movzx eax, word [drm_modes_buf + 14]     ; vdisplay
+    mov [drm_dumb_create + 0], eax
+    mov dword [drm_dumb_create + 8], 32
+    mov dword [drm_dumb_create + 12], 0
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_CREATE_DUMB
+    lea rdx, [drm_dumb_create]
+    syscall
+    test rax, rax
+    js .ic_fail_other
+    mov eax, [drm_dumb_create + 16]
+    mov [drm_dumb_handle], eax
+    mov eax, [drm_dumb_create + 20]
+    mov [drm_dumb_pitch], eax
+    mov rax, [drm_dumb_create + 24]
+    mov [drm_dumb_size], rax
+
+    ; --- MAP_DUMB → mmap ---
+    lea rdi, [drm_dumb_map]
+    xor eax, eax
+    mov ecx, 2
+    rep stosq
+    mov eax, [drm_dumb_handle]
+    mov [drm_dumb_map], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_MAP_DUMB
+    lea rdx, [drm_dumb_map]
+    syscall
+    test rax, rax
+    js .ic_fail_other
+    mov rax, [drm_dumb_map + 8]
+    mov [drm_dumb_offset], rax
+
+    mov rax, SYS_MMAP
+    xor edi, edi
+    mov rsi, [drm_dumb_size]
+    mov edx, PROT_RW
+    mov r10d, MAP_SHARED
+    mov r8, [drm_fd]
+    mov r9, [drm_dumb_offset]
+    syscall
+    cmp rax, -4096
+    ja .ic_fail_other
+    mov [drm_dumb_addr], rax
+
+    ; --- ADDFB ---
+    lea rdi, [drm_fb_cmd]
+    xor eax, eax
+    mov ecx, 7
+    rep stosd
+    mov eax, [drm_dumb_create + 4]
+    mov [drm_fb_cmd + 4], eax
+    mov eax, [drm_dumb_create + 0]
+    mov [drm_fb_cmd + 8], eax
+    mov eax, [drm_dumb_pitch]
+    mov [drm_fb_cmd + 12], eax
+    mov dword [drm_fb_cmd + 16], 32
+    mov dword [drm_fb_cmd + 20], 24
+    mov eax, [drm_dumb_handle]
+    mov [drm_fb_cmd + 24], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_ADDFB
+    lea rdx, [drm_fb_cmd]
+    syscall
+    test rax, rax
+    js .ic_fail_other
+    mov eax, [drm_fb_cmd]
+    mov [drm_fb_id], eax
+
+    ; --- SETCRTC: program the CRTC to scan our buffer ---
+    mov eax, [drm_chosen_conn]
+    mov [drm_set_conn_id], eax
+    lea rdi, [drm_crtc_set]
+    xor eax, eax
+    mov ecx, 13
+    rep stosq
+    lea rax, [drm_set_conn_id]
+    mov [drm_crtc_set + 0], rax
+    mov dword [drm_crtc_set + 8], 1
+    mov [drm_crtc_set + 12], r13d
+    mov eax, [drm_fb_id]
+    mov [drm_crtc_set + 16], eax
+    mov dword [drm_crtc_set + 32], 1
+    lea rsi, [drm_modes_buf]
+    lea rdi, [drm_crtc_set + 36]
+    mov ecx, 17
+    rep movsd
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_SETCRTC
+    lea rdx, [drm_crtc_set]
+    syscall
+    test rax, rax
+    js .ic_fail_other
+
+    mov byte [compositor_active], 1
+    call recomposite_screen
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.ic_fail_open:
+    mov rsi, probe_open_fail
+    mov rdx, probe_open_fail_len
+    call write_stderr
+    jmp .ic_fail
+.ic_fail_master:
+    mov rsi, ms_master_fail
+    mov rdx, ms_master_fail_len
+    call write_stderr
+    jmp .ic_fail
+.ic_fail_no_conn:
+    mov rsi, ms_no_conn
+    mov rdx, ms_no_conn_len
+    call write_stderr
+    jmp .ic_fail
+.ic_fail_other:
+    mov rsi, ms_err_step
+    mov rdx, ms_err_step_len
+    call write_stderr
+.ic_fail:
+    mov rax, -1
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; recomposite_screen — paint background, then walk every mapped window
+; and draw its rect in a per-XID colour. No-op if compositor_active
+; is 0.
+; ----------------------------------------------------------------------------
+recomposite_screen:
+    cmp byte [compositor_active], 0
+    je .rs_done
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; --- Fill background: write pixels by row to respect pitch.
+    movzx r12d, word [drm_modes_buf + 4]     ; width
+    movzx r13d, word [drm_modes_buf + 14]    ; height
+    mov r14d, [drm_dumb_pitch]
+    mov r15, [drm_dumb_addr]
+    xor ecx, ecx                              ; row
+.rs_bg_row:
+    cmp ecx, r13d
+    jge .rs_walk
+    mov rdi, r15
+    mov eax, ecx
+    imul eax, r14d
+    add rdi, rax                              ; row start
+    mov eax, COMP_BG_COLOR
+    mov edx, r12d                             ; pixels per row
+    push rcx
+.rs_bg_px:
+    test edx, edx
+    jz .rs_bg_row_done
+    mov [rdi], eax
+    add rdi, 4
+    dec edx
+    jmp .rs_bg_px
+.rs_bg_row_done:
+    pop rcx
+    inc ecx
+    jmp .rs_bg_row
+
+.rs_walk:
+    ; --- Walk window table, draw each mapped non-root window.
+    xor ecx, ecx
+.rs_w_loop:
+    cmp ecx, MAX_WINDOWS
+    jge .rs_done_pop
+    mov rax, rcx
+    imul rax, WINDOW_REC_SIZE
+    lea rbx, [windows + rax]
+    mov eax, [rbx]
+    test eax, eax
+    jz .rs_w_next
+    cmp eax, X_ROOT_WINDOW
+    je .rs_w_next
+    cmp byte [rbx + 28], 0
+    je .rs_w_next                             ; not mapped
+    ; Got a visible window. Draw it.
+    push rcx
+    mov edi, eax                              ; xid (for colour)
+    call window_color
+    mov edx, eax                              ; colour in edx
+    movsx eax, word [rbx + 8]                 ; x (s16)
+    movsx esi, word [rbx + 10]                ; y
+    movzx edi, word [rbx + 12]                ; width
+    movzx ecx, word [rbx + 14]                ; height
+    call draw_rect
+    pop rcx
+.rs_w_next:
+    inc ecx
+    jmp .rs_w_loop
+
+.rs_done_pop:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+.rs_done:
+    ret
+
+; ----------------------------------------------------------------------------
+; window_color — edi = xid. Returns a non-dark RGB colour in eax.
+; Hash via Knuth's golden-ratio constant; OR in 0x808080 so every
+; colour stays visible against the dark background.
+; ----------------------------------------------------------------------------
+window_color:
+    mov eax, edi
+    imul eax, 0x9E3779B1
+    or eax, 0x808080
+    and eax, 0x00FFFFFF
+    ret
+
+; ----------------------------------------------------------------------------
+; draw_rect — eax = x (s32), esi = y (s32), edi = w (u32), ecx = h (u32),
+; edx = colour.
+; Clips to screen bounds before drawing.
+; ----------------------------------------------------------------------------
+draw_rect:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov ebp, edx                              ; colour
+
+    ; --- Clip ---
+    movzx r12d, word [drm_modes_buf + 4]     ; screen width
+    movzx r13d, word [drm_modes_buf + 14]    ; screen height
+    test eax, eax
+    jns .dr_x_ok
+    add edi, eax                              ; w += x (which is negative)
+    xor eax, eax
+.dr_x_ok:
+    test esi, esi
+    jns .dr_y_ok
+    add ecx, esi
+    xor esi, esi
+.dr_y_ok:
+    mov ebx, eax
+    add ebx, edi
+    cmp ebx, r12d
+    jbe .dr_w_ok
+    mov edi, r12d
+    sub edi, eax
+.dr_w_ok:
+    mov ebx, esi
+    add ebx, ecx
+    cmp ebx, r13d
+    jbe .dr_h_ok
+    mov ecx, r13d
+    sub ecx, esi
+.dr_h_ok:
+    cmp edi, 0
+    jle .dr_done
+    cmp ecx, 0
+    jle .dr_done
+
+    ; --- Draw ---
+    mov r14d, [drm_dumb_pitch]
+    mov r15, [drm_dumb_addr]
+    mov ebx, ecx                              ; remaining rows
+    mov r13d, esi                             ; current y
+.dr_row:
+    test ebx, ebx
+    jz .dr_done
+    mov rdi, r15
+    mov edx, r13d
+    imul edx, r14d
+    add rdi, rdx                              ; row start
+    mov edx, eax
+    shl edx, 2
+    add rdi, rdx                              ; + x*4
+    mov edx, edi                              ; columns remaining
+    mov ecx, edi                              ; (reuse: column count)
+    mov edx, eax                              ; tmp
+    mov edx, ebp                              ; colour into edx
+.dr_col_setup:
+    ; Use rep stosd: rcx = pixel count = w, eax = colour.
+    push rax
+    mov ecx, edi                              ; w pixels
+    mov eax, ebp
+    rep stosd
+    pop rax
+    inc r13d
+    dec ebx
+    jmp .dr_row
+.dr_done:
+    pop rbp
+    pop r15
+    pop r14
     pop r13
     pop r12
     pop rbx
