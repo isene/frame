@@ -2,8 +2,8 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.10-blue)
-![Phase](https://img.shields.io/badge/phase-4d%2F14-yellow)
+![Version](https://img.shields.io/badge/version-0.0.11-blue)
+![Phase](https://img.shields.io/badge/phase-4e%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
@@ -35,7 +35,8 @@ software-rendered, all on a stack written end-to-end in asm.
 | 4c | Properties — ChangeProperty / GetProperty / GetAtomName | ✓ shipped |
 | 4d.1 | Input API — GrabKey / GrabKeyboard / real US keysym table | ✓ shipped |
 | 4d.2 | evdev → KeyPress event delivery | ✓ shipped |
-| 4e | SubstructureRedirect routing + ReparentWindow | |
+| 4e | SubstructureRedirect routing + ReparentWindow | ✓ shipped |
+| 4f | Software compositor (tie phase 2b dumb buffer to windows) | |
 | 5 | Atoms + GetProperty / ChangeProperty / selections | |
 | 6 | SHAPE extension | |
 | 7 | GCs + drawing primitives | |

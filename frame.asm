@@ -146,6 +146,13 @@ DEFAULT REL
 %define CW_COLORMAP          0x2000
 %define CW_CURSOR            0x4000
 
+; X11 event-mask bits (subset). SubstructureRedirectMask redirects
+; child MapWindow / ConfigureWindow to whichever client set it (the
+; WM). SubstructureNotifyMask sends MapNotify / ConfigureNotify /
+; DestroyNotify to the same subscriber.
+%define EM_SUBSTRUCTURE_NOTIFY    0x00080000
+%define EM_SUBSTRUCTURE_REDIRECT  0x00100000
+
 ; ConfigureWindow value-mask bits.
 %define CFG_X                0x01
 %define CFG_Y                0x02
@@ -242,7 +249,9 @@ reply_buf:          resb 16384
 ;   +24 event_mask (u32) — SubstructureRedirect / etc. for tile's root grab
 ;   +28 mapped (u8)
 ;   +29 override_redirect (u8)
-;   +30 pad (2)
+;   +30 redirect_owner (s8)  — phase 4e: slot of the WM that set
+;                              SubstructureRedirectMask, or -1
+;   +31 pad (1)
 %define MAX_WINDOWS      512
 %define WINDOW_REC_SIZE  32
 windows:            resb MAX_WINDOWS * WINDOW_REC_SIZE
@@ -2965,6 +2974,8 @@ dispatch_request:
     je .dr_get_window_attributes
     cmp eax, 4
     je .dr_destroy_window
+    cmp eax, 7
+    je .dr_reparent_window
     cmp eax, 8
     je .dr_map_window
     cmp eax, 10
@@ -3154,6 +3165,11 @@ dispatch_request:
     mov edi, ebx
     mov rsi, r12
     call handle_destroy_window
+    jmp .dr_done
+
+.dr_reparent_window:
+    mov rsi, r12
+    call handle_reparent_window
     jmp .dr_done
 
 .dr_map_window:
@@ -4277,7 +4293,8 @@ init_windows:
     mov dword [rbx + 24], 0                  ; event_mask (tile will set this)
     mov byte  [rbx + 28], 1                  ; mapped = true
     mov byte  [rbx + 29], 0                  ; override-redirect
-    mov word  [rbx + 30], 0
+    mov byte  [rbx + 30], -1                 ; no redirect owner yet
+    mov byte  [rbx + 31], 0
     pop rbx
     ret
 
@@ -4475,6 +4492,8 @@ handle_create_window:
     mov dword [r13 + 24], 0                  ; event_mask (default 0)
     mov byte  [r13 + 28], 0                  ; mapped (false)
     mov byte  [r13 + 29], 0                  ; override-redirect (false)
+    mov byte  [r13 + 30], -1                 ; redirect_owner (none)
+    mov byte  [r13 + 31], 0
 
     ; Walk CW value-mask.
     mov ecx, [r12 + 28]
@@ -4482,6 +4501,11 @@ handle_create_window:
     jz .cw_done
     lea rdx, [r12 + 32]
     call apply_cw_values
+    ; If the event mask includes SubstructureRedirect, claim ownership.
+    mov eax, [r13 + 24]
+    test eax, EM_SUBSTRUCTURE_REDIRECT
+    jz .cw_done
+    mov [r13 + 30], bl                       ; redirect_owner = current slot
 .cw_done:
     pop r14
     pop r13
@@ -4516,6 +4540,14 @@ handle_change_window_attributes:
     jz .cwa_done
     lea rdx, [r12 + 12]
     call apply_cw_values
+    ; SubstructureRedirect ownership transfer.
+    mov eax, [r13 + 24]
+    test eax, EM_SUBSTRUCTURE_REDIRECT
+    jz .cwa_clear_redirect
+    mov [r13 + 30], bl
+    jmp .cwa_done
+.cwa_clear_redirect:
+    mov byte [r13 + 30], -1
 .cwa_done:
     pop r13
     pop r12
@@ -4539,36 +4571,105 @@ handle_destroy_window:
     ret
 
 ; ============================================================================
-; handle_map_window — edi = slot, rsi = req ptr. Mark window's mapped flag.
+; handle_map_window — edi = slot, rsi = req ptr.
+;
+; SubstructureRedirect intercept: if the window's parent has a redirect
+; owner that's a DIFFERENT client than the requester, we don't map; we
+; send a MapRequest event to the owner instead. The owner (the WM) then
+; sees the request and decides what to do.
+;
+; Otherwise we map directly, and if the parent has SubstructureNotify on
+; the same client (the WM), send MapNotify so the WM knows it landed.
 ;
 ; Request: +4 window
-;
 ; No reply.
 ; ============================================================================
 handle_map_window:
     push rbx
-    mov ebx, edi
-    mov edi, [rsi + 4]
+    push r12
+    push r13
+    push r14
+    mov ebx, edi                              ; requester slot
+    mov edi, [rsi + 4]                        ; window xid
     call window_lookup
     test rax, rax
     jz .mw_done
-    mov byte [rax + 28], 1
+    mov r12, rax                              ; window record
+    mov edi, [r12 + 4]                        ; parent xid
+    call window_lookup
+    test rax, rax
+    jz .mw_just_map
+    mov r13, rax                              ; parent record
+    movsx r14d, byte [r13 + 30]               ; redirect_owner
+    cmp r14d, 0
+    jl .mw_just_map
+    cmp r14d, ebx
+    je .mw_just_map                            ; requester IS the WM → map
+    ; Redirect: send MapRequest to the WM.
+    mov edi, r14d                              ; owner slot
+    mov esi, [r13]                             ; parent xid
+    mov edx, [r12]                             ; window xid
+    call send_map_request
+    jmp .mw_done
+.mw_just_map:
+    mov byte [r12 + 28], 1
+    ; If parent has SubstructureNotify, notify the redirect-owner subscriber.
+    test r13, r13
+    jz .mw_done
+    mov eax, [r13 + 24]
+    test eax, EM_SUBSTRUCTURE_NOTIFY
+    jz .mw_done
+    movsx r14d, byte [r13 + 30]
+    cmp r14d, 0
+    jl .mw_done
+    mov edi, r14d
+    mov esi, [r13]                             ; parent xid (the event window)
+    mov edx, [r12]                             ; child xid
+    call send_map_notify
 .mw_done:
+    pop r14
+    pop r13
+    pop r12
     pop rbx
     ret
 
 ; ============================================================================
-; handle_unmap_window — symmetric to handle_map_window.
+; handle_unmap_window — symmetric to handle_map_window. (UnmapWindow is
+; NOT redirected — substructure redirect applies only to MapWindow,
+; ConfigureWindow, CirculateWindow.) Sends UnmapNotify to substructure
+; notify subscribers.
 ; ============================================================================
 handle_unmap_window:
     push rbx
+    push r12
+    push r13
+    push r14
     mov ebx, edi
     mov edi, [rsi + 4]
     call window_lookup
     test rax, rax
     jz .uw_done
-    mov byte [rax + 28], 0
+    mov r12, rax
+    mov byte [r12 + 28], 0
+    mov edi, [r12 + 4]
+    call window_lookup
+    test rax, rax
+    jz .uw_done
+    mov r13, rax
+    mov eax, [r13 + 24]
+    test eax, EM_SUBSTRUCTURE_NOTIFY
+    jz .uw_done
+    movsx r14d, byte [r13 + 30]
+    cmp r14d, 0
+    jl .uw_done
+    mov edi, r14d
+    mov esi, [r13]
+    mov edx, [r12]
+    call send_unmap_notify
 .uw_done:
+    pop r14
+    pop r13
+    pop r12
     pop rbx
     ret
 
@@ -4598,6 +4699,7 @@ handle_configure_window:
     push r12
     push r13
     push r14
+    push r15
     mov ebx, edi
     mov r12, rsi
     mov edi, [r12 + 4]
@@ -4605,6 +4707,29 @@ handle_configure_window:
     test rax, rax
     jz .cfgw_done
     mov r13, rax                             ; record ptr
+
+    ; SubstructureRedirect check on parent.
+    push rax
+    mov edi, [r13 + 4]                       ; parent xid
+    call window_lookup
+    mov r15, rax                             ; parent record (may be 0)
+    pop rax
+    test r15, r15
+    jz .cfgw_apply
+    movsx eax, byte [r15 + 30]
+    cmp eax, 0
+    jl .cfgw_apply
+    cmp eax, ebx
+    je .cfgw_apply                           ; requester IS the WM → apply
+    ; Redirect: send ConfigureRequest to the WM.
+    mov edi, eax                              ; owner slot
+    mov rsi, r12                              ; req ptr (has all the fields)
+    mov edx, [r13]                            ; window xid
+    mov ecx, [r15]                            ; parent xid
+    call send_configure_request
+    jmp .cfgw_done
+
+.cfgw_apply:
     movzx ecx, word [r12 + 8]                ; value-mask
     lea r14, [r12 + 12]                      ; cursor in value-list
 .cfgw_loop:
@@ -4648,6 +4773,7 @@ handle_configure_window:
     jz .cfgw_done
     add r14, 4
 .cfgw_done:
+    pop r15
     pop r14
     pop r13
     pop r12
@@ -5680,6 +5806,303 @@ send_key_press:
     mov rax, SYS_WRITE
     mov rdx, 32
     syscall
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; ============================================================================
+; PHASE 4e — SubstructureRedirect routing.
+; ============================================================================
+; The WM (tile) sets EM_SUBSTRUCTURE_REDIRECT on root via
+; ChangeWindowAttributes; from that moment, any non-WM client's
+; MapWindow / ConfigureWindow on a child of root is INTERCEPTED — the
+; request goes to the WM as a MapRequest / ConfigureRequest event
+; instead of executing directly. The WM looks at it, decides where
+; the window goes, and re-issues MapWindow / ConfigureWindow itself
+; (which run normally since the requester is the redirect owner).
+;
+; SubstructureNotify, set in the same event mask, sends MapNotify /
+; ConfigureNotify / UnmapNotify to the WM on every actual map /
+; configure / unmap of a child — so the WM can keep its view of the
+; tree consistent.
+; ============================================================================
+
+; ----------------------------------------------------------------------------
+; handle_reparent_window — rsi = req ptr.
+;
+; Request: +4 window, +8 parent, +12 x (s16), +14 y (s16)
+; ============================================================================
+handle_reparent_window:
+    push rbx
+    mov edi, [rsi + 4]
+    call window_lookup
+    test rax, rax
+    jz .rp_done
+    mov ecx, [rsi + 8]
+    mov [rax + 4], ecx                        ; new parent
+    mov dx, [rsi + 12]
+    mov [rax + 8], dx                         ; new x
+    mov dx, [rsi + 14]
+    mov [rax + 10], dx                        ; new y
+.rp_done:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; send_event_to_slot — edi = client slot, rsi = 32-byte event buffer.
+; Writes the buffer to the client's fd; events DON'T use sequence
+; numbers the way replies do, but the seq slot is normally the
+; client's last-sent seq, which we have in meta + 8.
+; ----------------------------------------------------------------------------
+send_event_to_slot:
+    push rbx
+    push r12
+    push r13
+    mov r12d, edi
+    mov r13, rsi
+    mov eax, r12d
+    call client_meta_addr
+    mov ebx, [rax]                            ; fd
+    mov ecx, [rax + 8]                        ; seq
+    mov [r13 + 2], cx                         ; patch into event[2..3]
+    mov rax, SYS_WRITE
+    mov edi, ebx
+    mov rsi, r13
+    mov rdx, 32
+    syscall
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; send_map_request — edi = slot, esi = parent xid, edx = window xid.
+;
+; MapRequest event (32 bytes):
+;   +0  code = 20         +1  0
+;   +2  sequence          +4  parent
+;   +8  window            +12..31 pad
+; ----------------------------------------------------------------------------
+send_map_request:
+    push rbx
+    push r12
+    push r13
+    mov ebx, edi
+    mov r12d, esi
+    mov r13d, edx
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 20
+    mov byte [rdi + 1], 0
+    mov word [rdi + 2], 0
+    mov dword [rdi + 4], r12d
+    mov dword [rdi + 8], r13d
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+    mov edi, ebx
+    lea rsi, [reply_buf]
+    call send_event_to_slot
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; send_configure_request — edi = slot, rsi = original req ptr,
+; edx = window xid, ecx = parent xid.
+;
+; The original request has all the geometry fields starting at +8;
+; we just unpack them. Stack-mode comes from request +1, value-mask
+; from request +8 (low 16 bits).
+;
+; ConfigureRequest event (32 bytes):
+;   +0  code = 23         +1  stack-mode
+;   +2  sequence          +4  parent
+;   +8  window            +12 sibling
+;   +16 x (s16)           +18 y (s16)
+;   +20 width (u16)       +22 height (u16)
+;   +24 border-width (u16) +26 value-mask (u16)
+;   +28..31 pad
+;
+; The original ConfigureWindow value-list is variable-length; we walk
+; the mask to pull each present value. Geometry fields default to the
+; window's current values when not in the mask.
+; ----------------------------------------------------------------------------
+send_configure_request:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov ebx, edi
+    mov r12, rsi                              ; req ptr
+    mov r13d, edx                             ; window xid
+    mov r14d, ecx                             ; parent xid
+
+    ; Look up window to grab current geometry as defaults.
+    mov edi, r13d
+    call window_lookup
+    mov r15, rax                              ; window record or 0
+
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 23
+    movzx eax, byte [r12 + 1]                 ; stack-mode (we forward it)
+    mov [rdi + 1], al
+    mov word [rdi + 2], 0
+    mov [rdi + 4], r14d
+    mov [rdi + 8], r13d
+    mov dword [rdi + 12], 0                   ; sibling (we ignore CFG_SIBLING)
+
+    ; Defaults from window record.
+    xor eax, eax
+    test r15, r15
+    jz .scr_defaults_done
+    mov ax, [r15 + 8]
+    mov [rdi + 16], ax
+    mov ax, [r15 + 10]
+    mov [rdi + 18], ax
+    mov ax, [r15 + 12]
+    mov [rdi + 20], ax
+    mov ax, [r15 + 14]
+    mov [rdi + 22], ax
+    mov ax, [r15 + 16]
+    mov [rdi + 24], ax
+.scr_defaults_done:
+
+    ; Walk value-mask + value-list and overwrite defaults where present.
+    movzx ecx, word [r12 + 8]
+    mov [rdi + 26], cx                        ; value-mask
+    lea r9, [r12 + 12]
+    test ecx, CFG_X
+    jz .scr_y
+    mov eax, [r9]
+    mov [rdi + 16], ax
+    add r9, 4
+.scr_y:
+    test ecx, CFG_Y
+    jz .scr_w
+    mov eax, [r9]
+    mov [rdi + 18], ax
+    add r9, 4
+.scr_w:
+    test ecx, CFG_WIDTH
+    jz .scr_h
+    mov eax, [r9]
+    mov [rdi + 20], ax
+    add r9, 4
+.scr_h:
+    test ecx, CFG_HEIGHT
+    jz .scr_b
+    mov eax, [r9]
+    mov [rdi + 22], ax
+    add r9, 4
+.scr_b:
+    test ecx, CFG_BORDER_WIDTH
+    jz .scr_pad
+    mov eax, [r9]
+    mov [rdi + 24], ax
+.scr_pad:
+    mov dword [rdi + 28], 0
+
+    mov edi, ebx
+    lea rsi, [reply_buf]
+    call send_event_to_slot
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; send_map_notify — edi = slot, esi = event window (the parent),
+; edx = child window.
+;
+; MapNotify event (32 bytes):
+;   +0  code = 19         +1  0
+;   +2  sequence          +4  event (the window with the notify mask)
+;   +8  window (the child)
+;   +12 override-redirect (BOOL)
+;   +13..31 pad
+; ----------------------------------------------------------------------------
+send_map_notify:
+    push rbx
+    push r12
+    push r13
+    mov ebx, edi
+    mov r12d, esi
+    mov r13d, edx
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 19
+    mov byte [rdi + 1], 0
+    mov word [rdi + 2], 0
+    mov [rdi + 4], r12d
+    mov [rdi + 8], r13d
+    ; Look up child for its override-redirect flag.
+    push rdi
+    mov edi, r13d
+    call window_lookup
+    test rax, rax
+    jz .smn_or_none
+    movzx ecx, byte [rax + 29]
+    pop rdi
+    mov [rdi + 12], cl
+    jmp .smn_pad
+.smn_or_none:
+    pop rdi
+    mov byte [rdi + 12], 0
+.smn_pad:
+    mov byte [rdi + 13], 0
+    mov word [rdi + 14], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+    mov edi, ebx
+    lea rsi, [reply_buf]
+    call send_event_to_slot
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; send_unmap_notify — same signature as send_map_notify.
+;
+; UnmapNotify event (32 bytes):
+;   +0  code = 18         +1  0
+;   +2  sequence          +4  event
+;   +8  window            +12 from-configure (BOOL, false here)
+;   +13..31 pad
+; ----------------------------------------------------------------------------
+send_unmap_notify:
+    push rbx
+    push r12
+    push r13
+    mov ebx, edi
+    mov r12d, esi
+    mov r13d, edx
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 18
+    mov byte [rdi + 1], 0
+    mov word [rdi + 2], 0
+    mov [rdi + 4], r12d
+    mov [rdi + 8], r13d
+    mov byte [rdi + 12], 0
+    mov byte [rdi + 13], 0
+    mov word [rdi + 14], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+    mov edi, ebx
+    lea rsi, [reply_buf]
+    call send_event_to_slot
     pop r13
     pop r12
     pop rbx
