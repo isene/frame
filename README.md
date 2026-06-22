@@ -2,8 +2,8 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.3-blue)
-![Phase](https://img.shields.io/badge/phase-2b%2F14-yellow)
+![Version](https://img.shields.io/badge/version-0.0.4-blue)
+![Phase](https://img.shields.io/badge/phase-3%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
@@ -29,7 +29,7 @@ software-rendered, all on a stack written end-to-end in asm.
 | 1 | Connection setup + Unix socket bind | ✓ shipped |
 | 2 | DRM/KMS probe (read-only ioctls, no master) | ✓ shipped |
 | 2b | DRM/KMS modeset (CreateDumb + AddFB + SetCRTC) | ✓ shipped |
-| 3 | evdev input + KeyPress / Motion routing | |
+| 3 | evdev input + KeyPress / Motion routing | ✓ shipped |
 | 4 | Window tree + Configure / Reparent / SubstructureRedirect | |
 | 5 | Atoms + GetProperty / ChangeProperty / selections | |
 | 6 | SHAPE extension | |
@@ -154,6 +154,51 @@ The full cleanup path always runs (RMFB → munmap → DESTROY_DUMB →
 DROP_MASTER → close), and the CRTC is restored to its prior state.
 Worst case if something goes wrong: the screen stays purple until
 the kernel reprograms it (the next X start does this).
+
+## Phase 3: evdev input
+
+```bash
+./frame --probe-input                       # enumerate /dev/input/event*
+./frame --watch-input /dev/input/event3     # live decode events
+```
+
+`--probe-input` scans `/dev/input/event0..31`, opens each one read-only,
+calls `EVIOCGNAME` (=`_IOC(_IOC_READ, 'E', 0x06, 64)`), and lists what
+came back:
+
+```
+frame: input devices:
+  event0: Power Button
+  event1: Lid Switch
+  event3: AT Translated Set 2 keyboard
+  event5: SynPS/2 Synaptics TouchPad
+  event7: SHK Bluetooth (Touch)
+  ...
+```
+
+`--watch-input PATH` opens the named device and decodes each
+`input_event` record (24 bytes: `tv_sec`, `tv_usec`, `type`, `code`,
+`value`). Output line format is one of:
+
+```
+KEY 30 press        # keyboard: 'A' down
+KEY 30 release      # 'A' up
+BTN 272 press       # mouse: BTN_LEFT down
+REL 0 value=-3      # mouse moved 3 left
+REL 1 value=2       # mouse moved 2 down
+ABS 0 value=512     # touchpad position
+SW  0 value=1       # switch (lid open/close, etc.)
+```
+
+Keycodes match `/usr/include/linux/input-event-codes.h`. Phase 4
+layers the evdev→XKB→keysym translation on top so X clients see
+real keysyms.
+
+### Access
+
+`/dev/input/event*` is `crw-rw---- root:input` on most distros. Either
+`sudo`, or `sudo usermod -aG input geir && reboot`. From a VT (where
+phase 2b runs anyway) this is automatic if you use `sudo`.
 
 ## How it's built
 

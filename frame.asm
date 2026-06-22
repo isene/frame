@@ -73,6 +73,28 @@ DEFAULT REL
 %define PROT_RW         3            ; PROT_READ | PROT_WRITE
 %define MAP_SHARED      1
 
+; ---- evdev / input ABI ----------------------------------------------------
+; struct input_event on 64-bit:
+;   __kernel_long_t tv_sec   (8)
+;   __kernel_long_t tv_usec  (8)
+;   __u16  type              (2)
+;   __u16  code              (2)
+;   __s32  value             (4)
+; = 24 bytes total.
+%define INPUT_EVENT_SIZE   24
+%define EV_SYN             0
+%define EV_KEY             1
+%define EV_REL             2
+%define EV_ABS             3
+%define EV_MSC             4
+%define EV_SW              5
+
+; EVIOCGNAME(64): _IOC(_IOC_READ, 'E', 0x06, 64)
+; (dir<<30) | (size<<16) | (type<<8) | nr = (2<<30) | (64<<16) | (0x45<<8) | 6
+%define EVIOCGNAME_64      0x80404506
+%define INPUT_DEV_MAX      32         ; scan /dev/input/event0..31
+%define INPUT_BATCH_BYTES  768        ; 32 events × 24 bytes
+
 %define DRM_MODE_CONNECTED      1
 %define DRM_MODE_DISCONNECTED   2
 %define DRM_MODE_UNKNOWNCONN    3
@@ -184,6 +206,11 @@ drm_dumb_addr:      resq 1
 drm_chosen_crtc:    resd 1
 drm_chosen_conn:    resd 1
 nanosleep_ts:       resq 2
+
+; ---- evdev probe / watch state --------------------------------------------
+input_dev_path:     resb 32
+input_dev_name:     resb 256
+input_event_batch:  resb INPUT_BATCH_BYTES
 
 ; ============================================================================
 ; RODATA — setup reply template, vendor string, log prefixes
@@ -301,6 +328,46 @@ ms_err_addfb_len   equ $ - ms_err_addfb
 ms_err_setcrtc:    db "SETCRTC", 10
 ms_err_setcrtc_len equ $ - ms_err_setcrtc
 
+; ---- input strings --------------------------------------------------------
+input_dev_pre:      db "/dev/input/event", 0
+input_dev_pre_len   equ $ - input_dev_pre - 1
+input_dev_header:   db "frame: input devices:", 10
+input_dev_header_len equ $ - input_dev_header
+input_dev_indent:   db "  event"
+input_dev_indent_len equ $ - input_dev_indent
+input_dev_colon:    db ": ", 0
+input_dev_colon_len equ $ - input_dev_colon - 1
+input_watch_pre:    db "frame: watching ", 0
+input_watch_pre_len equ $ - input_watch_pre - 1
+input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
+input_watch_usage_len equ $ - input_watch_usage
+input_watch_oerr:   db "frame: open failed (need 'input' group membership, or run with sudo)", 10
+input_watch_oerr_len equ $ - input_watch_oerr
+input_probe_none:   db "  (none opened — run with sudo, or add yourself to the 'input' group)", 10
+input_probe_none_len equ $ - input_probe_none
+input_lbl_key:      db "KEY ", 0
+input_lbl_key_len   equ $ - input_lbl_key - 1
+input_lbl_btn:      db "BTN ", 0
+input_lbl_btn_len   equ $ - input_lbl_btn - 1
+input_lbl_rel:      db "REL ", 0
+input_lbl_rel_len   equ $ - input_lbl_rel - 1
+input_lbl_abs:      db "ABS ", 0
+input_lbl_abs_len   equ $ - input_lbl_abs - 1
+input_lbl_sw:       db "SW  ", 0
+input_lbl_sw_len    equ $ - input_lbl_sw - 1
+input_lbl_msc:      db "MSC ", 0
+input_lbl_msc_len   equ $ - input_lbl_msc - 1
+input_lbl_other:    db "??? ", 0
+input_lbl_other_len equ $ - input_lbl_other - 1
+input_act_press:    db " press", 10
+input_act_press_len equ $ - input_act_press
+input_act_release:  db " release", 10
+input_act_release_len equ $ - input_act_release
+input_act_repeat:   db " repeat", 10
+input_act_repeat_len equ $ - input_act_repeat
+input_value_pre:    db " value=", 0
+input_value_pre_len equ $ - input_value_pre - 1
+
 ; Connector type names — indexed by drm_mode_get_connector.connector_type.
 ; (drm_mode.h, "DRM_MODE_CONNECTOR_*", values 0..21.)
 conn_type_0:  db "Unknown", 0
@@ -367,13 +434,51 @@ _start:
     syscall
 .check_modeset:
     cmp dword [rdi], '--mo'
-    jne .check_num
+    jne .check_probe_input
     cmp dword [rdi + 4], 'dese'
-    jne .check_num
+    jne .check_probe_input
     cmp word [rdi + 8], 't'              ; 't' + NUL
-    jne .check_num
+    jne .check_probe_input
     call do_modeset
     xor edi, edi
+    mov rax, SYS_EXIT
+    syscall
+.check_probe_input:
+    ; "--probe-input"
+    cmp dword [rdi], '--pr'
+    jne .check_watch_input
+    cmp dword [rdi + 4], 'obe-'
+    jne .check_watch_input
+    cmp dword [rdi + 8], 'inpu'
+    jne .check_watch_input
+    cmp word [rdi + 12], 't'             ; 't' + NUL
+    jne .check_watch_input
+    call do_probe_input
+    xor edi, edi
+    mov rax, SYS_EXIT
+    syscall
+.check_watch_input:
+    ; "--watch-input PATH"
+    cmp dword [rdi], '--wa'
+    jne .check_num
+    cmp dword [rdi + 4], 'tch-'
+    jne .check_num
+    cmp dword [rdi + 8], 'inpu'
+    jne .check_num
+    cmp word [rdi + 12], 't'
+    jne .check_num
+    cmp rax, 3
+    jl .watch_usage
+    mov rdi, [rsp + 24]                  ; argv[2] = device path
+    call do_watch_input
+    xor edi, edi
+    mov rax, SYS_EXIT
+    syscall
+.watch_usage:
+    mov rsi, input_watch_usage
+    mov rdx, input_watch_usage_len
+    call write_stderr
+    mov edi, 1
     mov rax, SYS_EXIT
     syscall
 .check_num:
@@ -1827,3 +1932,323 @@ modeset_find_connector:
     pop r13
     pop rbx
     ret
+
+; ============================================================================
+; do_probe_input — phase 3a. Scan /dev/input/event0..31, call EVIOCGNAME
+; on each that opens, print "  event N: NAME". No privileges beyond reading
+; the device files (which on this system requires 'input' group; the user
+; can also be in 'video' to inherit that).
+; ============================================================================
+do_probe_input:
+    push rbx
+    push r12
+    mov rsi, input_dev_header
+    mov rdx, input_dev_header_len
+    call write_stderr
+
+    xor ebx, ebx
+    xor r12d, r12d                       ; success counter
+.pi_loop:
+    cmp ebx, INPUT_DEV_MAX
+    jge .pi_done
+
+    ; Build path "/dev/input/eventN".
+    lea rdi, [input_dev_path]
+    lea rsi, [input_dev_pre]
+.pi_cp:
+    mov al, [rsi]
+    test al, al
+    jz .pi_cp_done
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    jmp .pi_cp
+.pi_cp_done:
+    mov eax, ebx
+    call u64_to_ascii
+    mov byte [rdi], 0
+
+    ; open O_RDONLY
+    mov rax, SYS_OPEN
+    lea rdi, [input_dev_path]
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .pi_next
+    push rax
+
+    ; ioctl EVIOCGNAME(64) — returns bytes written including NUL.
+    mov rdi, rax
+    mov esi, EVIOCGNAME_64
+    lea rdx, [input_dev_name]
+    mov rax, SYS_IOCTL
+    syscall
+    pop rdi                              ; recover fd
+    push rdi
+    test rax, rax
+    js .pi_close_skip
+
+    ; "  event N: NAME\n"
+    mov rsi, input_dev_indent
+    mov rdx, input_dev_indent_len
+    call write_stderr
+    mov eax, ebx
+    call write_u64_stderr
+    mov rsi, input_dev_colon
+    mov rdx, input_dev_colon_len
+    call write_stderr
+    lea rsi, [input_dev_name]
+    call write_str_stderr
+    lea rsi, [probe_conn_nl]
+    mov rdx, 1
+    call write_stderr
+    inc r12d
+
+.pi_close_skip:
+    pop rdi
+    mov rax, SYS_CLOSE
+    syscall
+.pi_next:
+    inc ebx
+    jmp .pi_loop
+.pi_done:
+    test r12d, r12d
+    jnz .pi_have_devs
+    mov rsi, input_probe_none
+    mov rdx, input_probe_none_len
+    call write_stderr
+.pi_have_devs:
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; do_watch_input(rdi = NUL-terminated device path) — phase 3b. Opens the
+; device, prints "frame: watching NAME", then loops on read(): each batch
+; of input_event records is decoded and printed. Runs until read returns 0
+; (EOF — device unplugged) or the user kills us.
+;
+; Per-event output drops EV_SYN packets (just framing) and uses a compact
+; one-line decode:
+;   KEY 30 press     (EV_KEY with code < 0x100 → keyboard key)
+;   BTN 272 press    (EV_KEY with code ≥ 0x100 → mouse / pad button)
+;   REL 0 value=-3   (EV_REL — relative axis; mostly mouse motion)
+;   ABS 0 value=512  (EV_ABS — absolute axis; touchpad coords)
+;   SW  0 value=1    (EV_SW  — switch; lid open/close etc.)
+;
+; Keycodes match /usr/include/linux/input-event-codes.h. Phase 4 layers the
+; evdev→XKB→keysym translation table on top so X clients see real keysyms.
+; ============================================================================
+do_watch_input:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi                         ; save path
+
+    mov rax, SYS_OPEN
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .wi_open_fail
+    mov r12, rax
+
+    ; Get the device name for the "watching" announcement.
+    mov rdi, r12
+    mov esi, EVIOCGNAME_64
+    lea rdx, [input_dev_name]
+    mov rax, SYS_IOCTL
+    syscall
+
+    mov rsi, input_watch_pre
+    mov rdx, input_watch_pre_len
+    call write_stderr
+    lea rsi, [input_dev_name]
+    call write_str_stderr
+    lea rsi, [probe_conn_nl]
+    mov rdx, 1
+    call write_stderr
+
+.wi_loop:
+    mov rax, SYS_READ
+    mov rdi, r12
+    lea rsi, [input_event_batch]
+    mov rdx, INPUT_BATCH_BYTES
+    syscall
+    test rax, rax
+    jle .wi_done
+
+    mov r13, rax                         ; total bytes
+    xor rbx, rbx
+.wi_event:
+    cmp rbx, r13
+    jge .wi_loop
+    lea rdi, [input_event_batch]
+    add rdi, rbx
+    call print_input_event
+    add rbx, INPUT_EVENT_SIZE
+    jmp .wi_event
+
+.wi_done:
+    mov rax, SYS_CLOSE
+    mov rdi, r12
+    syscall
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.wi_open_fail:
+    mov rsi, input_watch_oerr
+    mov rdx, input_watch_oerr_len
+    call write_stderr
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; print_input_event(rdi = pointer to a 24-byte input_event)
+; Layout: tv_sec(8) tv_usec(8) type(2) code(2) value(4). Drops SYN events
+; (type 0) silently — they're just packet boundaries, not user actions.
+; ============================================================================
+print_input_event:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    movzx r12d, word [rbx + 16]          ; type
+    movzx r13d, word [rbx + 18]          ; code
+    ; value is signed int32 — sign-extend.
+    movsxd r14, dword [rbx + 20]
+
+    test r12d, r12d
+    jz .pe_done                           ; SYN → ignore
+
+    ; Pick a label based on type.
+    cmp r12d, EV_KEY
+    je .pe_key
+    cmp r12d, EV_REL
+    je .pe_rel
+    cmp r12d, EV_ABS
+    je .pe_abs
+    cmp r12d, EV_SW
+    je .pe_sw
+    cmp r12d, EV_MSC
+    je .pe_msc
+    ; ??? — print generic with type=N
+    mov rsi, input_lbl_other
+    mov rdx, input_lbl_other_len
+    call write_stderr
+    mov eax, r12d
+    call write_u64_stderr
+    mov rsi, input_value_pre
+    mov rdx, input_value_pre_len
+    call write_stderr
+    mov rax, r14
+    call write_i64_stderr
+    lea rsi, [probe_conn_nl]
+    mov rdx, 1
+    call write_stderr
+    jmp .pe_done
+
+.pe_key:
+    ; BTN_* codes start at 0x100; below that is keyboard.
+    cmp r13d, 0x100
+    jae .pe_btn
+    mov rsi, input_lbl_key
+    mov rdx, input_lbl_key_len
+    call write_stderr
+    jmp .pe_keylike
+.pe_btn:
+    mov rsi, input_lbl_btn
+    mov rdx, input_lbl_btn_len
+    call write_stderr
+.pe_keylike:
+    mov eax, r13d
+    call write_u64_stderr
+    ; action label based on value: 1 = press, 0 = release, 2 = repeat.
+    cmp r14d, 1
+    je .pe_press
+    cmp r14d, 0
+    je .pe_release
+    cmp r14d, 2
+    je .pe_repeat
+    mov rsi, input_value_pre
+    mov rdx, input_value_pre_len
+    call write_stderr
+    mov rax, r14
+    call write_i64_stderr
+    lea rsi, [probe_conn_nl]
+    mov rdx, 1
+    call write_stderr
+    jmp .pe_done
+.pe_press:
+    mov rsi, input_act_press
+    mov rdx, input_act_press_len
+    call write_stderr
+    jmp .pe_done
+.pe_release:
+    mov rsi, input_act_release
+    mov rdx, input_act_release_len
+    call write_stderr
+    jmp .pe_done
+.pe_repeat:
+    mov rsi, input_act_repeat
+    mov rdx, input_act_repeat_len
+    call write_stderr
+    jmp .pe_done
+
+.pe_rel:
+    mov rsi, input_lbl_rel
+    mov rdx, input_lbl_rel_len
+    call write_stderr
+    jmp .pe_axis_emit
+.pe_abs:
+    mov rsi, input_lbl_abs
+    mov rdx, input_lbl_abs_len
+    call write_stderr
+    jmp .pe_axis_emit
+.pe_sw:
+    mov rsi, input_lbl_sw
+    mov rdx, input_lbl_sw_len
+    call write_stderr
+    jmp .pe_axis_emit
+.pe_msc:
+    mov rsi, input_lbl_msc
+    mov rdx, input_lbl_msc_len
+    call write_stderr
+.pe_axis_emit:
+    mov eax, r13d
+    call write_u64_stderr
+    mov rsi, input_value_pre
+    mov rdx, input_value_pre_len
+    call write_stderr
+    mov rax, r14
+    call write_i64_stderr
+    lea rsi, [probe_conn_nl]
+    mov rdx, 1
+    call write_stderr
+
+.pe_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; write_i64_stderr — rax = signed integer. Emits a leading '-' if negative.
+; ============================================================================
+write_i64_stderr:
+    test rax, rax
+    jns .wi_pos
+    push rax
+    lea rsi, [.wi_minus]
+    mov rdx, 1
+    call write_stderr
+    pop rax
+    neg rax
+.wi_pos:
+    jmp write_u64_stderr
+.wi_minus: db "-"
