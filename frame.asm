@@ -6413,15 +6413,23 @@ recomposite_screen:
     push r12
     push r13
 
-    ; --- Background fill across the whole buffer. drm_dumb_size always
-    ;     covers height × pitch (with any kernel alignment baked in), so
-    ;     a single rep stosd covers everything that's mapped without
-    ;     needing the row-by-row math.
+    ; --- Background fill across the whole buffer.
     mov rdi, [drm_dumb_addr]
     mov rcx, [drm_dumb_size]
     shr rcx, 2
     mov eax, COMP_BG_COLOR
     rep stosd
+
+    ; --- Diagnostic reference rect: pure red 100×100 at (10, 10).
+    ;     ALWAYS drawn while the compositor is active so we can see
+    ;     whether draw_rect's writes ever reach the panel — independent
+    ;     of any window-table state.
+    mov eax, 10
+    mov esi, 10
+    mov edi, 100
+    mov ecx, 100
+    mov edx, 0x00FF0000                      ; pure red
+    call draw_rect
 
     ; --- Walk the window table, draw every mapped non-root window.
     xor ebx, ebx
@@ -6457,6 +6465,12 @@ recomposite_screen:
     jmp .rs_loop
 
 .rs_done_pop:
+    ; Memory barrier — make sure all framebuffer writes are visible to
+    ; the panel before we return. Dumb buffer mmaps on i915 are normally
+    ; write-back cached; without a fence here, a recomposite that
+    ; finishes quickly can have its rect writes still in-flight when
+    ; the panel's next vblank starts reading.
+    mfence
     pop r13
     pop r12
     pop rbx
