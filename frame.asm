@@ -946,8 +946,16 @@ emit_setup_reply:
 
     ; ---- setup info (40 bytes header + vendor + formats + screen + depths) ----
     ; release-number, rid-base, rid-mask, motion-buffer-size
+    ;
+    ; rid-base is per-CLIENT — each client gets a 2 MB XID range of its
+    ; own (X_RID_BASE + slot * 0x200000), so client N's first XID can't
+    ; collide with client 0's. Without this every client allocates
+    ; 0x400001 for its first window, which collides in our window table.
     mov dword [rdi + 0], X_RELEASE_NUMBER
-    mov dword [rdi + 4], X_RID_BASE
+    mov eax, esi
+    shl eax, 21                              ; * 0x200000
+    add eax, X_RID_BASE
+    mov [rdi + 4], eax
     mov dword [rdi + 8], X_RID_MASK
     mov dword [rdi + 12], 256            ; motion buffer size
     ; vendor-length, maximum-request-length
@@ -2930,7 +2938,8 @@ client_process:
     cmp r14d, edx
     jl .cp_done                              ; need more bytes for auth tail
     push rdx
-    mov edi, r13d
+    mov edi, r13d                            ; fd
+    mov esi, ebx                             ; client slot — for per-client rid_base
     call emit_setup_reply
     pop rdx
     mov byte [r12 + 4], CSTATE_RUNNING
