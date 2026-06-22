@@ -63,6 +63,7 @@ DEFAULT REL
 %define DRM_IOCTL_MODE_GETCONNECTOR    0xC05064A7
 %define DRM_IOCTL_MODE_ADDFB           0xC01C64AE
 %define DRM_IOCTL_MODE_RMFB            0xC00464AF
+%define DRM_IOCTL_MODE_DIRTYFB         0xC01864B7
 %define DRM_IOCTL_MODE_CREATE_DUMB     0xC02064B2
 %define DRM_IOCTL_MODE_MAP_DUMB        0xC01064B3
 %define DRM_IOCTL_MODE_DESTROY_DUMB    0xC00464B4
@@ -371,6 +372,11 @@ drm_dumb_addr:      resq 1
 drm_chosen_crtc:    resd 1
 drm_chosen_conn:    resd 1
 nanosleep_ts:       resq 2
+
+; drm_mode_fb_dirty_cmd (24 bytes) for kicking the panel after a
+; framebuffer update. fb_id at +0, flags at +4, color at +8,
+; num_clips at +12, clips_ptr at +16.
+drm_dirty_cmd:      resb 24
 
 ; ---- Phase 4f compositor state --------------------------------------------
 compositor_requested: resb 1               ; set by --display argv flag
@@ -6497,12 +6503,28 @@ recomposite_screen:
     jmp .rs_loop
 
 .rs_done_pop:
-    ; Memory barrier — make sure all framebuffer writes are visible to
-    ; the panel before we return. Dumb buffer mmaps on i915 are normally
-    ; write-back cached; without a fence here, a recomposite that
-    ; finishes quickly can have its rect writes still in-flight when
-    ; the panel's next vblank starts reading.
+    ; Memory barrier — orders prior stores. NOT a cache flush.
     mfence
+
+    ; --- DRM_IOCTL_MODE_DIRTYFB: tell the kernel the framebuffer
+    ; contents changed, so it flushes any GTT / cache state and kicks
+    ; the panel out of self-refresh. Without this, subsequent
+    ; recomposite writes can sit in CPU cache invisibly — the first
+    ; recomposite happens to propagate (cache evictions during fill),
+    ; but later ones don't until the process exits.
+    lea rdi, [drm_dirty_cmd]
+    mov eax, [drm_fb_id]
+    mov [rdi + 0], eax                       ; fb_id
+    mov dword [rdi + 4], 0                   ; flags
+    mov dword [rdi + 8], 0                   ; color
+    mov dword [rdi + 12], 0                  ; num_clips (0 = whole fb)
+    mov qword [rdi + 16], 0                  ; clips_ptr
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_DIRTYFB
+    lea rdx, [drm_dirty_cmd]
+    syscall
+
     pop r13
     pop r12
     pop rbx
