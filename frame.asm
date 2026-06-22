@@ -67,6 +67,7 @@ DEFAULT REL
 %define DRM_IOCTL_MODE_MAP_DUMB        0xC01064B3
 %define DRM_IOCTL_MODE_DESTROY_DUMB    0xC00464B4
 
+%define SYS_POLL        7
 %define SYS_MMAP        9
 %define SYS_MUNMAP      11
 %define SYS_NANOSLEEP   35
@@ -148,6 +149,41 @@ envp:               resq 1
 listen_fd:          resq 1
 client_fd:          resq 1
 display_num:        resq 1
+
+; ---- Phase 4 multi-client state -------------------------------------------
+; clients_meta[16] — one 16-byte slot per concurrent client.
+;   +0 fd (s32)          -1 = empty slot
+;   +4 state (u8)        0 = SETUP, 1 = RUNNING
+;   +5 pad (3)
+;   +8 seq (u32)         next sequence number to assign
+;   +12 buf_used (u32)   bytes valid in this client's read buffer
+%define MAX_CLIENTS      16
+%define CLIENT_META_SIZE 16
+%define CLIENT_BUF_SIZE  8192
+%define CSTATE_SETUP     0
+%define CSTATE_RUNNING   1
+clients_meta:       resb MAX_CLIENTS * CLIENT_META_SIZE
+clients_bufs:       resb MAX_CLIENTS * CLIENT_BUF_SIZE
+
+; pollfd_buf[17] — listen_fd + up to 16 client fds. Rebuilt each poll
+; iteration (sub-microsecond — 17 × 8 = 136 bytes of writes).
+pollfd_buf:         resb (MAX_CLIENTS + 1) * 8
+
+; Atom interning table. Atom 0 = None. Atoms 1..predef_count_max are
+; X11's predefined set (PRIMARY, ATOM, STRING, WM_NAME, ...).
+; Subsequent IDs allocated on demand by InternAtom. The strings live
+; packed in atom_strings; per-atom offset+length stored in
+; atom_off[] / atom_len[].
+%define MAX_ATOMS        512
+%define ATOM_STRINGS_CAP 16384
+atom_count:         resd 1                   ; number of atoms allocated (1-based; entry 0 unused)
+atom_strings_used:  resd 1                   ; bytes used in atom_strings
+atom_off:           resd MAX_ATOMS
+atom_len:           resd MAX_ATOMS
+atom_strings:       resb ATOM_STRINGS_CAP
+
+; Scratch reply buffer (32-byte X11 reply header + small bodies).
+reply_buf:          resb 64
 
 ; sockaddr_un used for both bind() and the unlink() path on shutdown.
 sockaddr_buf:       resb 128
@@ -235,6 +271,93 @@ log_bind_fail:      db "frame: bind failed (display in use?)", 10
 log_bind_fail_len  equ $ - log_bind_fail
 log_setup_bad:      db "frame: malformed setup request, hanging up", 10
 log_setup_bad_len  equ $ - log_setup_bad
+
+; ---- phase 4 multi-client log strings -------------------------------------
+log_serve_ready:    db "serve loop ready, polling listen + clients", 10
+log_serve_ready_len equ $ - log_serve_ready
+log_max_clients:    db "refusing connection, all 16 client slots in use", 10
+log_max_clients_len equ $ - log_max_clients
+log_atom_new:       db "  intern-atom new id=", 0
+log_atom_new_len   equ $ - log_atom_new - 1
+log_atom_known:     db "  intern-atom known id=", 0
+log_atom_known_len equ $ - log_atom_known - 1
+log_qext_pre:       db "  query-extension (not-present): ", 0
+log_qext_pre_len   equ $ - log_qext_pre - 1
+
+; Predefined X11 atoms (1..68 in X.h's XA_* range). Stored as a packed
+; stream: 1 length byte then that many name bytes per atom, terminated
+; by a length byte of 0. init_atoms walks this once at startup and
+; populates atom_off[] / atom_len[] / atom_strings.
+predef_atom_stream:
+    db 7, "PRIMARY"
+    db 9, "SECONDARY"
+    db 3, "ARC"
+    db 4, "ATOM"
+    db 6, "BITMAP"
+    db 8, "CARDINAL"
+    db 8, "COLORMAP"
+    db 6, "CURSOR"
+    db 11, "CUT_BUFFER0"
+    db 11, "CUT_BUFFER1"
+    db 11, "CUT_BUFFER2"
+    db 11, "CUT_BUFFER3"
+    db 11, "CUT_BUFFER4"
+    db 11, "CUT_BUFFER5"
+    db 11, "CUT_BUFFER6"
+    db 11, "CUT_BUFFER7"
+    db 8, "DRAWABLE"
+    db 4, "FONT"
+    db 7, "INTEGER"
+    db 6, "PIXMAP"
+    db 5, "POINT"
+    db 9, "RECTANGLE"
+    db 16, "RESOURCE_MANAGER"
+    db 13, "RGB_COLOR_MAP"
+    db 12, "RGB_BEST_MAP"
+    db 12, "RGB_BLUE_MAP"
+    db 15, "RGB_DEFAULT_MAP"
+    db 12, "RGB_GRAY_MAP"
+    db 13, "RGB_GREEN_MAP"
+    db 11, "RGB_RED_MAP"
+    db 6, "STRING"
+    db 8, "VISUALID"
+    db 6, "WINDOW"
+    db 10, "WM_COMMAND"
+    db 8, "WM_HINTS"
+    db 16, "WM_CLIENT_MACHINE"
+    db 12, "WM_ICON_NAME"
+    db 12, "WM_ICON_SIZE"
+    db 7, "WM_NAME"
+    db 15, "WM_NORMAL_HINTS"
+    db 13, "WM_SIZE_HINTS"
+    db 13, "WM_ZOOM_HINTS"
+    db 9, "MIN_SPACE"
+    db 10, "NORM_SPACE"
+    db 9, "MAX_SPACE"
+    db 9, "END_SPACE"
+    db 13, "SUPERSCRIPT_X"
+    db 13, "SUPERSCRIPT_Y"
+    db 11, "SUBSCRIPT_X"
+    db 11, "SUBSCRIPT_Y"
+    db 18, "UNDERLINE_POSITION"
+    db 19, "UNDERLINE_THICKNESS"
+    db 16, "STRIKEOUT_ASCENT"
+    db 17, "STRIKEOUT_DESCENT"
+    db 12, "ITALIC_ANGLE"
+    db 8, "X_HEIGHT"
+    db 10, "QUAD_WIDTH"
+    db 6, "WEIGHT"
+    db 10, "POINT_SIZE"
+    db 10, "RESOLUTION"
+    db 9, "COPYRIGHT"
+    db 6, "NOTICE"
+    db 9, "FONT_NAME"
+    db 11, "FAMILY_NAME"
+    db 9, "FULL_NAME"
+    db 10, "CAP_HEIGHT"
+    db 8, "WM_CLASS"
+    db 16, "WM_TRANSIENT_FOR"
+    db 0                                     ; terminator
 
 ; ---- probe-mode strings ---------------------------------------------------
 probe_card_pre:     db "/dev/dri/card", 0
@@ -490,27 +613,9 @@ _start:
     call socket_setup
     test rax, rax
     js .die_bind
-
-.accept_loop:
-    call do_accept                       ; blocks until a client arrives
-    test rax, rax
-    js .accept_loop
-    mov [client_fd], rax
-
-    mov rsi, log_accepted
-    mov rdx, log_accepted_len
-    call write_stderr
-
-    call handle_client                   ; handles one client to disconnect
-
-    mov rsi, log_client_gone
-    mov rdx, log_client_gone_len
-    call write_stderr
-
-    mov rax, SYS_CLOSE
-    mov rdi, [client_fd]
-    syscall
-    jmp .accept_loop
+    call init_atoms
+    call init_clients
+    jmp serve_loop
 
 .die_bind:
     mov rsi, log_bind_fail
@@ -635,111 +740,17 @@ do_accept:
     ret
 
 ; ============================================================================
-; handle_client — full lifecycle of one client connection.
-;   1. read the 12-byte setup-request prefix + variable auth tail
-;   2. validate byte-order ('l' or 'B') + version (11.0)
-;   3. emit the setup reply (success header + setup info + screen + visuals)
-;   4. enter a read loop, log each request opcode/length, drop the body
-; ============================================================================
-handle_client:
-    push rbx
-    ; --- 1. Read setup prefix ---
-    mov rax, SYS_READ
-    mov rdi, [client_fd]
-    lea rsi, [setup_req]
-    mov rdx, 12
-    syscall
-    cmp rax, 12
-    jne .hc_setup_bad
-    ; byte-order: 'l' = 0x6C (LSB-first), 'B' = 0x42 (MSB-first). We
-    ; require 'l' for now; switching would mean byte-swapping every
-    ; multibyte field on every read and write, which we won't do until
-    ; a real big-endian client surfaces.
-    cmp byte [setup_req], 'l'
-    jne .hc_setup_bad
-    ; protocol major must be 11
-    mov ax, [setup_req + 2]
-    cmp ax, X_PROTO_MAJOR
-    jne .hc_setup_bad
-
-    ; --- 1b. Drain auth tail so we leave the socket aligned to the first
-    ; real request. Auth name length is at +6, data length at +8.
-    movzx eax, word [setup_req + 6]      ; auth name length
-    add eax, 3
-    and eax, ~3
-    movzx ecx, word [setup_req + 8]      ; auth data length
-    add ecx, 3
-    and ecx, ~3
-    add eax, ecx
-    test eax, eax
-    jz .hc_emit_setup
-    cmp eax, 4096
-    ja .hc_setup_bad
-    mov rdx, rax
-    mov rax, SYS_READ
-    mov rdi, [client_fd]
-    lea rsi, [setup_req + 12]
-    syscall
-    cmp rax, rdx
-    jne .hc_setup_bad
-
-.hc_emit_setup:
-    call emit_setup_reply
-
-    ; --- 2. Request loop ---
-.hc_req_loop:
-    mov rax, SYS_READ
-    mov rdi, [client_fd]
-    lea rsi, [req_buf]
-    mov rdx, 65536
-    syscall
-    test rax, rax
-    jle .hc_done
-    mov rbx, rax                         ; bytes available
-
-    ; Log each well-formed request: opcode at +0, length (in 4-byte units)
-    ; at +2. For phase 1 we just print and discard; phase 2 wires this to
-    ; a real dispatch table.
-    xor ecx, ecx
-.hc_walk:
-    cmp rcx, rbx
-    jge .hc_req_loop
-    mov rax, rbx
-    sub rax, rcx
-    cmp rax, 4
-    jl .hc_req_loop
-    movzx eax, byte [req_buf + rcx]      ; opcode
-    push rcx
-    mov rdi, rax
-    movzx eax, word [req_buf + rcx + 2]  ; length in 4-byte units
-    mov rsi, rax
-    call log_request
-    pop rcx
-    movzx eax, word [req_buf + rcx + 2]
-    shl eax, 2                           ; bytes
-    test eax, eax
-    jnz .hc_advance
-    mov eax, 4                           ; defensive: never advance 0
-.hc_advance:
-    add rcx, rax
-    jmp .hc_walk
-
-.hc_setup_bad:
-    mov rsi, log_setup_bad
-    mov rdx, log_setup_bad_len
-    call write_stderr
-.hc_done:
-    pop rbx
-    ret
-
-; ============================================================================
-; emit_setup_reply — write the success setup reply to client_fd. Body is
+; emit_setup_reply — rdi = target fd. Body is
 ; assembled in req_buf; only one screen, depths 24 and 32, one visual per
 ; depth, one pixmap format (depth-24-in-32-bpp).
 ; ============================================================================
 emit_setup_reply:
+    ; rdi = target fd. (Was client_fd-based when there was only one
+    ; client; the multi-client serve loop passes whichever slot's fd.)
     push rbx
     push r12
+    push r13
+    mov r13, rdi                         ; preserve target fd across helpers
     lea rdi, [req_buf]
     mov rbx, rdi                         ; rbx = base
 
@@ -856,7 +867,7 @@ emit_setup_reply:
     sub rdx, rbx
     push rdx
     mov rax, SYS_WRITE
-    mov rdi, [client_fd]
+    mov rdi, r13                         ; target fd from caller
     mov rsi, rbx
     syscall
     pop rdx
@@ -882,6 +893,7 @@ emit_setup_reply:
     mov rdx, log_setup_ok_2_len
     call write_stderr
 
+    pop r13
     pop r12
     pop rbx
     ret
@@ -2252,3 +2264,663 @@ write_i64_stderr:
 .wi_pos:
     jmp write_u64_stderr
 .wi_minus: db "-"
+
+; ============================================================================
+; ============================================================================
+; PHASE 4a — multi-client serve loop, dispatch table, atom interning.
+; ============================================================================
+; The single-client accept-then-drop model is replaced by a poll()-driven
+; serve loop with up to MAX_CLIENTS concurrent connections. Each client has:
+;   - a 16-byte metadata slot (fd, state, seq, buf_used)
+;   - an 8 KB per-client read buffer (handles partial requests)
+;
+; Phase 4a implements just enough of the wire protocol that a real client
+; (xdpyinfo, eventually tile/glass) can get past the setup-reply and into
+; its first round of "what atoms / extensions do you have" probing:
+;
+;   InternAtom       (opcode  16) — real implementation with a 68-entry
+;                                   predefined table + dynamic allocation
+;   QueryExtension   (opcode  98) — always "not present" (no extensions
+;                                   shipped yet)
+;
+; Every other opcode is logged ("req opcode=N len=M") and silently dropped
+; — same behaviour as phase 1, just per-client now. Subsequent phases
+; (4b window tree, 4c properties, 4d input, 4e SubstructureRedirect, 4f
+; compositor) fill in real implementations one opcode at a time.
+; ============================================================================
+
+; ----------------------------------------------------------------------------
+; init_clients — mark every slot empty (fd = -1).
+; ----------------------------------------------------------------------------
+init_clients:
+    push rbx
+    xor ebx, ebx
+.ic_loop:
+    cmp ebx, MAX_CLIENTS
+    jge .ic_done
+    mov rax, rbx
+    imul rax, CLIENT_META_SIZE
+    mov dword [clients_meta + rax], -1
+    inc ebx
+    jmp .ic_loop
+.ic_done:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; client_alloc — accept a new client. rdi = listen_fd's accept() result.
+; Finds the first empty slot, stores fd, initialises state. Returns slot
+; index in eax, or -1 if every slot is in use (caller closes the fd).
+; ----------------------------------------------------------------------------
+client_alloc:
+    push rbx
+    push r12
+    mov r12d, edi                            ; new fd
+    xor ebx, ebx
+.ca_loop:
+    cmp ebx, MAX_CLIENTS
+    jge .ca_full
+    mov rax, rbx
+    imul rax, CLIENT_META_SIZE
+    cmp dword [clients_meta + rax], -1
+    je .ca_take
+    inc ebx
+    jmp .ca_loop
+.ca_take:
+    ; slot at [clients_meta + rax]
+    mov [clients_meta + rax + 0], r12d       ; fd
+    mov byte [clients_meta + rax + 4], CSTATE_SETUP
+    mov dword [clients_meta + rax + 8], 0    ; seq (incremented on first reply)
+    mov dword [clients_meta + rax + 12], 0   ; buf_used
+    mov eax, ebx
+    pop r12
+    pop rbx
+    ret
+.ca_full:
+    mov eax, -1
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; client_close — close the fd, mark slot empty. edi = slot index.
+; ----------------------------------------------------------------------------
+client_close:
+    push rbx
+    mov ebx, edi
+    mov rax, rbx
+    imul rax, CLIENT_META_SIZE
+    mov edi, [clients_meta + rax]
+    push rax
+    mov rax, SYS_CLOSE
+    syscall
+    pop rax
+    mov dword [clients_meta + rax], -1
+    mov rsi, log_client_gone
+    mov rdx, log_client_gone_len
+    call write_stderr
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; Helpers: client_meta_addr(eax = slot) → rax = &clients_meta[slot]
+;          client_buf_addr (eax = slot) → rax = &clients_bufs[slot * BUF_SIZE]
+; Both leave the input register intact.
+; ----------------------------------------------------------------------------
+client_meta_addr:
+    mov rcx, rax
+    imul rcx, CLIENT_META_SIZE
+    lea rax, [clients_meta + rcx]
+    ret
+client_buf_addr:
+    mov rcx, rax
+    imul rcx, CLIENT_BUF_SIZE
+    lea rax, [clients_bufs + rcx]
+    ret
+
+; ----------------------------------------------------------------------------
+; init_atoms — walk predef_atom_stream, populating atom_off[] / atom_len[]
+; / atom_strings. Predefined atoms get IDs 1..68; atom_count is left
+; pointing at the next free ID (69). Atom 0 = None and is never used.
+; ----------------------------------------------------------------------------
+init_atoms:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov dword [atom_count], 1                ; reserve atom 0 = None
+    mov dword [atom_strings_used], 0
+    lea rbx, [predef_atom_stream]
+.ia_loop:
+    movzx eax, byte [rbx]
+    test eax, eax
+    jz .ia_done
+    mov r12d, eax                            ; name length
+    inc rbx                                  ; skip length byte
+
+    ; Allocate atom id = atom_count, then ++.
+    mov r13d, [atom_count]
+    inc dword [atom_count]
+    ; Record offset + length.
+    mov r14d, [atom_strings_used]
+    mov [atom_off + r13*4], r14d
+    mov [atom_len + r13*4], r12d
+    ; Copy r12 bytes from rbx to atom_strings + r14d.
+    lea rdi, [atom_strings + r14]
+    mov rsi, rbx
+    mov ecx, r12d
+    rep movsb
+    add [atom_strings_used], r12d
+    add rbx, r12                             ; advance past name
+    jmp .ia_loop
+.ia_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; atom_lookup — find an atom by name. rdi = name ptr, esi = name length.
+; Returns atom id in eax, or 0 if not found. Linear scan over atom_count;
+; for ~68 entries this is well under a microsecond.
+; ----------------------------------------------------------------------------
+atom_lookup:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi                             ; needle ptr
+    mov r13d, esi                            ; needle length
+    mov ebx, 1                               ; skip atom 0
+.al_loop:
+    cmp ebx, [atom_count]
+    jge .al_miss
+    cmp [atom_len + rbx*4], r13d
+    jne .al_next
+    mov eax, [atom_off + rbx*4]
+    lea r14, [atom_strings + rax]
+    mov r15, r12
+    mov ecx, r13d
+.al_cmp:
+    test ecx, ecx
+    jz .al_hit
+    mov al, [r14]
+    cmp al, [r15]
+    jne .al_next
+    inc r14
+    inc r15
+    dec ecx
+    jmp .al_cmp
+.al_hit:
+    mov eax, ebx
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.al_next:
+    inc ebx
+    jmp .al_loop
+.al_miss:
+    xor eax, eax
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; atom_create — register a new atom. rdi = name ptr, esi = name length.
+; Returns the new id in eax, or 0 on table exhaustion (table is sized
+; for typical full sessions; an exhausted table just refuses further
+; allocations rather than overflowing).
+; ----------------------------------------------------------------------------
+atom_create:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    mov r12d, esi
+    mov r13d, [atom_count]
+    cmp r13d, MAX_ATOMS
+    jge .ac_full
+    mov eax, [atom_strings_used]
+    add eax, r12d
+    cmp eax, ATOM_STRINGS_CAP
+    jg .ac_full
+    ; Stash offset + length, copy name.
+    mov eax, [atom_strings_used]
+    mov [atom_off + r13*4], eax
+    mov [atom_len + r13*4], r12d
+    lea rdi, [atom_strings + rax]
+    mov rsi, rbx
+    mov ecx, r12d
+    rep movsb
+    add [atom_strings_used], r12d
+    inc dword [atom_count]
+    mov eax, r13d
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.ac_full:
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; serve_loop — main multi-client event loop. Builds a pollfd array each
+; iteration (listen_fd + up to 16 client fds), polls with infinite
+; timeout, then accepts new connections / dispatches per-client reads.
+; ============================================================================
+serve_loop:
+    mov rsi, log_prefix
+    mov rdx, 7
+    call write_stderr
+    mov rsi, log_serve_ready
+    mov rdx, log_serve_ready_len
+    call write_stderr
+.sl_iter:
+    ; --- Build pollfd_buf. Always begins with listen_fd. Then each
+    ; live client slot gets a pollfd; empty slots are represented by
+    ; fd=-1 (poll ignores those, returning revents=0).
+    mov eax, [listen_fd]
+    mov [pollfd_buf], eax
+    mov word [pollfd_buf + 4], 1             ; POLLIN
+    mov word [pollfd_buf + 6], 0
+    xor ecx, ecx                             ; client slot index
+.sl_build:
+    cmp ecx, MAX_CLIENTS
+    jge .sl_poll
+    mov rax, rcx
+    imul rax, CLIENT_META_SIZE
+    mov edx, [clients_meta + rax]            ; fd (or -1)
+    mov rax, rcx
+    inc rax                                  ; pollfd index = client_slot + 1
+    shl rax, 3                               ; * 8 (pollfd size)
+    mov [pollfd_buf + rax], edx
+    mov word [pollfd_buf + rax + 4], 1       ; POLLIN
+    mov word [pollfd_buf + rax + 6], 0
+    inc ecx
+    jmp .sl_build
+.sl_poll:
+    mov rax, SYS_POLL
+    lea rdi, [pollfd_buf]
+    mov esi, MAX_CLIENTS + 1
+    mov edx, -1                              ; infinite timeout
+    syscall
+    test rax, rax
+    js .sl_iter                              ; -EINTR or similar — re-poll
+
+    ; --- Listen fd ready: accept all pending connections.
+    movzx eax, word [pollfd_buf + 6]
+    test eax, eax
+    jz .sl_clients
+    call do_accept
+    test rax, rax
+    js .sl_clients                           ; transient error — skip
+    mov edi, eax
+    push rdi
+    call client_alloc
+    pop rdi
+    cmp eax, -1
+    jne .sl_announce_ok
+    ; All slots full — refuse and close immediately.
+    push rdi
+    mov rsi, log_max_clients
+    mov rdx, log_max_clients_len
+    call write_stderr
+    pop rdi
+    mov rax, SYS_CLOSE
+    syscall
+    jmp .sl_clients
+.sl_announce_ok:
+    mov rsi, log_accepted
+    mov rdx, log_accepted_len
+    call write_stderr
+
+.sl_clients:
+    ; --- Walk client slots and process anyone whose revents has POLLIN.
+    xor ecx, ecx
+.sl_walk:
+    cmp ecx, MAX_CLIENTS
+    jge .sl_iter
+    push rcx
+    mov rax, rcx
+    inc rax
+    shl rax, 3
+    movzx edx, word [pollfd_buf + rax + 6]   ; revents
+    pop rcx
+    test edx, edx
+    jz .sl_walk_next
+    mov rax, rcx
+    imul rax, CLIENT_META_SIZE
+    cmp dword [clients_meta + rax], -1
+    je .sl_walk_next                         ; slot was closed mid-iter
+    push rcx
+    mov edi, ecx
+    call client_process
+    pop rcx
+.sl_walk_next:
+    inc ecx
+    jmp .sl_walk
+
+; ============================================================================
+; client_process — read everything available on this client and drain
+; the per-client buffer. edi = slot index. On read 0/error → close slot.
+; ============================================================================
+client_process:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov ebx, edi                             ; slot
+
+    ; meta_ptr in r12, fd in r13d
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+    mov r13d, [r12]
+    mov r14d, [r12 + 12]                     ; buf_used
+
+    ; If buffer is full, drop client (request too big / malformed).
+    cmp r14d, CLIENT_BUF_SIZE
+    jge .cp_close
+
+    ; Read into buf + buf_used.
+    mov eax, ebx
+    call client_buf_addr
+    add rax, r14
+    mov rax, SYS_READ
+    push rax                                  ; placeholder for syscall arg juggling
+    mov edi, r13d
+    mov eax, ebx
+    call client_buf_addr
+    lea rsi, [rax + r14]
+    pop rax
+    mov rax, SYS_READ
+    mov edi, r13d
+    mov edx, CLIENT_BUF_SIZE
+    sub edx, r14d                             ; space left
+    syscall
+    test rax, rax
+    jle .cp_close                             ; 0=EOF, <0=error
+    add r14d, eax
+    mov [r12 + 12], r14d
+
+.cp_drain:
+    ; --- State machine.
+    movzx eax, byte [r12 + 4]
+    cmp eax, CSTATE_SETUP
+    je .cp_setup
+    ; RUNNING.
+    cmp r14d, 4
+    jl .cp_done                              ; need at least the 4-byte header
+    mov eax, ebx
+    call client_buf_addr
+    movzx edx, word [rax + 2]                ; length in 4-byte units
+    shl edx, 2
+    test edx, edx
+    jnz .cp_have_len
+    mov edx, 4                               ; defensive (length 0 shouldn't happen)
+.cp_have_len:
+    cmp r14d, edx
+    jl .cp_done                              ; need more bytes for this request
+    push rdx
+    mov edi, ebx
+    mov esi, edx
+    call dispatch_request
+    pop rdx
+    ; Shift remaining buffer down by edx.
+    mov eax, ebx
+    call client_buf_addr
+    sub r14d, edx
+    mov rsi, rax
+    add rsi, rdx
+    mov rdi, rax
+    mov ecx, r14d
+    rep movsb
+    mov [r12 + 12], r14d
+    jmp .cp_drain
+
+.cp_setup:
+    ; Setup-request handling. Need at least 12 bytes, plus auth tail.
+    cmp r14d, 12
+    jl .cp_done
+    mov eax, ebx
+    call client_buf_addr
+    cmp byte [rax], 'l'
+    jne .cp_setup_bad
+    mov dx, [rax + 2]
+    cmp dx, X_PROTO_MAJOR
+    jne .cp_setup_bad
+    movzx edx, word [rax + 6]                ; auth name length
+    add edx, 3
+    and edx, ~3
+    movzx ecx, word [rax + 8]                ; auth data length
+    add ecx, 3
+    and ecx, ~3
+    add edx, ecx
+    add edx, 12                              ; total setup-request size
+    cmp r14d, edx
+    jl .cp_done                              ; need more bytes for auth tail
+    push rdx
+    mov edi, r13d
+    call emit_setup_reply
+    pop rdx
+    mov byte [r12 + 4], CSTATE_RUNNING
+    ; Shift buffer past the consumed setup bytes.
+    mov eax, ebx
+    call client_buf_addr
+    sub r14d, edx
+    mov rsi, rax
+    add rsi, rdx
+    mov rdi, rax
+    mov ecx, r14d
+    rep movsb
+    mov [r12 + 12], r14d
+    jmp .cp_drain
+
+.cp_setup_bad:
+    mov rsi, log_setup_bad
+    mov rdx, log_setup_bad_len
+    call write_stderr
+    jmp .cp_close
+
+.cp_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.cp_close:
+    mov edi, ebx
+    call client_close
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; dispatch_request — edi = slot, esi = request size in bytes. The request
+; lives at client_buf_addr(slot)[0..esi-1].
+;
+; Increments the per-client sequence number for every request (whether or
+; not it gets a reply; replies need the matching sequence so the client
+; can tie reply to request).
+; ============================================================================
+dispatch_request:
+    push rbx
+    push r12
+    push r13
+    mov ebx, edi                             ; slot
+    mov r13d, esi                            ; request size
+
+    ; Bump sequence.
+    mov eax, ebx
+    call client_meta_addr
+    inc dword [rax + 8]
+
+    mov eax, ebx
+    call client_buf_addr
+    mov r12, rax                             ; request ptr
+
+    movzx eax, byte [r12]                    ; opcode
+    movzx edx, word [r12 + 2]                ; length (4-byte units)
+
+    ; Log this request so the user can see what the client asked for.
+    push rax
+    push rdx
+    mov rdi, rax
+    mov rsi, rdx
+    call log_request
+    pop rdx
+    pop rax
+
+    cmp eax, 16
+    je .dr_intern_atom
+    cmp eax, 98
+    je .dr_query_extension
+    ; Unhandled — already logged.
+    jmp .dr_done
+
+.dr_intern_atom:
+    mov edi, ebx
+    call handle_intern_atom
+    jmp .dr_done
+
+.dr_query_extension:
+    mov edi, ebx
+    call handle_query_extension
+    jmp .dr_done
+
+.dr_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_intern_atom — edi = slot. The request body sits at the start of
+; the client's buffer:
+;   +0 opcode (16)        +1 only-if-exists (BOOL)
+;   +2 length (4u)        +4 n (CARD16 = name length)
+;   +6 pad (2)            +8 name (n bytes, padded to 4)
+;
+; Reply (32 bytes):
+;   +0 1 (Reply)          +1 0
+;   +2 sequence (u16)     +4 reply length (4u, = 0)
+;   +8 atom (u32)         +12..31 pad
+; ============================================================================
+handle_intern_atom:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax                             ; meta ptr
+    mov eax, ebx
+    call client_buf_addr
+    mov r13, rax                             ; request ptr
+    movzx r14d, word [r13 + 4]               ; n
+    lea r15, [r13 + 8]                       ; name ptr
+    movzx ecx, byte [r13 + 1]                ; only-if-exists
+
+    ; Look up first.
+    push rcx
+    mov rdi, r15
+    mov esi, r14d
+    call atom_lookup
+    pop rcx
+    test eax, eax
+    jnz .ha_have                             ; existing atom
+    ; Not found. If only-if-exists, return 0; else create.
+    test cl, cl
+    jnz .ha_emit
+    mov rdi, r15
+    mov esi, r14d
+    call atom_create
+.ha_have:
+.ha_emit:
+    push rax
+    ; Build reply.
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 0
+    mov ecx, [r12 + 8]                       ; seq (already incremented)
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 0                   ; reply length
+    pop rax
+    mov [rdi + 8], eax
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+
+    ; Write 32 bytes.
+    mov edi, [r12]                           ; fd
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_query_extension — edi = slot. Always replies "not present" since
+; no extensions have shipped yet.
+;
+; Reply (32 bytes):
+;   +0 1 (Reply)          +1 0
+;   +2 seq (u16)          +4 reply length 0
+;   +8 present (BOOL = 0) +9 major-opcode (0)
+;   +10 first-event (0)   +11 first-error (0)
+;   +12..31 pad
+; ============================================================================
+handle_query_extension:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 0
+    mov ecx, [r12 + 8]                       ; seq
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 0
+    mov dword [rdi + 8], 0                   ; present=0 + 3 zero bytes
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+
+    pop r12
+    pop rbx
+    ret
