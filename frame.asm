@@ -245,6 +245,28 @@ reply_buf:          resb 16384
 %define WINDOW_REC_SIZE  32
 windows:            resb MAX_WINDOWS * WINDOW_REC_SIZE
 
+; ---- Phase 4c property table ----------------------------------------------
+; properties[1024] — flat list of (window, atom) → value records. xid = 0
+; marks an empty slot. Value bytes live in a separate append-only pool
+; (property_values); each record references its value via (offset,
+; nbytes). ChangeProperty.Replace re-appends rather than re-using the
+; old slot — simpler, costs some pool space but pool is 256 KB.
+;
+; Layout (24 B):
+;   +0  xid (u32)          0 = empty
+;   +4  atom (u32)
+;   +8  type (u32)
+;   +12 format (u8)        8 / 16 / 32
+;   +13 pad (3)
+;   +16 nbytes (u32)       size of value in bytes
+;   +20 value_off (u32)    offset into property_values
+%define MAX_PROPERTIES        1024
+%define PROPERTY_REC_SIZE     24
+%define PROPERTY_VALUES_CAP   262144
+properties:         resb MAX_PROPERTIES * PROPERTY_REC_SIZE
+property_values:    resb PROPERTY_VALUES_CAP
+property_values_used: resd 1
+
 ; ---- ConfigureWindow / ChangeWindowAttributes value-mask bits -------------
 ; (numeric defines used by the handlers; not in BSS)
 
@@ -351,75 +373,82 @@ log_qext_pre_len   equ $ - log_qext_pre - 1
 ; stream: 1 length byte then that many name bytes per atom, terminated
 ; by a length byte of 0. init_atoms walks this once at startup and
 ; populates atom_off[] / atom_len[] / atom_strings.
+;
+; Length is computed by NASM (%strlen) — manual lengths are an easy
+; off-by-one trap (caught one in WM_CLIENT_MACHINE, which is 17 chars
+; not 16; the resulting mis-parse poisoned every atom after it).
+%macro ATM 1
+    db %strlen(%1), %1
+%endmacro
 predef_atom_stream:
-    db 7, "PRIMARY"
-    db 9, "SECONDARY"
-    db 3, "ARC"
-    db 4, "ATOM"
-    db 6, "BITMAP"
-    db 8, "CARDINAL"
-    db 8, "COLORMAP"
-    db 6, "CURSOR"
-    db 11, "CUT_BUFFER0"
-    db 11, "CUT_BUFFER1"
-    db 11, "CUT_BUFFER2"
-    db 11, "CUT_BUFFER3"
-    db 11, "CUT_BUFFER4"
-    db 11, "CUT_BUFFER5"
-    db 11, "CUT_BUFFER6"
-    db 11, "CUT_BUFFER7"
-    db 8, "DRAWABLE"
-    db 4, "FONT"
-    db 7, "INTEGER"
-    db 6, "PIXMAP"
-    db 5, "POINT"
-    db 9, "RECTANGLE"
-    db 16, "RESOURCE_MANAGER"
-    db 13, "RGB_COLOR_MAP"
-    db 12, "RGB_BEST_MAP"
-    db 12, "RGB_BLUE_MAP"
-    db 15, "RGB_DEFAULT_MAP"
-    db 12, "RGB_GRAY_MAP"
-    db 13, "RGB_GREEN_MAP"
-    db 11, "RGB_RED_MAP"
-    db 6, "STRING"
-    db 8, "VISUALID"
-    db 6, "WINDOW"
-    db 10, "WM_COMMAND"
-    db 8, "WM_HINTS"
-    db 16, "WM_CLIENT_MACHINE"
-    db 12, "WM_ICON_NAME"
-    db 12, "WM_ICON_SIZE"
-    db 7, "WM_NAME"
-    db 15, "WM_NORMAL_HINTS"
-    db 13, "WM_SIZE_HINTS"
-    db 13, "WM_ZOOM_HINTS"
-    db 9, "MIN_SPACE"
-    db 10, "NORM_SPACE"
-    db 9, "MAX_SPACE"
-    db 9, "END_SPACE"
-    db 13, "SUPERSCRIPT_X"
-    db 13, "SUPERSCRIPT_Y"
-    db 11, "SUBSCRIPT_X"
-    db 11, "SUBSCRIPT_Y"
-    db 18, "UNDERLINE_POSITION"
-    db 19, "UNDERLINE_THICKNESS"
-    db 16, "STRIKEOUT_ASCENT"
-    db 17, "STRIKEOUT_DESCENT"
-    db 12, "ITALIC_ANGLE"
-    db 8, "X_HEIGHT"
-    db 10, "QUAD_WIDTH"
-    db 6, "WEIGHT"
-    db 10, "POINT_SIZE"
-    db 10, "RESOLUTION"
-    db 9, "COPYRIGHT"
-    db 6, "NOTICE"
-    db 9, "FONT_NAME"
-    db 11, "FAMILY_NAME"
-    db 9, "FULL_NAME"
-    db 10, "CAP_HEIGHT"
-    db 8, "WM_CLASS"
-    db 16, "WM_TRANSIENT_FOR"
+    ATM "PRIMARY"
+    ATM "SECONDARY"
+    ATM "ARC"
+    ATM "ATOM"
+    ATM "BITMAP"
+    ATM "CARDINAL"
+    ATM "COLORMAP"
+    ATM "CURSOR"
+    ATM "CUT_BUFFER0"
+    ATM "CUT_BUFFER1"
+    ATM "CUT_BUFFER2"
+    ATM "CUT_BUFFER3"
+    ATM "CUT_BUFFER4"
+    ATM "CUT_BUFFER5"
+    ATM "CUT_BUFFER6"
+    ATM "CUT_BUFFER7"
+    ATM "DRAWABLE"
+    ATM "FONT"
+    ATM "INTEGER"
+    ATM "PIXMAP"
+    ATM "POINT"
+    ATM "RECTANGLE"
+    ATM "RESOURCE_MANAGER"
+    ATM "RGB_COLOR_MAP"
+    ATM "RGB_BEST_MAP"
+    ATM "RGB_BLUE_MAP"
+    ATM "RGB_DEFAULT_MAP"
+    ATM "RGB_GRAY_MAP"
+    ATM "RGB_GREEN_MAP"
+    ATM "RGB_RED_MAP"
+    ATM "STRING"
+    ATM "VISUALID"
+    ATM "WINDOW"
+    ATM "WM_COMMAND"
+    ATM "WM_HINTS"
+    ATM "WM_CLIENT_MACHINE"
+    ATM "WM_ICON_NAME"
+    ATM "WM_ICON_SIZE"
+    ATM "WM_NAME"
+    ATM "WM_NORMAL_HINTS"
+    ATM "WM_SIZE_HINTS"
+    ATM "WM_ZOOM_HINTS"
+    ATM "MIN_SPACE"
+    ATM "NORM_SPACE"
+    ATM "MAX_SPACE"
+    ATM "END_SPACE"
+    ATM "SUPERSCRIPT_X"
+    ATM "SUPERSCRIPT_Y"
+    ATM "SUBSCRIPT_X"
+    ATM "SUBSCRIPT_Y"
+    ATM "UNDERLINE_POSITION"
+    ATM "UNDERLINE_THICKNESS"
+    ATM "STRIKEOUT_ASCENT"
+    ATM "STRIKEOUT_DESCENT"
+    ATM "ITALIC_ANGLE"
+    ATM "X_HEIGHT"
+    ATM "QUAD_WIDTH"
+    ATM "WEIGHT"
+    ATM "POINT_SIZE"
+    ATM "RESOLUTION"
+    ATM "COPYRIGHT"
+    ATM "NOTICE"
+    ATM "FONT_NAME"
+    ATM "FAMILY_NAME"
+    ATM "FULL_NAME"
+    ATM "CAP_HEIGHT"
+    ATM "WM_CLASS"
+    ATM "WM_TRANSIENT_FOR"
     db 0                                     ; terminator
 
 ; ---- probe-mode strings ---------------------------------------------------
@@ -679,6 +708,7 @@ _start:
     call init_atoms
     call init_clients
     call init_windows
+    call init_properties
     jmp serve_loop
 
 .die_bind:
@@ -2869,8 +2899,16 @@ dispatch_request:
     je .dr_query_tree
     cmp eax, 16
     je .dr_intern_atom
+    cmp eax, 17
+    je .dr_get_atom_name
+    cmp eax, 18
+    je .dr_change_property
+    cmp eax, 19
+    je .dr_delete_property
     cmp eax, 20
     je .dr_get_property
+    cmp eax, 21
+    je .dr_list_properties
     cmp eax, 43
     je .dr_get_input_focus
     cmp eax, 55
@@ -2905,7 +2943,32 @@ dispatch_request:
 
 .dr_get_property:
     mov edi, ebx
+    mov rsi, r12
     call handle_get_property
+    jmp .dr_done
+
+.dr_change_property:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_change_property
+    jmp .dr_done
+
+.dr_get_atom_name:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_get_atom_name
+    jmp .dr_done
+
+.dr_delete_property:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_delete_property
+    jmp .dr_done
+
+.dr_list_properties:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_list_properties
     jmp .dr_done
 
 .dr_create_gc:
@@ -3151,45 +3214,131 @@ handle_query_extension:
     ret
 
 ; ============================================================================
-; handle_get_property — edi = slot. Phase 4a stand-in: every property is
-; reported as "doesn't exist" (format=0, type=None, length=0). Real
-; property storage lands in phase 4c (window tree + properties).
+; handle_get_property — edi = slot, rsi = request ptr. Looks up the
+; (window, property) pair in the property table; returns the full value
+; (long-offset / long-length ignored for now — every GetProperty either
+; "succeeds with the entire stored value" or "doesn't exist"). Common
+; case for WM/client property reads.
 ;
-; Reply (32 bytes):
-;   +0 1 (Reply)          +1 format (0 = doesn't exist)
-;   +2 seq (u16)          +4 reply length (4u, = 0)
-;   +8 type (ATOM, 0 = None)
-;   +12 bytes-after (u32)
-;   +16 value length (u32)
+; Request:
+;   +0 opcode (20)        +1 delete (BOOL)
+;   +2 length             +4 window
+;   +8 property (atom)    +12 type
+;   +16 long-offset       +20 long-length
+;
+; Reply (32 + nbytes + pad):
+;   +0 1                  +1 format
+;   +2 seq                +4 reply length = ceil(nbytes / 4)
+;   +8 type               +12 bytes-after (0)
+;   +16 length-of-value (in format-units)
 ;   +20..31 pad
+;   +32..32+n value
+;   +32+n.. pad to 4-byte boundary
 ; ============================================================================
 handle_get_property:
     push rbx
     push r12
+    push r13
+    push r14
     mov ebx, edi
+    mov r14, rsi                             ; req ptr
     mov eax, ebx
     call client_meta_addr
     mov r12, rax
 
+    mov edi, [r14 + 4]                       ; window
+    mov esi, [r14 + 8]                       ; property atom
+    call property_find
+    test rax, rax
+    jz .gp_none
+    mov r13, rax                             ; record ptr
+
+    ; ---- found: emit value reply ----
+    movzx r9d, byte [r13 + 12]               ; format (8/16/32)
+    mov r8d, [r13 + 16]                      ; nbytes
+    mov ecx, r8d
+    add ecx, 3
+    shr ecx, 2                               ; reply length in 4u
     lea rdi, [reply_buf]
     mov byte [rdi + 0], 1
-    mov byte [rdi + 1], 0                    ; format = 0
-    mov ecx, [r12 + 8]                       ; seq
-    mov [rdi + 2], cx
-    mov dword [rdi + 4], 0
-    mov dword [rdi + 8], 0                   ; type = None
-    mov dword [rdi + 12], 0                  ; bytes-after
-    mov dword [rdi + 16], 0                  ; value length
+    mov [rdi + 1], r9b                       ; format
+    mov edx, [r12 + 8]
+    mov [rdi + 2], dx                        ; seq
+    mov [rdi + 4], ecx
+    mov eax, [r13 + 8]
+    mov [rdi + 8], eax                       ; type
+    mov dword [rdi + 12], 0                  ; bytes-after = 0
+    ; length in format-units
+    mov eax, r8d
+    cmp r9d, 16
+    je .gp_units16
+    cmp r9d, 32
+    je .gp_units32
+    jmp .gp_units_set
+.gp_units16:
+    shr eax, 1
+    jmp .gp_units_set
+.gp_units32:
+    shr eax, 2
+.gp_units_set:
+    mov [rdi + 16], eax
     mov dword [rdi + 20], 0
     mov dword [rdi + 24], 0
     mov dword [rdi + 28], 0
 
+    ; Copy the value into reply_buf + 32.
+    mov eax, [r13 + 20]                      ; value offset in pool
+    lea rsi, [property_values + rax]
+    lea rdi, [reply_buf + 32]
+    mov ecx, r8d                             ; nbytes
+    rep movsb
+
+    ; Pad to 4-byte boundary.
+    mov ecx, r8d
+    add ecx, 3
+    and ecx, ~3
+    mov r10d, ecx                            ; padded body bytes
+    sub ecx, r8d
+    xor eax, eax
+    rep stosb
+
+    ; Write header + padded body.
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov edx, r10d
+    add edx, 32
+    syscall
+
+    ; Delete-on-read?
+    cmp byte [r14 + 1], 0
+    je .gp_done
+    mov dword [r13], 0                       ; xid = 0 → empty
+    jmp .gp_done
+
+.gp_none:
+    ; Not found — 32-byte "doesn't exist" reply.
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 0                    ; format = 0
+    mov edx, [r12 + 8]
+    mov [rdi + 2], dx
+    mov dword [rdi + 4], 0
+    mov dword [rdi + 8], 0                   ; type = None
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
     mov edi, [r12]
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
     syscall
 
+.gp_done:
+    pop r14
+    pop r13
     pop r12
     pop rbx
     ret
@@ -4360,6 +4509,436 @@ handle_configure_window:
     jz .cfgw_done
     add r14, 4
 .cfgw_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; ============================================================================
+; PHASE 4c — property storage.
+; ============================================================================
+; Per-window properties keyed by (xid, atom). Records held in a flat
+; 1024-slot table; value bytes appended to a 256 KB pool. The pool is
+; append-only: ChangeProperty.Replace allocates new pool space and
+; leaks the old. A full session of tile + glass + firefox usually
+; settles below 100 KB of property storage; if a long-running session
+; ever fills the pool, ChangeProperty silently drops new sets (real
+; X servers would generate BadAlloc; we'll add error events later).
+; ============================================================================
+
+; ----------------------------------------------------------------------------
+; init_properties — zero the table + reset pool watermark.
+; ----------------------------------------------------------------------------
+init_properties:
+    push rbx
+    lea rdi, [properties]
+    xor eax, eax
+    mov ecx, MAX_PROPERTIES * PROPERTY_REC_SIZE
+    rep stosb
+    mov dword [property_values_used], 0
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; property_find — edi = window, esi = atom. Returns ptr to record or 0.
+; ----------------------------------------------------------------------------
+property_find:
+    push rbx
+    xor ebx, ebx
+.pf_loop:
+    cmp ebx, MAX_PROPERTIES
+    jge .pf_miss
+    mov rax, rbx
+    imul rax, PROPERTY_REC_SIZE
+    lea rax, [properties + rax]
+    cmp [rax], edi
+    jne .pf_next
+    cmp [rax + 4], esi
+    je .pf_hit
+.pf_next:
+    inc ebx
+    jmp .pf_loop
+.pf_hit:
+    pop rbx
+    ret
+.pf_miss:
+    xor eax, eax
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; property_alloc — edi = window, esi = atom. Either returns the existing
+; record (so callers can update in place) or finds an empty slot, marks
+; it with (window, atom), and returns it. 0 if table is full.
+; ----------------------------------------------------------------------------
+property_alloc:
+    push rbx
+    push r12
+    push r13
+    mov r12d, edi
+    mov r13d, esi
+    mov edi, r12d
+    mov esi, r13d
+    call property_find
+    test rax, rax
+    jnz .pa_done
+    xor ebx, ebx
+.pa_loop:
+    cmp ebx, MAX_PROPERTIES
+    jge .pa_full
+    mov rax, rbx
+    imul rax, PROPERTY_REC_SIZE
+    lea rax, [properties + rax]
+    cmp dword [rax], 0
+    je .pa_take
+    inc ebx
+    jmp .pa_loop
+.pa_take:
+    mov [rax], r12d
+    mov [rax + 4], r13d
+.pa_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.pa_full:
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; property_value_alloc — edi = nbytes. Allocates from the value pool;
+; returns offset in eax (>=0), or -1 if out of space.
+; ----------------------------------------------------------------------------
+property_value_alloc:
+    mov eax, [property_values_used]
+    mov ecx, eax
+    add ecx, edi
+    cmp ecx, PROPERTY_VALUES_CAP
+    ja .pva_full
+    mov [property_values_used], ecx
+    ret
+.pva_full:
+    mov eax, -1
+    ret
+
+; ============================================================================
+; handle_change_property — edi = slot, rsi = request ptr.
+;
+; Request:
+;   +0 opcode (18)        +1 mode (0=Replace 1=Prepend 2=Append)
+;   +2 length             +4 window
+;   +8 property (atom)    +12 type (atom)
+;   +16 format (8/16/32)  +17 pad (3)
+;   +20 length-of-data (in format-units)
+;   +24 data
+;
+; nbytes = length-of-data * (format / 8).
+;
+; No reply.
+; ============================================================================
+handle_change_property:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov ebx, edi
+    mov r12, rsi                             ; req ptr
+
+    ; nbytes = data_units × format/8
+    movzx eax, byte [r12 + 16]               ; format
+    mov ecx, [r12 + 20]                      ; data units
+    cmp eax, 16
+    je .cp_n16
+    cmp eax, 32
+    je .cp_n32
+    ; format 8 → 1 byte/unit
+    jmp .cp_n_set
+.cp_n16:
+    shl ecx, 1
+    jmp .cp_n_set
+.cp_n32:
+    shl ecx, 2
+.cp_n_set:
+    mov r13d, ecx                            ; nbytes for new data
+
+    ; Allocate / fetch record.
+    mov edi, [r12 + 4]                       ; window
+    mov esi, [r12 + 8]                       ; atom
+    call property_alloc
+    test rax, rax
+    jz .cp_done
+    mov r14, rax                             ; record ptr
+
+    movzx eax, byte [r12 + 1]                ; mode
+    test eax, eax
+    je .cp_replace
+    ; Prepend (1) or Append (2): combined length = old + new.
+    mov edx, [r14 + 16]                      ; old nbytes
+    mov edi, edx
+    add edi, r13d                            ; total
+    push rax                                  ; mode
+    call property_value_alloc
+    pop rcx                                   ; mode
+    cmp eax, -1
+    je .cp_done
+    mov r15d, eax                            ; new value offset
+    ; Compose at property_values + r15.
+    lea rdi, [property_values + r15]
+    cmp ecx, 1
+    je .cp_prepend
+    ; Append: old then new
+    mov esi, [r14 + 20]                      ; old offset
+    lea rsi, [property_values + rsi]
+    mov ecx, [r14 + 16]                      ; old nbytes
+    rep movsb
+    lea rsi, [r12 + 24]                      ; new data ptr
+    mov ecx, r13d
+    rep movsb
+    jmp .cp_finalise_combined
+.cp_prepend:
+    lea rsi, [r12 + 24]                      ; new data first
+    mov ecx, r13d
+    rep movsb
+    mov esi, [r14 + 20]
+    lea rsi, [property_values + rsi]
+    mov ecx, [r14 + 16]
+    rep movsb
+.cp_finalise_combined:
+    mov ecx, [r14 + 16]
+    add ecx, r13d
+    mov [r14 + 16], ecx                      ; nbytes
+    mov [r14 + 20], r15d                     ; value_off
+    mov ecx, [r12 + 12]
+    mov [r14 + 8], ecx                       ; type
+    movzx ecx, byte [r12 + 16]
+    mov [r14 + 12], cl                       ; format
+    jmp .cp_done
+
+.cp_replace:
+    ; Allocate pool space and copy the new data.
+    mov edi, r13d
+    call property_value_alloc
+    cmp eax, -1
+    je .cp_done
+    mov r15d, eax                            ; offset
+    lea rdi, [property_values + r15]
+    lea rsi, [r12 + 24]
+    mov ecx, r13d
+    rep movsb
+    mov [r14 + 16], r13d                     ; nbytes
+    mov [r14 + 20], r15d                     ; value_off
+    mov ecx, [r12 + 12]
+    mov [r14 + 8], ecx                       ; type
+    movzx ecx, byte [r12 + 16]
+    mov [r14 + 12], cl                       ; format
+
+.cp_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_delete_property — edi = slot, rsi = request ptr.
+;
+; Request: +4 window, +8 property
+;
+; No reply.
+; ============================================================================
+handle_delete_property:
+    push rbx
+    mov edi, [rsi + 4]                       ; window
+    mov ebx, [rsi + 8]                       ; atom
+    mov esi, ebx
+    call property_find
+    test rax, rax
+    jz .dp_done
+    mov dword [rax], 0                       ; mark empty
+.dp_done:
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_get_atom_name — edi = slot, rsi = request ptr. Reverse-lookup
+; from atom ID to name string. Returns the name string from the table
+; we built in init_atoms (predefined atoms 1..68) plus any IDs added
+; later by InternAtom.
+;
+; Request: +4 atom (CARD32)
+;
+; Reply (32 + name-bytes + pad):
+;   +0 1                  +1 0
+;   +2 seq                +4 reply length = ceil(name_len / 4)
+;   +8 name length u16    +10 pad (22)
+;   +32..32+n name        +32+n.. pad to 4
+; ============================================================================
+handle_get_atom_name:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov ebx, edi
+    mov r14, rsi
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+
+    mov r13d, [r14 + 4]                      ; atom id
+    ; Bounds check.
+    cmp r13d, [atom_count]
+    jae .gan_zero
+    test r13d, r13d
+    jz .gan_zero
+    mov ecx, [atom_off + r13*4]              ; string offset
+    mov edx, [atom_len + r13*4]              ; string length
+
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 0
+    mov eax, [r12 + 8]
+    mov [rdi + 2], ax
+    mov eax, edx
+    add eax, 3
+    shr eax, 2
+    mov [rdi + 4], eax                       ; reply length
+    mov [rdi + 8], dx                        ; name length
+    mov word [rdi + 10], 0
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+
+    ; Copy name into reply_buf + 32.
+    lea rsi, [atom_strings + rcx]
+    lea rdi, [reply_buf + 32]
+    mov ecx, edx
+    rep movsb
+
+    ; Pad to 4.
+    mov ecx, edx
+    add ecx, 3
+    and ecx, ~3
+    mov r9d, ecx                             ; total body bytes (padded)
+    sub ecx, edx
+    xor eax, eax
+    rep stosb
+
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov edx, r9d
+    add edx, 32
+    syscall
+    jmp .gan_done
+
+.gan_zero:
+    ; Unknown atom id — return empty name. (Real X servers would emit
+    ; a BadAtom error; we permit-and-empty for now.)
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 0
+    mov eax, [r12 + 8]
+    mov [rdi + 2], ax
+    mov dword [rdi + 4], 0
+    mov word [rdi + 8], 0                    ; name length 0
+    mov word [rdi + 10], 0
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+
+.gan_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_list_properties — edi = slot, rsi = request ptr.
+;
+; Request: +4 window
+;
+; Reply (32 + 4N bytes):
+;   +0 1                  +1 0
+;   +2 seq                +4 reply length N
+;   +8 nAtoms u16         +10 pad (22)
+;   +32..32+4N atoms
+; ============================================================================
+handle_list_properties:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov ebx, edi
+    mov r14, rsi
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+
+    mov r13d, [r14 + 4]                      ; window xid
+    xor r15d, r15d                           ; count
+    lea rdi, [reply_buf + 32]
+    xor ecx, ecx
+.lp_walk:
+    cmp ecx, MAX_PROPERTIES
+    jge .lp_emit
+    mov rax, rcx
+    imul rax, PROPERTY_REC_SIZE
+    lea rdx, [properties + rax]
+    mov eax, [rdx]
+    test eax, eax
+    jz .lp_walk_next
+    cmp eax, r13d
+    jne .lp_walk_next
+    mov eax, [rdx + 4]
+    mov [rdi], eax
+    add rdi, 4
+    inc r15d
+.lp_walk_next:
+    inc ecx
+    jmp .lp_walk
+.lp_emit:
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 0
+    mov ecx, [r12 + 8]
+    mov [rdi + 2], cx
+    mov [rdi + 4], r15d                      ; reply length
+    mov [rdi + 8], r15w                      ; nAtoms
+    mov word [rdi + 10], 0
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, r15
+    shl rdx, 2
+    add rdx, 32
+    syscall
+
+    pop r15
     pop r14
     pop r13
     pop r12
