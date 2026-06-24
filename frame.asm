@@ -312,6 +312,18 @@ gcs:                resb MAX_GCS * GC_REC_SIZE
 %define PIXMAP_REC_SIZE  24
 pixmaps:            resb MAX_PIXMAPS * PIXMAP_REC_SIZE
 
+; ---- Phase 9 RENDER Picture table -----------------------------------------
+; A Picture wraps a drawable (window or pixmap) + a picture format for use
+; as a RENDER source/destination. We track just the mapping; drawing
+; resolves the drawable to its backing buffer.
+;   +0  pid (u32)          0 = empty
+;   +4  drawable (u32)
+;   +8  format (u32)
+;   +12 pad
+%define MAX_PICTURES     256
+%define PICTURE_REC_SIZE 16
+pictures:           resb MAX_PICTURES * PICTURE_REC_SIZE
+
 ; ---- Phase 4c property table ----------------------------------------------
 ; properties[1024] — flat list of (window, atom) → value records. xid = 0
 ; marks an empty slot. Value bytes live in a separate append-only pool
@@ -871,6 +883,7 @@ _start:
     call init_windows
     call init_gcs
     call init_pixmaps
+    call init_pictures
     call init_properties
     call init_keysyms
     call init_input
@@ -8406,7 +8419,28 @@ handle_render:
     je .hr_query_version
     cmp eax, 1
     je .hr_query_pict_formats
+    cmp eax, 4
+    je .hr_create_picture
+    cmp eax, 7
+    je .hr_free_picture
+    cmp eax, 26
+    je .hr_fill_rectangles
     ; Unhandled minor — leave it (logged by the generic request logger).
+    jmp .hr_done
+
+.hr_create_picture:
+    mov rdi, r12
+    call render_create_picture
+    jmp .hr_done
+
+.hr_free_picture:
+    mov rdi, r12
+    call render_free_picture
+    jmp .hr_done
+
+.hr_fill_rectangles:
+    mov rdi, r12
+    call render_fill_rectangles
     jmp .hr_done
 
 .hr_query_version:
@@ -8508,6 +8542,182 @@ handle_render:
     mov rdx, 160
     syscall
 .hr_done:
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; init_pictures — zero the Picture table.
+; ----------------------------------------------------------------------------
+init_pictures:
+    push rbx
+    lea rdi, [pictures]
+    xor eax, eax
+    mov ecx, MAX_PICTURES * PICTURE_REC_SIZE
+    rep stosb
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; picture_lookup — edi = pid. Returns record ptr in rax, or 0.
+; ----------------------------------------------------------------------------
+picture_lookup:
+    push rbx
+    xor ebx, ebx
+.pl_loop:
+    cmp ebx, MAX_PICTURES
+    jge .pl_miss
+    mov rax, rbx
+    imul rax, PICTURE_REC_SIZE
+    lea rax, [pictures + rax]
+    cmp [rax], edi
+    je .pl_hit
+    inc ebx
+    jmp .pl_loop
+.pl_hit:
+    pop rbx
+    ret
+.pl_miss:
+    xor eax, eax
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; render_create_picture — rdi = req ptr.
+;   +4 pid   +8 drawable   +12 format   +16 value-mask   +20 value-list
+; Records pid → (drawable, format). value-list ignored for now. No reply.
+; ----------------------------------------------------------------------------
+render_create_picture:
+    push rbx
+    push r12
+    mov r12, rdi
+    mov edi, [r12 + 4]                        ; pid
+    test edi, edi
+    jz .rcp_done
+    ; Find an empty slot (or reuse same pid).
+    call picture_lookup
+    test rax, rax
+    jnz .rcp_fill
+    xor ebx, ebx
+.rcp_find:
+    cmp ebx, MAX_PICTURES
+    jge .rcp_done
+    mov rax, rbx
+    imul rax, PICTURE_REC_SIZE
+    lea rax, [pictures + rax]
+    cmp dword [rax], 0
+    je .rcp_fill
+    inc ebx
+    jmp .rcp_find
+.rcp_fill:
+    mov ecx, [r12 + 4]
+    mov [rax + 0], ecx                        ; pid
+    mov ecx, [r12 + 8]
+    mov [rax + 4], ecx                        ; drawable
+    mov ecx, [r12 + 12]
+    mov [rax + 8], ecx                        ; format
+.rcp_done:
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; render_free_picture — rdi = req ptr (+4 picture). Clears the slot.
+; ----------------------------------------------------------------------------
+render_free_picture:
+    push rbx
+    mov edi, [rdi + 4]
+    call picture_lookup
+    test rax, rax
+    jz .rfp_done
+    mov dword [rax], 0
+.rfp_done:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; render_fill_rectangles — rdi = req ptr.
+;   +4 op   +8 dst(PICTURE)   +12 RENDERCOLOR(red,green,blue,alpha u16 each)
+;   +20 rects (x s16, y s16, w u16, h u16)
+; Fills each rect into the dst Picture's drawable backing with the colour.
+; PictOp is treated as Src (overwrite) for now. No reply.
+;
+;   rbx = req ptr   r12 = backing ptr   r13d = stride   r14d = bufh
+;   r15d = ARGB pixel   rbp = rect cursor   [rsp]=remaining rects
+; ----------------------------------------------------------------------------
+render_fill_rectangles:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 16
+    mov rbx, rdi                              ; req ptr
+
+    ; Resolve dst Picture → drawable → backing.
+    mov edi, [rbx + 8]                        ; dst picture
+    call picture_lookup
+    test rax, rax
+    jz .rfr_done
+    mov edi, [rax + 4]                        ; drawable
+    mov [rsp + 8], edi                        ; stash drawable for recomposite test
+    call drawable_get_backing
+    test rax, rax
+    jz .rfr_done
+    mov r12, rax                              ; backing ptr
+    mov r13d, edx                             ; stride (width)
+    mov r14d, ecx                             ; bufh
+
+    ; Convert RENDERCOLOR (16-bit channels) → 8-bit ARGB.
+    movzx eax, byte [rbx + 13]                ; red   high byte (red @12, hi @13)
+    shl eax, 16
+    mov r15d, eax
+    movzx eax, byte [rbx + 15]                ; green high byte
+    shl eax, 8
+    or r15d, eax
+    movzx eax, byte [rbx + 17]                ; blue  high byte
+    or r15d, eax
+    movzx eax, byte [rbx + 19]                ; alpha high byte
+    shl eax, 24
+    or r15d, eax
+
+    ; rect count = (length*4 - 20) / 8
+    movzx eax, word [rbx + 2]                 ; request length (4-byte units)
+    shl eax, 2                                 ; bytes
+    sub eax, 20
+    jle .rfr_done
+    shr eax, 3
+    mov [rsp + 0], eax                         ; remaining rects
+    lea rbp, [rbx + 20]                        ; rect cursor
+.rfr_loop:
+    cmp dword [rsp + 0], 0
+    jle .rfr_recomp
+    mov rdi, r12
+    mov esi, r13d
+    mov edx, r14d
+    movsx eax, word [rbp + 0]                  ; x
+    movsx r8d, word [rbp + 2]                  ; y
+    movzx r9d, word [rbp + 4]                  ; w
+    movzx r10d, word [rbp + 6]                 ; h
+    mov r11d, r15d                             ; colour
+    call fb_fill
+    add rbp, 8
+    dec dword [rsp + 0]
+    jmp .rfr_loop
+.rfr_recomp:
+    ; If the dst drawable is a window, recomposite to show it.
+    mov edi, [rsp + 8]
+    call window_lookup
+    test rax, rax
+    jz .rfr_done
+    call recomposite_screen
+.rfr_done:
+    add rsp, 16
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
     pop r12
     pop rbx
     ret
