@@ -323,6 +323,32 @@ pixmaps:            resb MAX_PIXMAPS * PIXMAP_REC_SIZE
 %define MAX_PICTURES     256
 %define PICTURE_REC_SIZE 16
 pictures:           resb MAX_PICTURES * PICTURE_REC_SIZE
+; A Picture with drawable == PICTURE_SOLID is a CreateSolidFill source;
+; its ARGB colour is stored in the format field.
+%define PICTURE_SOLID    0xFFFFFFFF
+
+; ---- Phase 9 RENDER glyph storage -----------------------------------------
+; Glyph sets hold client-rasterised A8 coverage masks. CompositeGlyphs
+; blends a solid source through each glyph's mask onto a dst Picture.
+;   glyphsets[]: gsid (u32, 0=empty) + format (u32)
+;   glyph_recs[]: gsid@0, glyphid@4, width@8(u16), height@10(u16),
+;                 gx@12(s16), gy@14(s16), xoff@16(s16), yoff@18(s16),
+;                 bitmap_off@20(u32 into glyph_pool), stride@24(u16), pad
+%define MAX_GLYPHSETS    64
+%define GLYPHSET_REC     8
+glyphsets:          resb MAX_GLYPHSETS * GLYPHSET_REC
+%define MAX_GLYPHS       8192
+%define GLYPH_REC_SIZE   32
+glyph_recs:         resb MAX_GLYPHS * GLYPH_REC_SIZE
+glyph_count:        resd 1
+%define GLYPH_POOL_SIZE  8388608      ; 8 MB A8 bitmap pool (demand-paged)
+glyph_pool:         resb GLYPH_POOL_SIZE
+glyph_pool_used:    resd 1
+; CompositeGlyphs per-call context (constant across the glyph list).
+cg_dst_ptr:         resq 1
+cg_dst_stride:      resd 1
+cg_dst_h:           resd 1
+cg_src:             resd 1               ; 8-bit ARGB source colour
 
 ; ---- Phase 4c property table ----------------------------------------------
 ; properties[1024] — flat list of (window, atom) → value records. xid = 0
@@ -8425,6 +8451,20 @@ handle_render:
     je .hr_free_picture
     cmp eax, 26
     je .hr_fill_rectangles
+    cmp eax, 17
+    je .hr_create_glyphset
+    cmp eax, 19
+    je .hr_free_glyphset
+    cmp eax, 20
+    je .hr_add_glyphs
+    cmp eax, 33
+    je .hr_create_solid_fill
+    cmp eax, 23
+    je .hr_composite_glyphs
+    cmp eax, 24
+    je .hr_composite_glyphs
+    cmp eax, 25
+    je .hr_composite_glyphs
     ; Unhandled minor — leave it (logged by the generic request logger).
     jmp .hr_done
 
@@ -8441,6 +8481,31 @@ handle_render:
 .hr_fill_rectangles:
     mov rdi, r12
     call render_fill_rectangles
+    jmp .hr_done
+
+.hr_create_glyphset:
+    mov rdi, r12
+    call render_create_glyphset
+    jmp .hr_done
+
+.hr_free_glyphset:
+    mov rdi, r12
+    call render_free_glyphset
+    jmp .hr_done
+
+.hr_add_glyphs:
+    mov rdi, r12
+    call render_add_glyphs
+    jmp .hr_done
+
+.hr_create_solid_fill:
+    mov rdi, r12
+    call render_create_solid_fill
+    jmp .hr_done
+
+.hr_composite_glyphs:
+    mov rdi, r12
+    call render_composite_glyphs
     jmp .hr_done
 
 .hr_query_version:
@@ -8713,6 +8778,536 @@ render_fill_rectangles:
     jz .rfr_done
     call recomposite_screen
 .rfr_done:
+    add rsp, 16
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; PHASE 9 — RENDER glyphs (text). CreateGlyphSet / AddGlyphs / CreateSolidFill
+; / CompositeGlyphs. Clients rasterise glyphs (freetype) and upload A8
+; coverage masks; we blend a solid source through each mask onto the dst.
+; ============================================================================
+
+; ----------------------------------------------------------------------------
+; render_create_glyphset — rdi = req ptr (+4 gsid, +8 format). No reply.
+; ----------------------------------------------------------------------------
+render_create_glyphset:
+    push rbx
+    mov ecx, [rdi + 4]                        ; gsid
+    test ecx, ecx
+    jz .cgs_done
+    mov edx, [rdi + 8]                        ; format
+    xor ebx, ebx
+.cgs_find:
+    cmp ebx, MAX_GLYPHSETS
+    jge .cgs_done
+    mov rax, rbx
+    imul rax, GLYPHSET_REC
+    lea rax, [glyphsets + rax]
+    cmp dword [rax], 0
+    je .cgs_take
+    inc ebx
+    jmp .cgs_find
+.cgs_take:
+    mov [rax + 0], ecx
+    mov [rax + 4], edx
+.cgs_done:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; render_free_glyphset — rdi = req ptr (+4 glyphset). Clears the set entry.
+; (Glyph bitmaps stay in the pool; acceptable for a session.)
+; ----------------------------------------------------------------------------
+render_free_glyphset:
+    push rbx
+    mov ecx, [rdi + 4]
+    xor ebx, ebx
+.fgs_find:
+    cmp ebx, MAX_GLYPHSETS
+    jge .fgs_done
+    mov rax, rbx
+    imul rax, GLYPHSET_REC
+    lea rax, [glyphsets + rax]
+    cmp [rax], ecx
+    je .fgs_clear
+    inc ebx
+    jmp .fgs_find
+.fgs_clear:
+    mov dword [rax], 0
+.fgs_done:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; render_add_glyphs — rdi = req ptr.
+;   +4 glyphset   +8 numGlyphs   +12 glyphids[n]   then GLYPHINFO[n]
+;   then concatenated A8 bitmaps (scanline padded to 4 bytes).
+; Stores each glyph (metrics + bitmap copied into glyph_pool). No reply.
+;
+;   rbx=glyphset  r12=ids cursor  r13=info cursor  r14=data cursor
+;   r15=remaining n  rbp=pool write ptr
+; ----------------------------------------------------------------------------
+render_add_glyphs:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov rbx, rdi                              ; req ptr (reuse below)
+    mov r15d, [rbx + 8]                        ; numGlyphs
+    test r15d, r15d
+    jz .ag_done
+    mov ecx, [rbx + 4]                         ; glyphset id (keep in ecx→stack)
+    push rcx                                   ; [rsp] = glyphset id
+    lea r12, [rbx + 12]                        ; ids cursor
+    mov eax, r15d
+    lea r13, [r12 + rax*4]                      ; info cursor = ids + n*4
+    mov eax, r15d
+    imul eax, 12
+    lea r14, [r13 + rax]                        ; data cursor = info + n*12
+.ag_loop:
+    test r15d, r15d
+    jz .ag_pop
+    ; capacity guards
+    mov eax, [glyph_count]
+    cmp eax, MAX_GLYPHS
+    jge .ag_pop
+    ; metrics
+    movzx r8d, word [r13 + 0]                  ; width
+    movzx r9d, word [r13 + 2]                  ; height
+    ; stride = (width + 3) & ~3
+    lea eax, [r8 + 3]
+    and eax, ~3
+    mov r10d, eax                              ; stride
+    ; size = stride * height
+    imul eax, r9d
+    mov r11d, eax                              ; bitmap size
+    ; pool capacity
+    mov ecx, [glyph_pool_used]
+    lea edx, [rcx + r11]
+    cmp edx, GLYPH_POOL_SIZE
+    ja .ag_pop                                  ; pool full → stop
+    ; --- write glyph record ---
+    mov eax, [glyph_count]
+    imul eax, GLYPH_REC_SIZE
+    lea rbp, [glyph_recs + rax]
+    mov edx, [rsp]                              ; glyphset id
+    mov [rbp + 0], edx
+    mov edx, [r12]                              ; glyphid
+    mov [rbp + 4], edx
+    mov [rbp + 8], r8w                          ; width
+    mov [rbp + 10], r9w                         ; height
+    mov ax, [r13 + 4]
+    mov [rbp + 12], ax                          ; gx
+    mov ax, [r13 + 6]
+    mov [rbp + 14], ax                          ; gy
+    mov ax, [r13 + 8]
+    mov [rbp + 16], ax                          ; xoff
+    mov ax, [r13 + 10]
+    mov [rbp + 18], ax                          ; yoff
+    mov eax, [glyph_pool_used]
+    mov [rbp + 20], eax                         ; bitmap_off
+    mov [rbp + 24], r10w                        ; stride
+    ; --- copy bitmap into pool ---
+    push rsi
+    push rdi
+    mov edi, [glyph_pool_used]
+    lea rdi, [glyph_pool + rdi]
+    mov rsi, r14
+    mov ecx, r11d
+    rep movsb
+    pop rdi
+    pop rsi
+    ; advance pool + counters
+    add [glyph_pool_used], r11d
+    inc dword [glyph_count]
+    add r14, r11                                ; data cursor += size
+    add r12, 4                                  ; next glyphid
+    add r13, 12                                 ; next GLYPHINFO
+    dec r15d
+    jmp .ag_loop
+.ag_pop:
+    add rsp, 8                                  ; drop glyphset id
+.ag_done:
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; render_create_solid_fill — rdi = req ptr.
+;   +4 pid   +8 RENDERCOLOR (red,green,blue,alpha u16)
+; Records a solid-source Picture (drawable = PICTURE_SOLID, colour in
+; the format field). No reply.
+; ----------------------------------------------------------------------------
+render_create_solid_fill:
+    push rbx
+    push r12
+    mov r12, rdi
+    mov edi, [r12 + 4]                          ; pid
+    test edi, edi
+    jz .csf_done
+    call picture_lookup
+    test rax, rax
+    jnz .csf_fill
+    xor ebx, ebx
+.csf_find:
+    cmp ebx, MAX_PICTURES
+    jge .csf_done
+    mov rax, rbx
+    imul rax, PICTURE_REC_SIZE
+    lea rax, [pictures + rax]
+    cmp dword [rax], 0
+    je .csf_fill
+    inc ebx
+    jmp .csf_find
+.csf_fill:
+    mov ecx, [r12 + 4]
+    mov [rax + 0], ecx                          ; pid
+    mov dword [rax + 4], PICTURE_SOLID          ; drawable = solid sentinel
+    ; colour → 8-bit ARGB in format field
+    movzx ecx, byte [r12 + 15]                  ; alpha hi
+    shl ecx, 24
+    movzx edx, byte [r12 + 9]                   ; red hi
+    shl edx, 16
+    or ecx, edx
+    movzx edx, byte [r12 + 11]                  ; green hi
+    shl edx, 8
+    or ecx, edx
+    movzx edx, byte [r12 + 13]                  ; blue hi
+    or ecx, edx
+    mov [rax + 8], ecx                          ; format field = ARGB colour
+.csf_done:
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; glyph_find — edi = gsid, esi = glyphid. Returns rec ptr in rax, or 0.
+; ----------------------------------------------------------------------------
+glyph_find:
+    push rbx
+    xor ebx, ebx
+.gf_loop:
+    cmp ebx, [glyph_count]
+    jge .gf_miss
+    mov rax, rbx
+    imul rax, GLYPH_REC_SIZE
+    lea rax, [glyph_recs + rax]
+    cmp [rax + 0], edi
+    jne .gf_next
+    cmp [rax + 4], esi
+    je .gf_hit
+.gf_next:
+    inc ebx
+    jmp .gf_loop
+.gf_hit:
+    pop rbx
+    ret
+.gf_miss:
+    xor eax, eax
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; glyph_blend — composite one glyph's A8 mask through cg_src onto cg_dst.
+;   ecx = dst_x (s32, bitmap top-left)   r8d = dst_y (s32)   r9 = glyph rec
+; Over operator: dst = src*a + dst*(1-a), a = coverage*srcAlpha/255.
+; Division by 255 via (v*257+257)>>16.
+;   rbx=bitmap ptr  r10d=width  r11d=height  r12d=stride
+;   r13d=dst_x  r14d=dst_y  r15=row index
+; ----------------------------------------------------------------------------
+glyph_blend:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov r13d, ecx                              ; dst_x
+    mov r14d, r8d                              ; dst_y
+    movzx r10d, word [r9 + 8]                  ; width
+    movzx r11d, word [r9 + 10]                 ; height
+    movzx r12d, word [r9 + 24]                 ; stride
+    mov eax, [r9 + 20]                         ; bitmap_off
+    lea rbx, [glyph_pool + rax]                ; bitmap ptr
+    xor r15d, r15d                             ; row = 0
+.gb_row:
+    cmp r15d, r11d
+    jge .gb_done
+    mov eax, r14d
+    add eax, r15d                              ; dy
+    js .gb_row_next
+    cmp eax, [cg_dst_h]
+    jge .gb_done
+    ; col loop
+    push r15
+    xor ebp, ebp                               ; col = 0
+.gb_col:
+    cmp ebp, r10d
+    jge .gb_col_done
+    mov eax, r13d
+    add eax, ebp                               ; dx
+    js .gb_col_next
+    cmp eax, [cg_dst_stride]
+    jge .gb_col_next
+    ; coverage = bitmap[row*stride + col]
+    mov ecx, r15d
+    imul ecx, r12d
+    add ecx, ebp
+    movzx ecx, byte [rbx + rcx]                ; cov
+    test ecx, ecx
+    jz .gb_col_next
+    ; dst pixel addr = cg_dst_ptr + (dy*stride + dx)*4
+    mov edx, r14d
+    add edx, r15d                              ; dy
+    imul edx, [cg_dst_stride]
+    add edx, eax                               ; + dx
+    mov rdi, [cg_dst_ptr]
+    lea rdi, [rdi + rdx*4]                      ; dst pixel ptr
+    ; a = cov * srcAlpha / 255
+    mov eax, [cg_src]
+    shr eax, 24
+    and eax, 0xff                              ; src alpha
+    imul eax, ecx                               ; cov * sa
+    imul eax, 257
+    add eax, 257
+    shr eax, 16                                 ; a = (cov*sa)/255
+    mov r8d, eax                                ; a (0..255)
+    mov r9d, 255
+    sub r9d, eax                                ; 255 - a
+    mov edx, [rdi]                               ; dst pixel
+    ; blue
+    mov eax, [cg_src]
+    and eax, 0xff
+    imul eax, r8d
+    mov ecx, edx
+    and ecx, 0xff
+    imul ecx, r9d
+    add eax, ecx
+    imul eax, 257
+    add eax, 257
+    shr eax, 16                                 ; nb
+    mov ecx, eax                                ; ecx accumulates result, blue
+    ; green
+    mov eax, [cg_src]
+    shr eax, 8
+    and eax, 0xff
+    imul eax, r8d
+    mov esi, edx
+    shr esi, 8
+    and esi, 0xff
+    imul esi, r9d
+    add eax, esi
+    imul eax, 257
+    add eax, 257
+    shr eax, 16                                 ; ng
+    shl eax, 8
+    or ecx, eax
+    ; red
+    mov eax, [cg_src]
+    shr eax, 16
+    and eax, 0xff
+    imul eax, r8d
+    mov esi, edx
+    shr esi, 16
+    and esi, 0xff
+    imul esi, r9d
+    add eax, esi
+    imul eax, 257
+    add eax, 257
+    shr eax, 16                                 ; nr
+    shl eax, 16
+    or ecx, eax
+    or ecx, 0xFF000000                          ; opaque dst
+    mov [rdi], ecx
+.gb_col_next:
+    inc ebp
+    jmp .gb_col
+.gb_col_done:
+    pop r15
+.gb_row_next:
+    inc r15d
+    jmp .gb_row
+.gb_done:
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; render_composite_glyphs — rdi = req ptr (minor 23/24/25 = id size 1/2/4).
+;   +1 minor  +4 op  +8 src  +12 dst  +16 maskFormat  +20 glyphset
+;   +24 xSrc  +26 ySrc   +28 GLYPHLIST
+; Blends a solid source through each glyph mask onto the dst Picture.
+;
+;   rbx=req ptr  r12=glyphlist cursor  r13=req end  r14d=pen_x  r15d=pen_y
+;   rbp=current glyphset id  [rsp+0]=glyph id size (1/2/4)
+; ----------------------------------------------------------------------------
+render_composite_glyphs:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 16
+    mov rbx, rdi
+
+    ; glyph id size from minor opcode
+    movzx eax, byte [rbx + 1]
+    mov ecx, 1                                  ; minor 23 → 1
+    cmp eax, 24
+    je .cog_sz2
+    cmp eax, 25
+    je .cog_sz4
+    jmp .cog_szdone
+.cog_sz2:
+    mov ecx, 2
+    jmp .cog_szdone
+.cog_sz4:
+    mov ecx, 4
+.cog_szdone:
+    mov [rsp + 0], ecx                          ; id size
+
+    ; --- resolve src colour into cg_src ---
+    mov dword [cg_src], 0xFFFFFFFF              ; default white opaque
+    mov edi, [rbx + 8]                          ; src picture
+    call picture_lookup
+    test rax, rax
+    jz .cog_have_src
+    cmp dword [rax + 4], PICTURE_SOLID
+    jne .cog_src_drawable
+    mov ecx, [rax + 8]                          ; solid colour
+    mov [cg_src], ecx
+    jmp .cog_have_src
+.cog_src_drawable:
+    ; Non-solid src: sample its drawable's top-left pixel as the colour.
+    mov edi, [rax + 4]
+    call drawable_get_backing
+    test rax, rax
+    jz .cog_have_src
+    mov ecx, [rax]                              ; top-left pixel
+    mov [cg_src], ecx
+.cog_have_src:
+
+    ; --- resolve dst → backing into cg_dst_* ---
+    mov edi, [rbx + 12]                         ; dst picture
+    call picture_lookup
+    test rax, rax
+    jz .cog_done
+    mov edi, [rax + 4]                          ; dst drawable
+    mov [rsp + 8], edi                          ; stash for recomposite test
+    call drawable_get_backing
+    test rax, rax
+    jz .cog_done
+    mov [cg_dst_ptr], rax
+    mov [cg_dst_stride], edx
+    mov [cg_dst_h], ecx
+
+    ; current glyphset, pen, cursor, end
+    mov ebp, [rbx + 20]                         ; glyphset
+    xor r14d, r14d                              ; pen_x
+    xor r15d, r15d                              ; pen_y
+    lea r12, [rbx + 28]                         ; glyphlist cursor
+    movzx eax, word [rbx + 2]                   ; request length (units)
+    shl eax, 2
+    lea r13, [rbx + rax]                        ; request end
+
+.cog_elt:
+    ; need at least 8 bytes for an element header
+    lea rax, [r12 + 8]
+    cmp rax, r13
+    ja .cog_finish
+    movzx eax, byte [r12]                       ; count
+    cmp eax, 255
+    je .cog_switch
+    ; element: pad(3) @ r12+1, deltax @ r12+4 (s16), deltay @ r12+6 (s16)
+    movsx ecx, word [r12 + 4]
+    add r14d, ecx                               ; pen_x += deltax
+    movsx ecx, word [r12 + 6]
+    add r15d, ecx                               ; pen_y += deltay
+    mov edx, eax                                ; count
+    add r12, 8                                   ; advance past header
+    ; draw `count` glyphs
+.cog_glyph:
+    test edx, edx
+    jz .cog_glyph_done
+    push rdx                                     ; save count (caller-saved)
+    mov ecx, [rsp + 8]                           ; id size (1/2/4); [rsp+8] after push
+    cmp ecx, 1
+    je .cog_id1
+    cmp ecx, 2
+    je .cog_id2
+    mov edi, [r12]                               ; 4-byte id
+    jmp .cog_idgot
+.cog_id1:
+    movzx edi, byte [r12]
+    jmp .cog_idgot
+.cog_id2:
+    movzx edi, word [r12]
+.cog_idgot:
+    add r12, rcx                                 ; advance cursor by id size (32-bit clean)
+    mov esi, edi                                 ; glyphid
+    mov edi, ebp                                 ; gsid
+    call glyph_find
+    test rax, rax
+    jz .cog_glyph_after
+    mov r9, rax                                  ; glyph rec
+    movsx ecx, word [r9 + 12]                    ; gx
+    mov edi, r14d
+    sub edi, ecx                                  ; dst_x = pen_x - gx
+    movsx ecx, word [r9 + 14]                     ; gy
+    mov r8d, r15d
+    sub r8d, ecx                                  ; dst_y = pen_y - gy
+    ; advance pen BEFORE glyph_blend (it clobbers r9/eax/ecx; r14/r15 are
+    ; preserved by glyph_blend's push list).
+    movsx eax, word [r9 + 16]
+    add r14d, eax                                 ; pen_x += xoff
+    movsx eax, word [r9 + 18]
+    add r15d, eax                                 ; pen_y += yoff
+    mov ecx, edi                                  ; glyph_blend arg: dst_x
+    call glyph_blend                              ; ecx=dst_x, r8d=dst_y, r9=rec
+.cog_glyph_after:
+    pop rdx
+    dec edx
+    jmp .cog_glyph
+.cog_glyph_done:
+    ; pad cursor to 4-byte boundary relative to request start
+    mov rax, r12
+    sub rax, rbx
+    and eax, 3
+    jz .cog_elt
+    mov ecx, 4
+    sub ecx, eax
+    add r12, rcx
+    jmp .cog_elt
+.cog_switch:
+    ; count==255: next 4 bytes (after pad) are a new glyphset id
+    mov ebp, [r12 + 4]
+    add r12, 8
+    jmp .cog_elt
+.cog_finish:
+    ; recomposite if dst drawable is a window
+    mov edi, [rsp + 8]
+    call window_lookup
+    test rax, rax
+    jz .cog_done
+    call recomposite_screen
+.cog_done:
     add rsp, 16
     pop rbp
     pop r15
