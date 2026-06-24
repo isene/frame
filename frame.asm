@@ -38,6 +38,7 @@ DEFAULT REL
 %define SIGINT          2
 %define SIGTERM         15
 %define SIGHUP          1
+%define SIGUSR1         10
 %define SA_RESTORER     0x04000000
 %define SYS_SOCKET      41
 %define SYS_BIND        49
@@ -554,6 +555,9 @@ str_render:         db "RENDER"
 dbg_ag_tag:         db 10, "AG: "
 dbg_ag_tag_len      equ $ - dbg_ag_tag
 dbg_sp:             db " "
+dbg_dump_tag:       db "DUMP xid/w/h/nonbg: "
+dbg_dump_tag_len    equ $ - dbg_dump_tag
+dump_path:          db "/tmp/frame_win.raw", 0
 log_atom_new:       db "  intern-atom new id=", 0
 log_atom_new_len   equ $ - log_atom_new - 1
 log_atom_known:     db "  intern-atom known id=", 0
@@ -927,6 +931,7 @@ _start:
     call init_pixmaps
     call init_pictures
     call init_properties
+    call install_dump_handler
     call init_keysyms
     call init_input
     cmp byte [compositor_requested], 0
@@ -7530,16 +7535,9 @@ handle_poly_fill_rectangle:
     push r14
     push r15
     push rbp
+    sub rsp, 16                              ; [rsp]=backing_w [rsp+8]=backing_h
     mov rbx, rsi                             ; req ptr
-    mov ebp, edx                             ; req bytes
-
-    mov edi, [rbx + 4]                        ; drawable
-    call window_lookup
-    test rax, rax
-    jz .pfr_done
-    mov r12, rax                             ; window record
-    cmp dword [r12], X_ROOT_WINDOW
-    je .pfr_done                             ; don't back the root
+    mov r12d, edx                            ; req bytes
 
     ; GC foreground.
     mov edi, [rbx + 8]
@@ -7548,28 +7546,29 @@ handle_poly_fill_rectangle:
     jz .pfr_done
     mov r15d, [rax + 4]                      ; foreground colour
 
-    ; Ensure backing.
-    mov rdi, r12
-    call window_ensure_backing
+    ; Resolve drawable backing — window OR pixmap (glass fills its
+    ; double-buffer pixmap with cells via PolyFillRectangle).
+    mov edi, [rbx + 4]
+    call drawable_get_backing
     test rax, rax
     jz .pfr_done
     mov r13, rax                             ; backing ptr
+    mov [rsp + 0], edx                       ; backing_w (stride)
+    mov [rsp + 8], ecx                       ; backing_h
 
     ; Iterate rectangles. Count = (req_bytes - 12) / 8.
     lea r14, [rbx + 12]                       ; rect cursor
-    mov eax, ebp
+    mov eax, r12d
     sub eax, 12
     jle .pfr_done
-    shr eax, 3                               ; rect count
-    mov ebp, eax                             ; reuse ebp = remaining rects
+    shr eax, 3
+    mov ebp, eax                             ; remaining rects
 .pfr_loop:
     test ebp, ebp
     jz .pfr_done
-    ; fb_fill into backing: buf=r13, bufw=backing_w, bufh=backing_h,
-    ; x,y,w,h from rect, colour=r15.
     mov rdi, r13
-    movzx esi, word [r12 + 40]               ; backing_w (stride)
-    movzx edx, word [r12 + 42]               ; backing_h
+    mov esi, [rsp + 0]                       ; backing_w (stride)
+    mov edx, [rsp + 8]                       ; backing_h
     movsx eax, word [r14 + 0]                ; rect x
     movsx r8d, word [r14 + 2]                ; rect y
     movzx r9d, word [r14 + 4]                ; rect w
@@ -7580,7 +7579,15 @@ handle_poly_fill_rectangle:
     dec ebp
     jmp .pfr_loop
 .pfr_done:
+    ; Recomposite only if the dst is a window (pixmap fills don't show
+    ; until CopyArea'd to a window).
+    mov edi, [rbx + 4]
+    call window_lookup
+    test rax, rax
+    jz .pfr_ret
     call recomposite_screen
+.pfr_ret:
+    add rsp, 16
     pop rbp
     pop r15
     pop r14
@@ -7707,30 +7714,19 @@ handle_put_image:
     cmp eax, 32
     jne .pi_done
 .pi_ok_depth:
-    mov edi, [r13 + 4]                        ; drawable
-    call window_lookup
-    test rax, rax
-    jz .pi_done
-    mov r14, rax                             ; window record
-    cmp dword [r14], X_ROOT_WINDOW
-    je .pi_done
-    mov rdi, r14
-    call window_ensure_backing
+    mov edi, [r13 + 4]                        ; drawable (window OR pixmap)
+    call drawable_get_backing
     test rax, rax
     jz .pi_done
     mov rbx, rax                            ; backing ptr (dst base)
+    mov [rsp + 16], edx                     ; backing_w (stride)
+    mov [rsp + 24], ecx                     ; backing_h
 
     lea rbp, [r13 + 24]                      ; src data ptr
-
-    ; Stash scalars.
     movzx eax, word [r13 + 12]              ; imgw
     mov [rsp + 0], eax
     movzx eax, word [r13 + 14]              ; imgh
     mov [rsp + 8], eax
-    movzx eax, word [r14 + 40]             ; backing_w
-    mov [rsp + 16], eax
-    movzx eax, word [r14 + 42]             ; backing_h
-    mov [rsp + 24], eax
     movsx eax, word [r13 + 18]             ; dsty
     mov [rsp + 32], eax
 
@@ -7786,7 +7782,14 @@ handle_put_image:
     inc r12d
     jmp .pi_row
 .pi_done:
+    ; Recomposite only if the dst is a window (pixmap PutImage, e.g. glass's
+    ; per-colour pen-pixmap update, must NOT trigger a full repaint).
+    mov edi, [r13 + 4]
+    call window_lookup
+    test rax, rax
+    jz .pi_ret
     call recomposite_screen
+.pi_ret:
     add rsp, 64
     pop rbp
     pop r15
@@ -9756,5 +9759,141 @@ handle_query_font:
     lea rsi, [reply_buf]
     mov rdx, 60
     syscall
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; install_dump_handler / dump_handler — DEBUG. On SIGUSR1, log stats about
+; the first mapped non-root window's backing buffer (size, count of pixels
+; differing from back_pixel, and the centre pixel). Lets us check whether a
+; client (glass) actually rendered content into its window, network-only.
+; ----------------------------------------------------------------------------
+install_dump_handler:
+    lea rdi, [sig_sa_buf]
+    lea rax, [dump_handler]
+    mov [rdi + 0], rax
+    mov qword [rdi + 8], SA_RESTORER
+    lea rax, [sig_restorer]
+    mov [rdi + 16], rax
+    mov qword [rdi + 24], 0
+    mov rax, SYS_RT_SIGACTION
+    mov edi, SIGUSR1
+    lea rsi, [sig_sa_buf]
+    xor edx, edx
+    mov r10, 8
+    syscall
+    ret
+
+dump_handler:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rsi, dbg_dump_tag                     ; marker: handler fired
+    mov edx, dbg_dump_tag_len
+    call write_stderr
+    lea rsi, [probe_conn_nl]
+    mov rdx, 1
+    call write_stderr
+    xor ebx, ebx
+.dh_find:
+    cmp ebx, MAX_WINDOWS
+    jge .dh_done
+    mov rax, rbx
+    imul rax, WINDOW_REC_SIZE
+    lea r12, [windows + rax]
+    mov eax, [r12]
+    test eax, eax
+    jz .dh_next
+    cmp eax, X_ROOT_WINDOW
+    je .dh_next
+    ; log every non-root window regardless of mapped/backing state
+    xor edx, edx                              ; nonbg count (0 if no backing)
+    cmp byte [r12 + 31], 0                    ; has_backing?
+    je .dh_log
+    mov r13, [r12 + 32]                       ; backing ptr
+    ; --- write the raw ARGB backing to /tmp/frame_win.raw (first backed win) ---
+    mov rax, SYS_OPEN
+    lea rdi, [dump_path]
+    mov esi, 0x241                            ; O_WRONLY|O_CREAT|O_TRUNC
+    mov edx, 0x1A4                            ; 0644
+    syscall
+    test rax, rax
+    js .dh_wf_done
+    push rax                                  ; fd
+    movzx eax, word [r12 + 40]
+    movzx ecx, word [r12 + 42]
+    imul eax, ecx
+    shl eax, 2                                ; w*h*4 bytes
+    mov edx, eax
+    mov rax, SYS_WRITE
+    mov rdi, [rsp]
+    mov rsi, [r12 + 32]
+    syscall
+    mov rax, SYS_CLOSE
+    mov rdi, [rsp]
+    syscall
+    add rsp, 8
+.dh_wf_done:
+    movzx r14d, word [r12 + 40]
+    movzx eax, word [r12 + 42]
+    imul r14d, eax                            ; pixel count
+    mov r15d, [r12 + 44]                      ; back_pixel
+    xor ecx, ecx                              ; index
+.dh_count:
+    cmp ecx, r14d
+    jge .dh_log
+    mov eax, [r13 + rcx*4]
+    cmp eax, r15d
+    je .dh_count_next
+    inc edx
+.dh_count_next:
+    inc ecx
+    jmp .dh_count
+.dh_log:
+    push rdx                                  ; nonbg count
+    mov rsi, dbg_dump_tag
+    mov edx, dbg_dump_tag_len
+    call write_stderr
+    mov eax, [r12]                            ; xid
+    call write_u64_stderr
+    mov rsi, dbg_sp
+    mov edx, 1
+    call write_stderr
+    movzx eax, byte [r12 + 28]                ; mapped
+    call write_u64_stderr
+    mov rsi, dbg_sp
+    mov edx, 1
+    call write_stderr
+    movzx eax, byte [r12 + 31]                ; has_backing
+    call write_u64_stderr
+    mov rsi, dbg_sp
+    mov edx, 1
+    call write_stderr
+    movzx eax, word [r12 + 40]                ; w
+    call write_u64_stderr
+    mov rsi, dbg_sp
+    mov edx, 1
+    call write_stderr
+    movzx eax, word [r12 + 42]                ; h
+    call write_u64_stderr
+    mov rsi, dbg_sp
+    mov edx, 1
+    call write_stderr
+    pop rax                                   ; nonbg count
+    call write_u64_stderr
+    lea rsi, [probe_conn_nl]
+    mov rdx, 1
+    call write_stderr
+    jmp .dh_next
+.dh_next:
+    inc ebx
+    jmp .dh_find
+.dh_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
     pop rbx
     ret
