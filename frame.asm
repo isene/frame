@@ -70,6 +70,8 @@ DEFAULT REL
 %define DRM_IOCTL_MODE_ADDFB           0xC01C64AE
 %define DRM_IOCTL_MODE_RMFB            0xC00464AF
 %define DRM_IOCTL_MODE_DIRTYFB         0xC01864B7
+%define DRM_IOCTL_MODE_PAGE_FLIP       0xC01864B0
+%define DRM_MODE_PAGE_FLIP_EVENT       0x01
 %define DRM_IOCTL_MODE_CREATE_DUMB     0xC02064B2
 %define DRM_IOCTL_MODE_MAP_DUMB        0xC01064B3
 %define DRM_IOCTL_MODE_DESTROY_DUMB    0xC00464B4
@@ -423,9 +425,23 @@ nanosleep_ts:       resq 2
 ; num_clips at +12, clips_ptr at +16.
 drm_dirty_cmd:      resb 24
 
+; ---- Double-buffer + page-flip (the real fix for FBC/PSR staleness) -------
+; Two dumb buffers. We render the BACK one, clflush it, then PAGE_FLIP the
+; CRTC to it; the flip forces the display engine to re-scan at vblank,
+; defeating framebuffer-compression / panel-self-refresh staleness that
+; makes in-place CPU updates vanish. comp_addr[i]/comp_fbid[i] are the two
+; buffers; comp_back is the index (0/1) currently being rendered into.
+comp_addr:          resq 2                 ; mmap'd ARGB buffer per buffer
+comp_fbid:          resd 2                 ; DRM framebuffer id per buffer
+comp_handle:        resd 2                 ; dumb-buffer handle per buffer
+comp_back:          resd 1                 ; index of the back buffer (0/1)
+drm_page_flip:      resb 24                ; struct drm_mode_crtc_page_flip
+drm_event_buf:      resb 64                ; drain the flip-complete event
+
 ; ---- Phase 4f compositor state --------------------------------------------
 compositor_requested: resb 1               ; set by --display argv flag
 compositor_active:    resb 1               ; set to 1 after init_compositor wins
+dirtyfb_logged:       resb 1               ; log DIRTYFB return code only once
 sig_sa_buf:           resb 32              ; kernel struct sigaction
 
 ; ---- evdev probe / watch state --------------------------------------------
@@ -473,6 +489,8 @@ log_comp_pitch:     db ", pitch ", 0
 log_comp_pitch_len  equ $ - log_comp_pitch - 1
 log_comp_size:      db ", size ", 0
 log_comp_size_len   equ $ - log_comp_size - 1
+log_pageflip:       db "frame: first PAGE_FLIP rc=", 0
+log_pageflip_len    equ $ - log_pageflip - 1
 log_atom_new:       db "  intern-atom new id=", 0
 log_atom_new_len   equ $ - log_atom_new - 1
 log_atom_known:     db "  intern-atom known id=", 0
@@ -6502,6 +6520,98 @@ init_compositor:
     mov eax, [drm_fb_cmd]
     mov [drm_fb_id], eax
 
+    ; Record buffer 0 (the one SETCRTC will show first = front).
+    mov rax, [drm_dumb_addr]
+    mov [comp_addr + 0], rax
+    mov eax, [drm_fb_id]
+    mov [comp_fbid + 0], eax
+    mov eax, [drm_dumb_handle]
+    mov [comp_handle + 0], eax
+
+    ; --- Create buffer 1 (back). Same dims/pitch/size as buffer 0. The
+    ;     compositor renders the back buffer then PAGE_FLIPs to it, which
+    ;     forces the display engine to re-scan at vblank — the only way to
+    ;     beat FBC/PSR staleness on a legacy framebuffer (DIRTYFB is
+    ;     unsupported: returns -ENOENT). ---
+    lea rdi, [drm_dumb_create]
+    xor eax, eax
+    mov ecx, 4
+    rep stosq
+    movzx eax, word [drm_modes_buf + 4]
+    mov [drm_dumb_create + 4], eax
+    movzx eax, word [drm_modes_buf + 14]
+    mov [drm_dumb_create + 0], eax
+    mov dword [drm_dumb_create + 8], 32
+    mov dword [drm_dumb_create + 12], 0
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_CREATE_DUMB
+    lea rdx, [drm_dumb_create]
+    syscall
+    test rax, rax
+    js .ic_fail_other
+    mov eax, [drm_dumb_create + 16]
+    mov [comp_handle + 4], eax               ; buffer 1 handle
+    ; MAP_DUMB
+    lea rdi, [drm_dumb_map]
+    xor eax, eax
+    mov ecx, 2
+    rep stosq
+    mov eax, [comp_handle + 4]
+    mov [drm_dumb_map], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_MAP_DUMB
+    lea rdx, [drm_dumb_map]
+    syscall
+    test rax, rax
+    js .ic_fail_other
+    mov rax, [drm_dumb_map + 8]
+    mov [drm_dumb_offset], rax               ; reuse as temp
+    ; mmap
+    mov rax, SYS_MMAP
+    xor edi, edi
+    mov rsi, [drm_dumb_size]
+    mov edx, PROT_RW
+    mov r10d, MAP_SHARED
+    mov r8, [drm_fd]
+    mov r9, [drm_dumb_offset]
+    syscall
+    cmp rax, -4096
+    ja .ic_fail_other
+    mov [comp_addr + 8], rax                 ; buffer 1 addr
+    ; fill buffer 1 blue
+    mov rdi, rax
+    mov rcx, [drm_dumb_size]
+    shr rcx, 2
+    mov eax, COMP_BG_COLOR
+    rep stosd
+    ; ADDFB for buffer 1
+    lea rdi, [drm_fb_cmd]
+    xor eax, eax
+    mov ecx, 7
+    rep stosd
+    mov eax, [drm_dumb_create + 4]
+    mov [drm_fb_cmd + 4], eax
+    mov eax, [drm_dumb_create + 0]
+    mov [drm_fb_cmd + 8], eax
+    mov eax, [drm_dumb_pitch]
+    mov [drm_fb_cmd + 12], eax
+    mov dword [drm_fb_cmd + 16], 32
+    mov dword [drm_fb_cmd + 20], 24
+    mov eax, [comp_handle + 4]
+    mov [drm_fb_cmd + 24], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_ADDFB
+    lea rdx, [drm_fb_cmd]
+    syscall
+    test rax, rax
+    js .ic_fail_other
+    mov eax, [drm_fb_cmd]
+    mov [comp_fbid + 4], eax                 ; buffer 1 fbid
+    mov dword [comp_back], 1                  ; render buffer 1 first (front=0)
+
     ; --- GETCRTC: save the console's current CRTC state so a clean exit
     ;     (Ctrl+C, SIGTERM) can restore the text VT instead of leaving
     ;     the panel showing a freed framebuffer (= black, needs a VT
@@ -6628,7 +6738,15 @@ recomposite_screen:
     push r12
     push r13
 
-    ; --- Background fill across the whole buffer.
+    ; Point drm_dumb_addr at the BACK buffer — every draw helper (the bg
+    ; fill, draw_rect, blit_window) renders through drm_dumb_addr, so this
+    ; one assignment redirects the whole repaint into the back buffer.
+    ; We PAGE_FLIP to it at the end (.rs_done_pop).
+    mov eax, [comp_back]
+    mov rax, [comp_addr + rax*8]
+    mov [drm_dumb_addr], rax
+
+    ; --- Background fill across the whole (back) buffer.
     mov rdi, [drm_dumb_addr]
     mov rcx, [drm_dumb_size]
     shr rcx, 2
@@ -6687,6 +6805,8 @@ recomposite_screen:
     ; the panel's scan-out) without explicit flushing. clflush is
     ; per-64-byte cache line; we sweep the whole 9.2 MB buffer with one
     ; `rep`-flavoured loop. ~144k cache lines, sub-ms total.
+    ; clflush the back buffer (CPU write-back cache → RAM) so the display
+    ; engine reads our fresh pixels, not stale cache.
     mov rdi, [drm_dumb_addr]
     mov rcx, [drm_dumb_size]
 .rs_flush:
@@ -6695,6 +6815,60 @@ recomposite_screen:
     sub rcx, 64
     ja .rs_flush
     sfence
+
+    ; --- PAGE_FLIP the CRTC to the back buffer. The flip makes the
+    ; display engine re-scan the new buffer at the next vblank, which
+    ; defeats FBC/PSR staleness (DIRTYFB is unsupported on legacy FBs).
+    ; ebx = back index.
+    mov ebx, [comp_back]
+    lea rdi, [drm_page_flip]
+    mov eax, [drm_chosen_crtc]
+    mov [rdi + 0], eax                       ; crtc_id
+    mov eax, [comp_fbid + rbx*4]
+    mov [rdi + 4], eax                       ; fb_id
+    mov dword [rdi + 8], DRM_MODE_PAGE_FLIP_EVENT
+    mov dword [rdi + 12], 0                  ; reserved
+    mov qword [rdi + 16], 0                  ; user_data
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_PAGE_FLIP
+    lea rdx, [drm_page_flip]
+    syscall
+
+    ; Log the first flip's return so we can confirm flips are accepted.
+    cmp byte [dirtyfb_logged], 0
+    jne .rs_flip_logged
+    mov byte [dirtyfb_logged], 1
+    push rax
+    mov rsi, log_pageflip
+    mov rdx, log_pageflip_len
+    call write_stderr
+    pop rax
+    push rax
+    call write_i64_stderr
+    lea rsi, [probe_conn_nl]
+    mov rdx, 1
+    call write_stderr
+    pop rax
+.rs_flip_logged:
+    test rax, rax
+    js .rs_no_swap                           ; flip rejected → keep current front
+
+    ; Drain the flip-complete event (blocking read; arrives at vblank,
+    ; ~8 ms). Only one flip may be pending per CRTC, and we drain it
+    ; synchronously here, so the next recomposite's flip never collides.
+    mov rax, SYS_READ
+    mov rdi, [drm_fd]
+    lea rsi, [drm_event_buf]
+    mov rdx, 64
+    syscall
+
+    ; Swap: the back buffer just became the front; render the other one
+    ; next time.
+    mov eax, [comp_back]
+    xor eax, 1
+    mov [comp_back], eax
+.rs_no_swap:
 
     pop r13
     pop r12
