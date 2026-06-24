@@ -161,6 +161,7 @@ DEFAULT REL
 ; child MapWindow / ConfigureWindow to whichever client set it (the
 ; WM). SubstructureNotifyMask sends MapNotify / ConfigureNotify /
 ; DestroyNotify to the same subscriber.
+%define EM_STRUCTURE_NOTIFY      0x00020000
 %define EM_SUBSTRUCTURE_NOTIFY    0x00080000
 %define EM_SUBSTRUCTURE_REDIRECT  0x00100000
 
@@ -4951,6 +4952,29 @@ handle_map_window:
 .mw_just_map:
     mov byte [r12 + 28], 1
     call recomposite_screen
+    ; If the window selected StructureNotify on ITSELF, send its own client
+    ; MapNotify + ConfigureNotify (clients like glass wait for the latter
+    ; before forking their shell / learning their geometry). Owner client
+    ; slot is encoded in the xid: (xid - X_RID_BASE) >> 21.
+    mov eax, [r12 + 24]
+    test eax, EM_STRUCTURE_NOTIFY
+    jz .mw_check_sub
+    mov eax, [r12]                             ; window xid
+    cmp eax, X_RID_BASE
+    jb .mw_check_sub
+    sub eax, X_RID_BASE
+    shr eax, 21                                 ; owner slot
+    cmp eax, MAX_CLIENTS
+    jae .mw_check_sub
+    mov r14d, eax                               ; owner slot
+    mov edi, r14d
+    mov esi, [r12]                              ; event window = the window
+    mov edx, [r12]                              ; window = itself
+    call send_map_notify
+    mov edi, r14d
+    mov rsi, r12                                ; window record
+    call send_configure_notify
+.mw_check_sub:
     ; If parent has SubstructureNotify, notify the redirect-owner subscriber.
     test r13, r13
     jz .mw_done
@@ -6431,6 +6455,46 @@ send_map_notify:
     lea rsi, [reply_buf]
     call send_event_to_slot
     pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; send_configure_notify — edi = recipient slot, rsi = window record ptr.
+; Sends a ConfigureNotify for the window to its own client (StructureNotify).
+;   ConfigureNotify (32 bytes): code 22, event@4, window@8, above@12=None,
+;   x@16, y@18, width@20, height@22, border@24, override-redirect@26.
+; ----------------------------------------------------------------------------
+send_configure_notify:
+    push rbx
+    push r12
+    mov ebx, edi                               ; recipient slot
+    mov r12, rsi                               ; window record
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 22
+    mov byte [rdi + 1], 0
+    mov word [rdi + 2], 0
+    mov eax, [r12]                             ; window xid
+    mov [rdi + 4], eax                         ; event window
+    mov [rdi + 8], eax                         ; window
+    mov dword [rdi + 12], 0                    ; above-sibling = None
+    mov ax, [r12 + 8]
+    mov [rdi + 16], ax                         ; x
+    mov ax, [r12 + 10]
+    mov [rdi + 18], ax                         ; y
+    mov ax, [r12 + 12]
+    mov [rdi + 20], ax                         ; width
+    mov ax, [r12 + 14]
+    mov [rdi + 22], ax                         ; height
+    mov ax, [r12 + 16]
+    mov [rdi + 24], ax                         ; border-width
+    movzx eax, byte [r12 + 29]
+    mov [rdi + 26], al                         ; override-redirect
+    mov byte [rdi + 27], 0
+    mov dword [rdi + 28], 0
+    mov edi, ebx
+    lea rsi, [reply_buf]
+    call send_event_to_slot
     pop r12
     pop rbx
     ret
