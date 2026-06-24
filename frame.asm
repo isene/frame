@@ -182,6 +182,14 @@ DEFAULT REL
 ; Resource ID space we give to the first client. With one client this is
 ; safe; multi-client work later will allocate non-overlapping ranges.
 %define X_RID_BASE           0x00400000
+
+; ---- RENDER extension (phase 9) -------------------------------------------
+; Major opcode we advertise for RENDER via QueryExtension. Clients then
+; send requests with this as byte 0 and the RENDER minor opcode as byte 1.
+%define RENDER_MAJOR         140
+%define RENDER_ERROR_BASE    128
+%define RENDER_VERSION_MAJOR 0
+%define RENDER_VERSION_MINOR 11
 %define X_RID_MASK           0x001FFFFF
 
 ; ============================================================================
@@ -491,6 +499,7 @@ log_comp_size:      db ", size ", 0
 log_comp_size_len   equ $ - log_comp_size - 1
 log_pageflip:       db "frame: first PAGE_FLIP rc=", 0
 log_pageflip_len    equ $ - log_pageflip - 1
+str_render:         db "RENDER"
 log_atom_new:       db "  intern-atom new id=", 0
 log_atom_new_len   equ $ - log_atom_new - 1
 log_atom_known:     db "  intern-atom known id=", 0
@@ -3173,7 +3182,16 @@ dispatch_request:
     je .dr_get_pointer_mapping
     cmp eax, 119
     je .dr_get_modifier_mapping
+    cmp eax, RENDER_MAJOR
+    je .dr_render
     ; Unhandled — already logged.
+    jmp .dr_done
+
+.dr_render:
+    mov edi, ebx
+    mov rsi, r12
+    mov edx, r13d
+    call handle_render
     jmp .dr_done
 
 .dr_intern_atom:
@@ -3270,6 +3288,7 @@ dispatch_request:
 
 .dr_query_extension:
     mov edi, ebx
+    mov rsi, r12
     call handle_query_extension
     jmp .dr_done
 
@@ -3514,33 +3533,63 @@ handle_intern_atom:
 ;   +10 first-event (0)   +11 first-error (0)
 ;   +12..31 pad
 ; ============================================================================
+; edi = slot, rsi = req ptr.
+;   +4 name-length (CARD16)   +8 name (string, padded to 4)
+; We recognise "RENDER" and report it present with major opcode
+; RENDER_MAJOR; everything else reports absent (present=0).
 handle_query_extension:
     push rbx
     push r12
+    push r13
     mov ebx, edi
+    mov r13, rsi                             ; req ptr
     mov eax, ebx
     call client_meta_addr
     mov r12, rax
 
     lea rdi, [reply_buf]
-    mov byte [rdi + 0], 1
+    mov byte [rdi + 0], 1                    ; reply
     mov byte [rdi + 1], 0
     mov ecx, [r12 + 8]                       ; seq
     mov [rdi + 2], cx
-    mov dword [rdi + 4], 0
-    mov dword [rdi + 8], 0                   ; present=0 + 3 zero bytes
+    mov dword [rdi + 4], 0                   ; reply length 0
+    mov dword [rdi + 8], 0                   ; present(0)=absent + pad
     mov dword [rdi + 12], 0
     mov dword [rdi + 16], 0
     mov dword [rdi + 20], 0
     mov dword [rdi + 24], 0
     mov dword [rdi + 28], 0
 
+    ; Is the requested name "RENDER" (length 6)?
+    movzx eax, word [r13 + 4]                ; name-length
+    cmp eax, 6
+    jne .qe_send
+    lea rsi, [r13 + 8]
+    lea rdi, [str_render]
+    mov ecx, 6
+.qe_cmp:
+    mov al, [rsi]
+    cmp al, [rdi]
+    jne .qe_send
+    inc rsi
+    inc rdi
+    dec ecx
+    jnz .qe_cmp
+    ; Match → report present with our major opcode.
+    lea rdi, [reply_buf]
+    mov byte [rdi + 8], 1                    ; present = True
+    mov byte [rdi + 9], RENDER_MAJOR         ; major-opcode
+    mov byte [rdi + 10], 0                   ; first-event
+    mov byte [rdi + 11], RENDER_ERROR_BASE   ; first-error
+
+.qe_send:
     mov edi, [r12]
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
     syscall
 
+    pop r13
     pop r12
     pop rbx
     ret
@@ -8323,6 +8372,142 @@ handle_send_event:
     syscall
 .se_done:
     pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; ============================================================================
+; PHASE 9 (start) — RENDER extension.
+; ============================================================================
+; The extension modern toolkits + glass use for anti-aliased glyphs and
+; ARGB compositing. This is the foundation: extension negotiation
+; (QueryExtension reports RENDER present, in handle_query_extension) and
+; the RENDER request dispatcher with QueryVersion. PictFormats, Pictures,
+; glyph sets, and Composite come next.
+;
+; A RENDER request arrives as a normal X request whose opcode byte is
+; RENDER_MAJOR; byte 1 is the RENDER minor opcode.
+; ============================================================================
+
+; ----------------------------------------------------------------------------
+; handle_render — edi = slot, rsi = req ptr, edx = req bytes.
+; Dispatches on the minor opcode (req byte 1).
+;   0 = QueryVersion
+; Unknown minors are accepted silently (no reply) for now.
+; ----------------------------------------------------------------------------
+handle_render:
+    push rbx
+    push r12
+    mov ebx, edi                             ; slot
+    mov r12, rsi                             ; req ptr
+    movzx eax, byte [r12 + 1]                ; minor opcode
+    cmp eax, 0
+    je .hr_query_version
+    cmp eax, 1
+    je .hr_query_pict_formats
+    ; Unhandled minor — leave it (logged by the generic request logger).
+    jmp .hr_done
+
+.hr_query_version:
+    ; Reply: server's supported RENDER version.
+    ;   +0 reply(1) +2 seq +4 len(0) +8 major +12 minor +16..31 pad
+    mov eax, ebx
+    call client_meta_addr                    ; rax = meta
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1                    ; reply
+    mov byte [rdi + 1], 0
+    mov ecx, [rax + 8]                       ; seq
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 0                   ; length
+    mov dword [rdi + 8], RENDER_VERSION_MAJOR
+    mov dword [rdi + 12], RENDER_VERSION_MINOR
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+    mov edi, [rax]                           ; fd
+    push rax
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+    pop rax
+    jmp .hr_done
+
+; --- QueryPictFormats: report 3 standard formats (ARGB32, RGB24, A8) and
+;     one screen mapping our depth-24 + depth-32 visuals to formats.
+;     libXrender BLOCKS on this during setup, so it must reply. 160-byte
+;     reply (32 fixed + 128 variable).
+.hr_query_pict_formats:
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax                             ; meta (req ptr no longer needed)
+    ; Zero the 160-byte reply region.
+    lea rdi, [reply_buf]
+    xor eax, eax
+    mov ecx, 20
+    rep stosq
+    ; --- fixed reply header ---
+    mov byte  [reply_buf + 0], 1             ; reply
+    mov ecx, [r12 + 8]                       ; seq
+    mov [reply_buf + 2], cx
+    mov dword [reply_buf + 4], 32            ; reply length (variable 4-byte units)
+    mov dword [reply_buf + 8], 3             ; numFormats
+    mov dword [reply_buf + 12], 1            ; numScreens
+    mov dword [reply_buf + 16], 2            ; numDepths
+    mov dword [reply_buf + 20], 2            ; numVisuals
+    mov dword [reply_buf + 24], 1            ; numSubpixels
+    ; --- PICTFORMINFO ARGB32 @ 32 (id 0x30, depth 32) ---
+    mov dword [reply_buf + 32], 0x30
+    mov byte  [reply_buf + 36], 1            ; type = Direct
+    mov byte  [reply_buf + 37], 32           ; depth
+    mov word  [reply_buf + 40], 16           ; red shift
+    mov word  [reply_buf + 42], 0xff         ; red mask
+    mov word  [reply_buf + 44], 8            ; green shift
+    mov word  [reply_buf + 46], 0xff
+    mov word  [reply_buf + 48], 0            ; blue shift
+    mov word  [reply_buf + 50], 0xff
+    mov word  [reply_buf + 52], 24           ; alpha shift
+    mov word  [reply_buf + 54], 0xff
+    ; --- PICTFORMINFO RGB24 @ 60 (id 0x31, depth 24, no alpha) ---
+    mov dword [reply_buf + 60], 0x31
+    mov byte  [reply_buf + 64], 1
+    mov byte  [reply_buf + 65], 24
+    mov word  [reply_buf + 68], 16           ; red
+    mov word  [reply_buf + 70], 0xff
+    mov word  [reply_buf + 72], 8            ; green
+    mov word  [reply_buf + 74], 0xff
+    mov word  [reply_buf + 76], 0            ; blue
+    mov word  [reply_buf + 78], 0xff
+    ; alpha shift/mask @ 80/82 stay 0
+    ; --- PICTFORMINFO A8 @ 88 (id 0x32, depth 8, alpha only) ---
+    mov dword [reply_buf + 88], 0x32
+    mov byte  [reply_buf + 92], 1
+    mov byte  [reply_buf + 93], 8
+    ; rgb shifts/masks @ 96..107 stay 0
+    mov word  [reply_buf + 108], 0           ; alpha shift
+    mov word  [reply_buf + 110], 0xff        ; alpha mask
+    ; --- PICTSCREEN 0 @ 116 ---
+    mov dword [reply_buf + 116], 2           ; numDepths
+    mov dword [reply_buf + 120], 0x31        ; fallback format (RGB24)
+    ; PICTDEPTH depth 24 @ 124
+    mov byte  [reply_buf + 124], 24          ; depth
+    mov word  [reply_buf + 126], 1           ; numVisuals
+    mov dword [reply_buf + 132], 0x20        ; visual id (depth-24)
+    mov dword [reply_buf + 136], 0x31        ; → RGB24
+    ; PICTDEPTH depth 32 @ 140
+    mov byte  [reply_buf + 140], 32
+    mov word  [reply_buf + 142], 1
+    mov dword [reply_buf + 148], 0x21        ; visual id (depth-32)
+    mov dword [reply_buf + 152], 0x30        ; → ARGB32
+    ; --- subpixel order @ 156 (SubPixelUnknown = 0) stays 0 ---
+    mov edi, [r12]                           ; fd
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 160
+    syscall
+.hr_done:
     pop r12
     pop rbx
     ret
