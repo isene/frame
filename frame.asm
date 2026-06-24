@@ -349,6 +349,8 @@ cg_dst_ptr:         resq 1
 cg_dst_stride:      resd 1
 cg_dst_h:           resd 1
 cg_src:             resd 1               ; 8-bit ARGB source colour
+gb_bpp:             resd 1               ; current glyph bytes-per-pixel (1=A8, 4=ARGB)
+ag_log_count:       resd 1               ; debug: limit AddGlyphs dumps
 
 ; ---- Phase 4c property table ----------------------------------------------
 ; properties[1024] — flat list of (window, atom) → value records. xid = 0
@@ -538,6 +540,9 @@ log_comp_size_len   equ $ - log_comp_size - 1
 log_pageflip:       db "frame: first PAGE_FLIP rc=", 0
 log_pageflip_len    equ $ - log_pageflip - 1
 str_render:         db "RENDER"
+dbg_ag_tag:         db 10, "AG: "
+dbg_ag_tag_len      equ $ - dbg_ag_tag
+dbg_sp:             db " "
 log_atom_new:       db "  intern-atom new id=", 0
 log_atom_new_len   equ $ - log_atom_new - 1
 log_atom_known:     db "  intern-atom known id=", 0
@@ -8845,6 +8850,31 @@ render_free_glyphset:
     ret
 
 ; ----------------------------------------------------------------------------
+; glyphset_format — edi = gsid. Returns the set's PICTFORMAT in eax, or 0.
+; ----------------------------------------------------------------------------
+glyphset_format:
+    push rbx
+    xor ebx, ebx
+.gsf_loop:
+    cmp ebx, MAX_GLYPHSETS
+    jge .gsf_miss
+    mov rax, rbx
+    imul rax, GLYPHSET_REC
+    lea rax, [glyphsets + rax]
+    cmp [rax], edi
+    je .gsf_hit
+    inc ebx
+    jmp .gsf_loop
+.gsf_hit:
+    mov eax, [rax + 4]                         ; format
+    pop rbx
+    ret
+.gsf_miss:
+    xor eax, eax
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
 ; render_add_glyphs — rdi = req ptr.
 ;   +4 glyphset   +8 numGlyphs   +12 glyphids[n]   then GLYPHINFO[n]
 ;   then concatenated A8 bitmaps (scanline padded to 4 bytes).
@@ -8864,8 +8894,19 @@ render_add_glyphs:
     mov r15d, [rbx + 8]                        ; numGlyphs
     test r15d, r15d
     jz .ag_done
-    mov ecx, [rbx + 4]                         ; glyphset id (keep in ecx→stack)
-    push rcx                                   ; [rsp] = glyphset id
+    mov ecx, [rbx + 4]                         ; glyphset id
+    push rcx                                   ; [rsp+8] = glyphset id
+    ; Determine bytes-per-pixel from the set's format: A8 (0x32) = 1,
+    ; everything else (ARGB32/RGB24) = 4. Xft uploads ARGB32 glyphs when
+    ; subpixel/LCD rendering is on, so this is the common case.
+    mov edi, ecx
+    call glyphset_format
+    mov edx, 1
+    cmp eax, 0x32
+    je .ag_bpp_done
+    mov edx, 4
+.ag_bpp_done:
+    push rdx                                   ; [rsp] = bpp, [rsp+8] = gsid
     lea r12, [rbx + 12]                        ; ids cursor
     mov eax, r15d
     lea r13, [r12 + rax*4]                      ; info cursor = ids + n*4
@@ -8882,11 +8923,19 @@ render_add_glyphs:
     ; metrics
     movzx r8d, word [r13 + 0]                  ; width
     movzx r9d, word [r13 + 2]                  ; height
-    ; stride = (width + 3) & ~3
+    ; stride: A8 (bpp 1) → (width+3)&~3 ; ARGB32 (bpp 4) → width*4
+    cmp dword [rsp], 1                          ; bpp
+    je .ag_stride1
+    mov r10d, r8d
+    shl r10d, 2                                 ; width*4
+    jmp .ag_stride_done
+.ag_stride1:
     lea eax, [r8 + 3]
     and eax, ~3
-    mov r10d, eax                              ; stride
+    mov r10d, eax
+.ag_stride_done:
     ; size = stride * height
+    mov eax, r10d
     imul eax, r9d
     mov r11d, eax                              ; bitmap size
     ; pool capacity
@@ -8898,7 +8947,7 @@ render_add_glyphs:
     mov eax, [glyph_count]
     imul eax, GLYPH_REC_SIZE
     lea rbp, [glyph_recs + rax]
-    mov edx, [rsp]                              ; glyphset id
+    mov edx, [rsp + 8]                          ; glyphset id
     mov [rbp + 0], edx
     mov edx, [r12]                              ; glyphid
     mov [rbp + 4], edx
@@ -8915,6 +8964,8 @@ render_add_glyphs:
     mov eax, [glyph_pool_used]
     mov [rbp + 20], eax                         ; bitmap_off
     mov [rbp + 24], r10w                        ; stride
+    mov edx, [rsp]                              ; bpp
+    mov [rbp + 26], dx                          ; bpp
     ; --- copy bitmap into pool ---
     push rsi
     push rdi
@@ -8934,7 +8985,7 @@ render_add_glyphs:
     dec r15d
     jmp .ag_loop
 .ag_pop:
-    add rsp, 8                                  ; drop glyphset id
+    add rsp, 16                                 ; drop bpp + glyphset id
 .ag_done:
     pop rbp
     pop r15
@@ -9039,6 +9090,8 @@ glyph_blend:
     movzx r10d, word [r9 + 8]                  ; width
     movzx r11d, word [r9 + 10]                 ; height
     movzx r12d, word [r9 + 24]                 ; stride
+    movzx eax, word [r9 + 26]                   ; bpp (1=A8, 4=ARGB32)
+    mov [gb_bpp], eax
     mov eax, [r9 + 20]                         ; bitmap_off
     lea rbx, [glyph_pool + rax]                ; bitmap ptr
     xor r15d, r15d                             ; row = 0
@@ -9061,10 +9114,19 @@ glyph_blend:
     js .gb_col_next
     cmp eax, [cg_dst_stride]
     jge .gb_col_next
-    ; coverage = bitmap[row*stride + col]
+    ; coverage byte offset = row*stride + (A8: col ; ARGB32: col*4 + 3 = alpha)
     mov ecx, r15d
     imul ecx, r12d
+    cmp dword [gb_bpp], 1
+    je .gb_cov_a8
+    mov edx, ebp
+    shl edx, 2
+    add ecx, edx
+    add ecx, 3                                  ; alpha channel of ARGB pixel
+    jmp .gb_cov_read
+.gb_cov_a8:
     add ecx, ebp
+.gb_cov_read:
     movzx ecx, byte [rbx + rcx]                ; cov
     test ecx, ecx
     jz .gb_col_next
