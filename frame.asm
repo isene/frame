@@ -350,6 +350,16 @@ cg_dst_stride:      resd 1
 cg_dst_h:           resd 1
 cg_src:             resd 1               ; 8-bit ARGB source colour
 gb_bpp:             resd 1               ; current glyph bytes-per-pixel (1=A8, 4=ARGB)
+; RENDER Composite (minor 8) per-call context.
+co_src_ptr:         resq 1
+co_src_stride:      resd 1
+co_src_w:           resd 1
+co_src_h:           resd 1
+co_src_solid:       resd 1               ; 1 if src is a solid-fill colour
+co_src_color:       resd 1
+co_dst_ptr:         resq 1
+co_dst_stride:      resd 1
+co_dst_h:           resd 1
 ag_log_count:       resd 1               ; debug: limit AddGlyphs dumps
 
 ; ---- Phase 4c property table ----------------------------------------------
@@ -8456,6 +8466,8 @@ handle_render:
     je .hr_free_picture
     cmp eax, 26
     je .hr_fill_rectangles
+    cmp eax, 8
+    je .hr_composite
     cmp eax, 17
     je .hr_create_glyphset
     cmp eax, 19
@@ -8486,6 +8498,11 @@ handle_render:
 .hr_fill_rectangles:
     mov rdi, r12
     call render_fill_rectangles
+    jmp .hr_done
+
+.hr_composite:
+    mov rdi, r12
+    call render_composite
     jmp .hr_done
 
 .hr_create_glyphset:
@@ -9371,6 +9388,208 @@ render_composite_glyphs:
     call recomposite_screen
 .cog_done:
     add rsp, 16
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; render_composite — rdi = req ptr (RENDER minor 8).
+;   +4 op   +8 src   +12 mask   +16 dst
+;   +20 xSrc +22 ySrc  +24 xMask +26 yMask  +28 xDst +30 yDst
+;   +32 width +34 height
+; Composites a width×height region from src onto dst. mask is ignored for
+; now (emoji/image blits don't use one; glyph masking goes through
+; CompositeGlyphs). op Src(1) copies; anything else blends Over using the
+; source alpha. src may be a solid-fill colour or an image drawable. No reply.
+;
+;   rbx=req ptr  r12d=op  r13d=dst drawable  r14d=dy  r15d=dx
+; ----------------------------------------------------------------------------
+render_composite:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov rbx, rdi
+
+    movzx r12d, byte [rbx + 4]                  ; op
+
+    ; --- resolve dst ---
+    mov edi, [rbx + 16]
+    call picture_lookup
+    test rax, rax
+    jz .rc_done
+    mov edi, [rax + 4]
+    mov r13d, edi                               ; dst drawable
+    call drawable_get_backing
+    test rax, rax
+    jz .rc_done
+    mov [co_dst_ptr], rax
+    mov [co_dst_stride], edx
+    mov [co_dst_h], ecx
+
+    ; --- resolve src ---
+    mov dword [co_src_solid], 0
+    mov edi, [rbx + 8]
+    call picture_lookup
+    test rax, rax
+    jz .rc_done
+    cmp dword [rax + 4], PICTURE_SOLID
+    jne .rc_src_drawable
+    mov ecx, [rax + 8]
+    mov [co_src_color], ecx
+    mov dword [co_src_solid], 1
+    jmp .rc_src_done
+.rc_src_drawable:
+    mov edi, [rax + 4]
+    call drawable_get_backing
+    test rax, rax
+    jz .rc_done
+    mov [co_src_ptr], rax
+    mov [co_src_stride], edx
+    mov [co_src_w], edx                         ; stride == width for our buffers
+    mov [co_src_h], ecx
+.rc_src_done:
+
+    ; --- region loop ---
+    xor r14d, r14d                              ; dy = 0
+.rc_row:
+    movzx eax, word [rbx + 34]                  ; height
+    cmp r14d, eax
+    jge .rc_finish
+    xor r15d, r15d                              ; dx = 0
+.rc_col:
+    movzx eax, word [rbx + 32]                  ; width
+    cmp r15d, eax
+    jge .rc_row_next
+    ; dst coords
+    movsx eax, word [rbx + 28]                  ; xDst
+    add eax, r15d                                ; dstx
+    js .rc_col_next
+    cmp eax, [co_dst_stride]
+    jge .rc_col_next
+    mov ebp, eax                                 ; dstx (keep)
+    movsx eax, word [rbx + 30]                  ; yDst
+    add eax, r14d                                ; dsty
+    js .rc_col_next
+    cmp eax, [co_dst_h]
+    jge .rc_col_next
+    ; dst pixel ptr → rdi
+    imul eax, [co_dst_stride]
+    add eax, ebp
+    mov rdi, [co_dst_ptr]
+    lea rdi, [rdi + rax*4]
+    ; --- fetch src pixel → esi (ARGB) ---
+    cmp dword [co_src_solid], 1
+    je .rc_src_solid
+    ; image src: sample at (xSrc+dx, ySrc+dy)
+    movsx eax, word [rbx + 20]                  ; xSrc
+    add eax, r15d
+    js .rc_col_next
+    cmp eax, [co_src_w]
+    jge .rc_col_next
+    mov ecx, eax                                 ; srcx
+    movsx eax, word [rbx + 22]                  ; ySrc
+    add eax, r14d
+    js .rc_col_next
+    cmp eax, [co_src_h]
+    jge .rc_col_next
+    imul eax, [co_src_stride]
+    add eax, ecx
+    mov rsi, [co_src_ptr]
+    mov esi, [rsi + rax*4]                        ; src ARGB
+    jmp .rc_have_src
+.rc_src_solid:
+    mov esi, [co_src_color]
+.rc_have_src:
+    ; op: Src(1) = copy ; else Over by src alpha
+    cmp r12d, 1
+    jne .rc_over
+    mov eax, esi
+    or eax, 0xFF000000
+    mov [rdi], eax
+    jmp .rc_col_next
+.rc_over:
+    mov eax, esi
+    shr eax, 24
+    and eax, 0xff                               ; src alpha
+    test eax, eax
+    jz .rc_col_next                             ; fully transparent
+    cmp eax, 255
+    jne .rc_blend
+    ; opaque → copy
+    mov eax, esi
+    or eax, 0xFF000000
+    mov [rdi], eax
+    jmp .rc_col_next
+.rc_blend:
+    ; dst = src*a + dst*(255-a), per channel, /255 via (v*257+257)>>16
+    mov r8d, eax                                 ; a
+    mov r9d, 255
+    sub r9d, eax                                 ; 255-a
+    mov edx, [rdi]                                ; dst pixel
+    ; blue
+    mov eax, esi
+    and eax, 0xff
+    imul eax, r8d
+    mov ecx, edx
+    and ecx, 0xff
+    imul ecx, r9d
+    add eax, ecx
+    imul eax, 257
+    add eax, 257
+    shr eax, 16
+    mov ecx, eax                                 ; result accumulator (B)
+    ; green
+    mov eax, esi
+    shr eax, 8
+    and eax, 0xff
+    imul eax, r8d
+    mov r10d, edx
+    shr r10d, 8
+    and r10d, 0xff
+    imul r10d, r9d
+    add eax, r10d
+    imul eax, 257
+    add eax, 257
+    shr eax, 16
+    shl eax, 8
+    or ecx, eax
+    ; red
+    mov eax, esi
+    shr eax, 16
+    and eax, 0xff
+    imul eax, r8d
+    mov r10d, edx
+    shr r10d, 16
+    and r10d, 0xff
+    imul r10d, r9d
+    add eax, r10d
+    imul eax, 257
+    add eax, 257
+    shr eax, 16
+    shl eax, 16
+    or ecx, eax
+    or ecx, 0xFF000000
+    mov [rdi], ecx
+.rc_col_next:
+    inc r15d
+    jmp .rc_col
+.rc_row_next:
+    inc r14d
+    jmp .rc_row
+.rc_finish:
+    mov edi, r13d                                ; dst drawable
+    call window_lookup
+    test rax, rax
+    jz .rc_done
+    call recomposite_screen
+.rc_done:
     pop rbp
     pop r15
     pop r14
