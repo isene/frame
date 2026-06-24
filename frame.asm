@@ -3091,6 +3091,8 @@ dispatch_request:
     je .dr_change_window_attributes
     cmp eax, 3
     je .dr_get_window_attributes
+    cmp eax, 25
+    je .dr_send_event
     cmp eax, 4
     je .dr_destroy_window
     cmp eax, 7
@@ -3333,6 +3335,11 @@ dispatch_request:
 .dr_ungrab_key:
     mov rsi, r12
     call handle_ungrab_key
+    jmp .dr_done
+
+.dr_send_event:
+    mov rsi, r12
+    call handle_send_event
     jmp .dr_done
 
 .dr_create_window:
@@ -8216,6 +8223,105 @@ handle_poly_rectangle:
     pop rbp
     pop r15
     pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; ============================================================================
+; PHASE 4i — SendEvent (synthetic event delivery).
+; ============================================================================
+; The ICCCM handshake real toolkits depend on: a WM (tile) sends a
+; synthetic ConfigureNotify to a client window after tiling it, so the
+; client learns its final geometry. Without this, GTK/Qt/Firefox render
+; at the wrong size or never settle. Also used for WM_PROTOCOLS messages
+; (WM_DELETE_WINDOW), _NET_WM_STATE changes, etc.
+;
+; We route the event to the client that OWNS the destination window. No
+; per-window owner field is needed: the per-client rid_base means a
+; window XID encodes its creator's slot directly —
+;   slot = (xid - X_RID_BASE) >> 21
+; (X_RID_BASE = 0x400000, each client's range is 0x200000 = 1<<21 wide).
+; ============================================================================
+
+; ----------------------------------------------------------------------------
+; handle_send_event — rsi = req ptr.
+;   +1 propagate (BOOL)   +4 destination (WINDOW)
+;   +8 event-mask (CARD32)   +12 event (32 bytes)
+;
+; Delivers the 32-byte event to the destination window's owning client,
+; with the synthetic bit (0x80) set in the event code (per spec). For a
+; destination of root, routes to root's redirect owner (the WM) if set.
+; No reply.
+; ----------------------------------------------------------------------------
+handle_send_event:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rsi                             ; req ptr
+    mov r12d, [rbx + 4]                       ; destination window
+
+    ; Resolve the recipient client slot.
+    cmp r12d, X_RID_BASE
+    jb .se_maybe_root                        ; below client XID range
+    mov eax, r12d
+    sub eax, X_RID_BASE
+    shr eax, 21                               ; slot = (xid - base) >> 21
+    cmp eax, MAX_CLIENTS
+    jae .se_done
+    mov r13d, eax
+    jmp .se_have_slot
+
+.se_maybe_root:
+    ; Destination is root (or pointer/focus, which we don't track). If
+    ; root has a redirect owner (the WM), deliver there; else drop.
+    cmp r12d, X_ROOT_WINDOW
+    jne .se_done
+    mov edi, X_ROOT_WINDOW
+    call window_lookup
+    test rax, rax
+    jz .se_done
+    movsx eax, byte [rax + 30]                ; root.redirect_owner
+    cmp eax, 0
+    jl .se_done
+    mov r13d, eax
+
+.se_have_slot:
+    ; Validate the client slot is live (fd != -1).
+    mov eax, r13d
+    call client_meta_addr
+    mov r13, rax                             ; meta ptr
+    mov eax, [r13]                            ; fd
+    cmp eax, -1
+    je .se_done
+
+    ; Build the outgoing 32-byte event in reply_buf: copy from req+12,
+    ; set the synthetic bit (0x80) in the code byte.
+    lea rdi, [reply_buf]
+    lea rsi, [rbx + 12]
+    mov ecx, 4
+.se_copy:
+    mov rax, [rsi]
+    mov [rdi], rax
+    add rsi, 8
+    add rdi, 8
+    dec ecx
+    jnz .se_copy
+    or byte [reply_buf], 0x80                 ; mark as SendEvent-synthetic
+    ; Stamp the recipient's current sequence number into bytes 2-3.
+    ; libxcb tracks sequences and aborts ("unknown sequence number") if a
+    ; delivered event carries a stale/zero seq.
+    mov ecx, [r13 + 8]                         ; recipient client's seq
+    mov [reply_buf + 2], cx
+
+    ; Write the event to the recipient's fd.
+    mov edi, [r13]                            ; fd
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+.se_done:
     pop r13
     pop r12
     pop rbx
