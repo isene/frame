@@ -3156,6 +3156,10 @@ dispatch_request:
     je .dr_get_window_attributes
     cmp eax, 25
     je .dr_send_event
+    cmp eax, 23
+    je .dr_get_selection_owner
+    cmp eax, 47
+    je .dr_query_font
     cmp eax, 4
     je .dr_destroy_window
     cmp eax, 7
@@ -3413,6 +3417,16 @@ dispatch_request:
 .dr_send_event:
     mov rsi, r12
     call handle_send_event
+    jmp .dr_done
+
+.dr_get_selection_owner:
+    mov edi, ebx
+    call handle_get_selection_owner
+    jmp .dr_done
+
+.dr_query_font:
+    mov edi, ebx
+    call handle_query_font
     jmp .dr_done
 
 .dr_create_window:
@@ -9595,5 +9609,88 @@ render_composite:
     pop r14
     pop r13
     pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; handle_get_selection_owner — edi = slot. GetSelectionOwner (opcode 23).
+; Replies owner = None (0): we don't track selections yet. glass queries
+; this during init and BLOCKS on the reply, so it must be answered.
+; ----------------------------------------------------------------------------
+handle_get_selection_owner:
+    push rbx
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1                     ; reply
+    mov byte [rdi + 1], 0
+    mov ecx, [rax + 8]                        ; seq
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 0                    ; length
+    mov dword [rdi + 8], 0                    ; owner = None
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+    mov edi, [rax]                            ; fd
+    push rax
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+    pop rax
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; handle_query_font — edi = slot. QueryFont (opcode 47).
+; Replies a minimal but structurally-exact fixed-width font reply (no
+; per-char CHARINFOs, no properties → reply length 7, 60 bytes total).
+; Clients that use a core font (e.g. glass) read max-bounds char-width
+; (offset 28), font-ascent (52), font-descent (54) and drain 32+len*4
+; bytes — so the length field MUST be exact or the socket desyncs.
+; Uniform metrics: width 6, ascent 11, descent 2 (≈ -misc-fixed-13).
+; ----------------------------------------------------------------------------
+handle_query_font:
+    push rbx
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr
+    push rax                                   ; meta
+    ; zero 60 bytes
+    lea rdi, [reply_buf]
+    xor eax, eax
+    mov ecx, 8
+    rep stosq                                  ; 64 bytes (covers 60)
+    pop rax                                     ; meta
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1                       ; reply
+    mov ecx, [rax + 8]                          ; seq
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 7                       ; reply length = 7 + 2n + 3m, n=m=0
+    ; min-bounds CHARINFO @8: width@12, ascent@14, descent@16
+    mov word [rdi + 12], 6
+    mov word [rdi + 14], 11
+    mov word [rdi + 16], 2
+    ; max-bounds CHARINFO @24: width@28, ascent@30, descent@32
+    mov word [rdi + 28], 6
+    mov word [rdi + 30], 11
+    mov word [rdi + 32], 2
+    ; min-char-or-byte2 @40 = 0 ; max-char-or-byte2 @42 = 255
+    mov word [rdi + 42], 255
+    ; default-char @44 = 0 ; nFontProps @46 = 0
+    ; draw-direction @48 = 0 ; min-byte1 @49 = 0 ; max-byte1 @50 = 255
+    mov byte [rdi + 50], 255
+    mov byte [rdi + 51], 1                       ; all-chars-exist
+    mov word [rdi + 52], 11                      ; font-ascent
+    mov word [rdi + 54], 2                       ; font-descent
+    ; nCharInfos @56 = 0
+    mov edi, [rax]                               ; fd
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 60
+    syscall
     pop rbx
     ret
