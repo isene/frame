@@ -6100,6 +6100,23 @@ dispatch_input_event:
     mov [mod_state], ecx
 
 .die_check_grab:
+    ; Zap: Ctrl+Alt+Backspace (evdev keycode 14) on press → clean exit
+    ; (restore console + drop DRM master). The traditional X server quit
+    ; combo; gives the user a way out when frame is grabbing all evdev
+    ; input and the launching tty can't be used to stop it.
+    cmp r13d, 1
+    jne .die_nozap
+    cmp r12d, 14
+    jne .die_nozap
+    movzx eax, byte [mod_state]
+    and eax, MOD_CONTROL | MOD_MOD1
+    cmp eax, MOD_CONTROL | MOD_MOD1
+    jne .die_nozap
+    call compositor_shutdown
+    mov rax, SYS_EXIT
+    xor edi, edi
+    syscall
+.die_nozap:
     ; x11_keycode = evdev_code + 8 (kept in r12d from here on).
     add r12d, 8
 
