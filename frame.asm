@@ -419,6 +419,9 @@ input_fds:          resd MAX_INPUTS
 input_fd_count:     resd 1
 mod_state:          resd 1
 focus_window:       resd 1               ; SetInputFocus target (0/1 = none/PointerRoot)
+screen_w:           resd 1               ; advertised screen size; defaults to
+screen_h:           resd 1               ; X_SCREEN_W/H, overwritten by the real
+                                         ; DRM mode in init_compositor (--display)
 
 ; ---- ConfigureWindow / ChangeWindowAttributes value-mask bits -------------
 ; (numeric defines used by the handlers; not in BSS)
@@ -1140,8 +1143,10 @@ emit_setup_reply:
     mov dword [rdi + 8],  0x00FFFFFF     ; white pixel
     mov dword [rdi + 12], 0x00000000     ; black pixel
     mov dword [rdi + 16], 0              ; current input masks (we tell clients later)
-    mov word  [rdi + 20], X_SCREEN_W
-    mov word  [rdi + 22], X_SCREEN_H
+    mov ax, [screen_w]                   ; real panel size (set by init_compositor)
+    mov word  [rdi + 20], ax
+    mov ax, [screen_h]
+    mov word  [rdi + 22], ax
     mov word  [rdi + 24], X_SCREEN_W_MM
     mov word  [rdi + 26], X_SCREEN_H_MM
     mov word  [rdi + 28], 1              ; min installed maps
@@ -4610,8 +4615,14 @@ init_windows:
     mov dword [rbx + 4],  0                  ; root's parent = None
     mov word  [rbx + 8],  0                  ; x
     mov word  [rbx + 10], 0                  ; y
-    mov word  [rbx + 12], X_SCREEN_W
-    mov word  [rbx + 14], X_SCREEN_H
+    ; Default the runtime screen size; init_compositor overwrites it (and
+    ; this root width/height) with the real DRM mode when --display engages.
+    mov dword [screen_w], X_SCREEN_W
+    mov dword [screen_h], X_SCREEN_H
+    mov ax, [screen_w]
+    mov word  [rbx + 12], ax
+    mov ax, [screen_h]
+    mov word  [rbx + 14], ax
     mov word  [rbx + 16], 0                  ; border-width
     mov byte  [rbx + 18], 24                 ; depth
     mov byte  [rbx + 19], 1                  ; class = InputOutput
@@ -6764,8 +6775,15 @@ init_compositor:
     rep stosq
     movzx eax, word [drm_modes_buf + 4]      ; hdisplay
     mov [drm_dumb_create + 4], eax
+    ; Advertise the REAL panel width to X clients (setup reply + root window
+    ; record slot 0), so the WM sizes windows to the full panel instead of
+    ; the hardcoded X_SCREEN_W/H default. Root rec width is at windows+12.
+    mov [screen_w], eax
+    mov word [windows + 12], ax
     movzx eax, word [drm_modes_buf + 14]     ; vdisplay
     mov [drm_dumb_create + 0], eax
+    mov [screen_h], eax
+    mov word [windows + 14], ax
     mov dword [drm_dumb_create + 8], 32
     mov dword [drm_dumb_create + 12], 0
     mov rax, SYS_IOCTL
