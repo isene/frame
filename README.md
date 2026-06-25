@@ -22,6 +22,14 @@ software-rendered, all on a stack written end-to-end in asm.
 
 <br clear="left"/>
 
+![pointer (the Fe2O3 file manager) running in glass on frame](img/pointer-on-frame.jpg)
+
+*The whole stack, end to end in assembly: [pointer](https://github.com/isene/pointer)
+(a Rust TUI file manager) running inside [glass](https://github.com/isene/glass)
+(the asm terminal) on **frame** (the asm X server), shown on the laptop's
+panel via DRM/KMS — two-pane layout, syntax-highlighted preview, colour,
+keyboard-driven. No libc, no Xlib, no Mesa anywhere in the path.*
+
 ## Status: phase 4 of 14 (core protocol + compositor + drawing)
 
 | # | Phase | Status |
