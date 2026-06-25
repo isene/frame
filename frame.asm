@@ -363,7 +363,6 @@ co_dst_ptr:         resq 1
 co_dst_stride:      resd 1
 co_dst_h:           resd 1
 ag_log_count:       resd 1               ; debug: limit AddGlyphs dumps
-key_log_count:      resd 1               ; debug: limit key-delivery dumps
 
 ; ---- Phase 4c property table ----------------------------------------------
 ; properties[1024] — flat list of (window, atom) → value records. xid = 0
@@ -560,10 +559,6 @@ dbg_sp:             db " "
 dbg_dump_tag:       db "DUMP xid/w/h/nonbg: "
 dbg_dump_tag_len    equ $ - dbg_dump_tag
 dump_path:          db "/tmp/frame_win.raw", 0
-dbg_sif:            db "frame: SetInputFocus win="
-dbg_sif_len         equ $ - dbg_sif
-dbg_key:            db "frame: key->win="
-dbg_key_len         equ $ - dbg_key
 log_atom_new:       db "  intern-atom new id=", 0
 log_atom_new_len   equ $ - log_atom_new - 1
 log_atom_known:     db "  intern-atom known id=", 0
@@ -4956,6 +4951,13 @@ handle_map_window:
     test rax, rax
     jz .mw_just_map
     mov r13, rax                              ; parent record
+    ; Override-redirect windows bypass SubstructureRedirect entirely —
+    ; the server maps them directly and NEVER sends the WM a MapRequest
+    ; (X11 semantics). strip's status bar is such a window; redirecting it
+    ; to tile wedged tile's map-handling. Still falls through to .mw_just_map
+    ; which sends MapNotify (carrying override-redirect=1) to SubNotify subs.
+    cmp byte [r12 + 29], 0                     ; window override-redirect?
+    jne .mw_just_map
     movsx r14d, byte [r13 + 30]               ; redirect_owner
     cmp r14d, 0
     jl .mw_just_map
@@ -6169,17 +6171,6 @@ dispatch_input_event:
 handle_set_input_focus:
     mov eax, [rsi + 4]
     mov [focus_window], eax
-    ; DEBUG: log the focus target.
-    push rsi
-    mov rsi, dbg_sif
-    mov edx, dbg_sif_len
-    call write_stderr
-    mov eax, [focus_window]
-    call write_u64_stderr
-    lea rsi, [probe_conn_nl]
-    mov rdx, 1
-    call write_stderr
-    pop rsi
     ret
 
 ; ----------------------------------------------------------------------------
@@ -6244,22 +6235,6 @@ deliver_to_focus:
     jz .dtf_done
     mov ebx, eax
 .dtf_have:
-    ; DEBUG: log key target window (gated).
-    mov eax, [key_log_count]
-    cmp eax, 40
-    jge .dtf_nolog
-    inc dword [key_log_count]
-    push rbx
-    mov rsi, dbg_key
-    mov edx, dbg_key_len
-    call write_stderr
-    mov eax, ebx
-    call write_u64_stderr
-    lea rsi, [probe_conn_nl]
-    mov rdx, 1
-    call write_stderr
-    pop rbx
-.dtf_nolog:
     ; owner slot = (xid - X_RID_BASE) >> 21
     mov eax, ebx
     cmp eax, X_RID_BASE
