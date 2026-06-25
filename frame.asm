@@ -418,6 +418,7 @@ active_kbd_window:  resd 1
 input_fds:          resd MAX_INPUTS
 input_fd_count:     resd 1
 mod_state:          resd 1
+focus_window:       resd 1               ; SetInputFocus target (0/1 = none/PointerRoot)
 
 ; ---- ConfigureWindow / ChangeWindowAttributes value-mask bits -------------
 ; (numeric defines used by the handlers; not in BSS)
@@ -3222,6 +3223,8 @@ dispatch_request:
     je .dr_get_property
     cmp eax, 21
     je .dr_list_properties
+    cmp eax, 42
+    je .dr_set_input_focus
     cmp eax, 43
     je .dr_get_input_focus
     cmp eax, 55
@@ -3365,6 +3368,11 @@ dispatch_request:
 .dr_query_tree:
     mov edi, ebx
     call handle_query_tree
+    jmp .dr_done
+
+.dr_set_input_focus:
+    mov rsi, r12
+    call handle_set_input_focus
     jmp .dr_done
 
 .dr_get_input_focus:
@@ -6092,32 +6100,132 @@ dispatch_input_event:
     mov [mod_state], ecx
 
 .die_check_grab:
-    ; Only fire on press (value=1) for the grab check.
+    ; x11_keycode = evdev_code + 8 (kept in r12d from here on).
+    add r12d, 8
+
+    ; Release (value 0) → KeyRelease to the focused window.
+    cmp r13d, 0
+    je .die_release
+    ; Repeat (value 2) → KeyPress to the focused window (no grab re-fire).
     cmp r13d, 1
-    jne .die_done
+    jne .die_focus_press
 
-    ; x11_keycode = evdev_code + 8.
-    mov eax, r12d
-    add eax, 8
-
-    ; Find a matching grab.
-    push rax                                  ; save x11_keycode
-    mov edi, eax
+    ; Fresh press: a matching key-grab wins (WM hotkeys); else focus.
+    mov edi, r12d
     movzx esi, byte [mod_state]
     call find_key_grab
-    pop rdx                                   ; rdx = x11_keycode
     test rax, rax
-    jz .die_done                              ; no grab — drop
-
-    ; rax = grab record ptr. Send KeyPress to its client.
-    mov ebx, [rax + 0]                       ; window
-    mov edi, [rax + 4]                       ; client slot
-    mov esi, edx                              ; keycode
+    jz .die_focus_press
+    mov edi, [rax + 4]                       ; grab client slot
+    mov esi, r12d                            ; keycode
     movzx ecx, byte [mod_state]
-    mov edx, ebx                             ; window
+    mov edx, [rax + 0]                       ; grab window
+    mov r8d, 2                               ; KeyPress
     call send_key_press
+    jmp .die_done
+
+.die_focus_press:
+    mov esi, r12d
+    mov r8d, 2                               ; KeyPress
+    call deliver_to_focus
+    jmp .die_done
+.die_release:
+    mov esi, r12d
+    mov r8d, 3                               ; KeyRelease
+    call deliver_to_focus
 
 .die_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; handle_set_input_focus — rsi = req ptr (+4 focus window). Records the
+; focus target so key events route there.
+; ----------------------------------------------------------------------------
+handle_set_input_focus:
+    mov eax, [rsi + 4]
+    mov [focus_window], eax
+    ret
+
+; ----------------------------------------------------------------------------
+; first_mapped_window — returns the xid of the first mapped non-root window
+; in eax, or 0. Used as the default key target when no focus is set (no WM).
+; ----------------------------------------------------------------------------
+first_mapped_window:
+    push rbx
+    xor ebx, ebx
+.fmw_loop:
+    cmp ebx, MAX_WINDOWS
+    jge .fmw_none
+    mov rax, rbx
+    imul rax, WINDOW_REC_SIZE
+    lea rax, [windows + rax]
+    mov edx, [rax]
+    test edx, edx
+    jz .fmw_next
+    cmp edx, X_ROOT_WINDOW
+    je .fmw_next
+    cmp byte [rax + 28], 0                    ; mapped?
+    je .fmw_next
+    mov eax, edx                              ; xid
+    pop rbx
+    ret
+.fmw_next:
+    inc ebx
+    jmp .fmw_loop
+.fmw_none:
+    xor eax, eax
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; deliver_to_focus — esi = x11 keycode, r8d = event code (2/3). Routes the
+; key event to the focused window's client (or the first mapped window when
+; focus is None/PointerRoot or stale). No-op if no suitable window.
+; ----------------------------------------------------------------------------
+deliver_to_focus:
+    push rbx
+    push r12
+    push r13
+    mov r12d, esi                            ; keycode
+    mov r13d, r8d                            ; event code
+    ; Pick the target window.
+    mov eax, [focus_window]
+    cmp eax, 1                               ; 0=None, 1=PointerRoot
+    jbe .dtf_default
+    mov edi, eax
+    push rax
+    call window_lookup
+    pop rcx
+    test rax, rax
+    jz .dtf_default
+    cmp byte [rax + 28], 0                    ; mapped?
+    je .dtf_default
+    mov ebx, ecx                              ; target xid
+    jmp .dtf_have
+.dtf_default:
+    call first_mapped_window
+    test eax, eax
+    jz .dtf_done
+    mov ebx, eax
+.dtf_have:
+    ; owner slot = (xid - X_RID_BASE) >> 21
+    mov eax, ebx
+    cmp eax, X_RID_BASE
+    jb .dtf_done
+    sub eax, X_RID_BASE
+    shr eax, 21
+    cmp eax, MAX_CLIENTS
+    jae .dtf_done
+    mov edi, eax                              ; client slot
+    mov esi, r12d                             ; keycode
+    movzx ecx, byte [mod_state]
+    mov edx, ebx                              ; window
+    mov r8d, r13d                             ; event code
+    call send_key_press
+.dtf_done:
     pop r13
     pop r12
     pop rbx
@@ -6164,23 +6272,25 @@ find_key_grab:
 
 ; ----------------------------------------------------------------------------
 ; send_key_press — edi = client slot, esi = x11 keycode, ecx = mod
-; state, edx = grab_window. Emits a 32-byte KeyPress event on the
-; client's fd.
+; state, edx = window, r8d = event code (2 = KeyPress, 3 = KeyRelease).
+; Emits a 32-byte key event on the client's fd.
 ; ----------------------------------------------------------------------------
 send_key_press:
     push rbx
     push r12
     push r13
+    push r14
     mov ebx, edi
     mov r12d, esi
     mov r13d, edx
+    mov r14d, r8d                             ; event code
     push rcx                                  ; mod_state on stack
     mov eax, ebx
     call client_meta_addr
     mov rdi, rax                              ; meta ptr
 
     lea rsi, [reply_buf]
-    mov byte [rsi + 0], 2                     ; KeyPress
+    mov [rsi + 0], r14b                       ; KeyPress (2) / KeyRelease (3)
     mov [rsi + 1], r12b                       ; detail (keycode)
     mov eax, [rdi + 8]
     mov [rsi + 2], ax                         ; seq (client's last)
@@ -6199,6 +6309,7 @@ send_key_press:
     mov rax, SYS_WRITE
     mov rdx, 32
     syscall
+    pop r14
     pop r13
     pop r12
     pop rbx
