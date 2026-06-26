@@ -422,6 +422,10 @@ focus_window:       resd 1               ; SetInputFocus target (0/1 = none/Poin
 screen_w:           resd 1               ; advertised screen size; defaults to
 screen_h:           resd 1               ; X_SCREEN_W/H, overwritten by the real
                                          ; DRM mode in init_compositor (--display)
+cursor_x:           resd 1               ; pointer position (root coords),
+cursor_y:           resd 1               ; updated by evdev REL motion
+button_state:       resd 1               ; held-button mask for event 'state'
+                                         ; (Button1Mask 0x100, 2 0x200, 3 0x400)
 
 ; ---- ConfigureWindow / ChangeWindowAttributes value-mask bits -------------
 ; (numeric defines used by the handlers; not in BSS)
@@ -4623,6 +4627,13 @@ init_windows:
     mov word  [rbx + 12], ax
     mov ax, [screen_h]
     mov word  [rbx + 14], ax
+    ; Centre the pointer (re-centred on the real size in init_compositor).
+    mov eax, X_SCREEN_W
+    shr eax, 1
+    mov [cursor_x], eax
+    mov eax, X_SCREEN_H
+    shr eax, 1
+    mov [cursor_y], eax
     mov word  [rbx + 16], 0                  ; border-width
     mov byte  [rbx + 18], 24                 ; depth
     mov byte  [rbx + 19], 1                  ; class = InputOutput
@@ -6066,11 +6077,17 @@ dispatch_input_event:
     push r13
     mov rbx, rdi
     movzx eax, word [rbx + 16]               ; type
+    cmp eax, EV_REL
+    je .die_rel                              ; pointer motion / wheel
     cmp eax, EV_KEY
     jne .die_done
 
-    movzx r12d, word [rbx + 18]              ; code (evdev keycode)
+    movzx r12d, word [rbx + 18]              ; code (evdev keycode / BTN_*)
     mov r13d, [rbx + 20]                     ; value (0=rel,1=press,2=repeat)
+
+    ; Mouse buttons (code >= 0x100) are pointer events, not keyboard.
+    cmp r12d, 0x100
+    jae .die_button
 
     ; If modifier key: adjust mod_state. (Key repeats don't toggle.)
     cmp r12d, 29
@@ -6168,8 +6185,281 @@ dispatch_input_event:
     mov esi, r12d
     mov r8d, 3                               ; KeyRelease
     call deliver_to_focus
+    jmp .die_done
+
+    ; --- Pointer motion / wheel (EV_REL) ----------------------------------
+.die_rel:
+    movzx ecx, word [rbx + 18]               ; REL code
+    movsxd rdx, dword [rbx + 20]             ; delta (signed)
+    test ecx, ecx                            ; REL_X = 0
+    je .die_rel_x
+    cmp ecx, 1                               ; REL_Y
+    je .die_rel_y
+    cmp ecx, 8                               ; REL_WHEEL
+    je .die_wheel
+    jmp .die_done
+.die_rel_x:
+    mov eax, [cursor_x]
+    add eax, edx
+    jns .die_rx_hi
+    xor eax, eax
+.die_rx_hi:
+    mov ecx, [screen_w]
+    dec ecx
+    cmp eax, ecx
+    cmovg eax, ecx
+    mov [cursor_x], eax
+    jmp .die_motion
+.die_rel_y:
+    mov eax, [cursor_y]
+    add eax, edx
+    jns .die_ry_hi
+    xor eax, eax
+.die_ry_hi:
+    mov ecx, [screen_h]
+    dec ecx
+    cmp eax, ecx
+    cmovg eax, ecx
+    mov [cursor_y], eax
+.die_motion:
+    call deliver_pointer_motion
+    jmp .die_done
+.die_wheel:
+    test edx, edx
+    jz .die_done
+    mov r12d, 4                              ; wheel up → button 4
+    jns .die_wheel_send
+    mov r12d, 5                              ; wheel down → button 5
+.die_wheel_send:
+    mov edi, 4                               ; ButtonPress
+    mov esi, r12d
+    call deliver_pointer_button
+    mov edi, 5                               ; ButtonRelease
+    mov esi, r12d
+    call deliver_pointer_button
+    jmp .die_done
+
+    ; --- Mouse buttons (EV_KEY, code >= 0x100) ----------------------------
+.die_button:
+    ; Map BTN_LEFT(0x110)->1, BTN_MIDDLE(0x112)->2, BTN_RIGHT(0x111)->3.
+    mov esi, 1
+    cmp r12d, 0x111
+    je .die_btn_right
+    cmp r12d, 0x112
+    je .die_btn_middle
+    jmp .die_btn_have
+.die_btn_right:
+    mov esi, 3
+    jmp .die_btn_have
+.die_btn_middle:
+    mov esi, 2
+.die_btn_have:
+    ; Send first (so 'state' reflects pre-event mask), then update the mask.
+    test r13d, r13d
+    jz .die_btn_release
+    mov edi, 4                               ; ButtonPress
+    push rsi
+    call deliver_pointer_button
+    pop rsi
+    mov ecx, esi
+    dec ecx
+    mov eax, 0x100
+    shl eax, cl
+    or [button_state], eax
+    jmp .die_done
+.die_btn_release:
+    mov edi, 5                               ; ButtonRelease
+    push rsi
+    call deliver_pointer_button
+    pop rsi
+    mov ecx, esi
+    dec ecx
+    mov eax, 0x100
+    shl eax, cl
+    not eax
+    and [button_state], eax
+    jmp .die_done
 
 .die_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; window_at_point — topmost mapped non-root window whose geometry contains
+; (cursor_x, cursor_y). Returns its record ptr in rax, or 0 (over root).
+; Last match in table order wins (≈ most-recently-created on top).
+; ----------------------------------------------------------------------------
+window_at_point:
+    push rbx
+    mov r10d, [cursor_x]
+    mov r11d, [cursor_y]
+    xor ebx, ebx
+    xor eax, eax                             ; best = none
+.wap_loop:
+    cmp ebx, MAX_WINDOWS
+    jge .wap_done
+    mov r8, rbx
+    imul r8, WINDOW_REC_SIZE
+    lea r8, [windows + r8]
+    mov r9d, [r8]                            ; xid
+    test r9d, r9d
+    jz .wap_next
+    cmp r9d, X_ROOT_WINDOW
+    je .wap_next
+    cmp byte [r8 + 28], 0                     ; mapped?
+    je .wap_next
+    movsx r9d, word [r8 + 8]                  ; win x
+    cmp r10d, r9d
+    jl .wap_next
+    movzx ecx, word [r8 + 12]                 ; win w
+    add r9d, ecx
+    cmp r10d, r9d
+    jge .wap_next
+    movsx r9d, word [r8 + 10]                 ; win y
+    cmp r11d, r9d
+    jl .wap_next
+    movzx ecx, word [r8 + 14]                 ; win h
+    add r9d, ecx
+    cmp r11d, r9d
+    jge .wap_next
+    mov rax, r8                               ; match
+.wap_next:
+    inc ebx
+    jmp .wap_loop
+.wap_done:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; deliver_pointer_motion — send MotionNotify to the window under the cursor
+; if it selected PointerMotionMask (0x40). No-op otherwise.
+; ----------------------------------------------------------------------------
+deliver_pointer_motion:
+    push rbx
+    call window_at_point
+    test rax, rax
+    jz .dpm_done
+    mov rbx, rax
+    test dword [rbx + 24], 0x40              ; PointerMotionMask
+    jz .dpm_done
+    mov eax, [rbx]                           ; xid → owner slot
+    cmp eax, X_RID_BASE
+    jb .dpm_done
+    sub eax, X_RID_BASE
+    shr eax, 21
+    cmp eax, MAX_CLIENTS
+    jae .dpm_done
+    mov edi, eax                             ; slot
+    mov esi, 6                               ; MotionNotify
+    xor edx, edx                             ; detail 0
+    mov ecx, [rbx]                           ; window
+    mov r8d, [cursor_x]
+    movsx r9d, word [rbx + 8]
+    sub r8d, r9d                             ; event-x
+    mov r9d, [cursor_y]
+    movsx eax, word [rbx + 10]
+    sub r9d, eax                             ; event-y
+    call send_pointer_event
+.dpm_done:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; deliver_pointer_button — edi = event code (4 press / 5 release),
+; esi = button number (1/2/3/4/5). Sends to the window under the cursor if
+; it selected ButtonPress (0x04) / ButtonRelease (0x08).
+; ----------------------------------------------------------------------------
+deliver_pointer_button:
+    push rbx
+    push r12
+    push r13
+    mov r12d, edi                            ; code
+    mov r13d, esi                            ; button
+    call window_at_point
+    test rax, rax
+    jz .dpb_done
+    mov rbx, rax
+    mov ecx, 0x04                            ; ButtonPressMask
+    cmp r12d, 4
+    je .dpb_mask
+    mov ecx, 0x08                            ; ButtonReleaseMask
+.dpb_mask:
+    test [rbx + 24], ecx
+    jz .dpb_done
+    mov eax, [rbx]
+    cmp eax, X_RID_BASE
+    jb .dpb_done
+    sub eax, X_RID_BASE
+    shr eax, 21
+    cmp eax, MAX_CLIENTS
+    jae .dpb_done
+    mov edi, eax                             ; slot
+    mov esi, r12d                            ; code
+    mov edx, r13d                            ; detail = button
+    mov ecx, [rbx]                           ; window
+    mov r8d, [cursor_x]
+    movsx r9d, word [rbx + 8]
+    sub r8d, r9d
+    mov r9d, [cursor_y]
+    movsx eax, word [rbx + 10]
+    sub r9d, eax
+    call send_pointer_event
+.dpb_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; send_pointer_event — edi = client slot, esi = event code (4/5/6),
+; edx = detail (button# or 0), ecx = window xid, r8d = event-x, r9d = event-y.
+; Root coords come from cursor_x/y; state from button_state | mod_state.
+; ----------------------------------------------------------------------------
+send_pointer_event:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov ebx, edi                             ; slot
+    mov r12d, esi                            ; code
+    mov r13d, edx                            ; detail
+    mov r14d, ecx                            ; window
+    mov r15d, r8d                            ; event-x
+    push r9                                   ; event-y
+    mov eax, ebx
+    call client_meta_addr
+    mov rdi, rax                             ; meta ptr
+    lea rsi, [reply_buf]
+    mov [rsi + 0], r12b                      ; code
+    mov [rsi + 1], r13b                      ; detail
+    mov eax, [rdi + 8]
+    mov [rsi + 2], ax                        ; seq
+    mov dword [rsi + 4], 0                   ; time
+    mov dword [rsi + 8], X_ROOT_WINDOW
+    mov [rsi + 12], r14d                     ; event window
+    mov dword [rsi + 16], 0                  ; child
+    mov eax, [cursor_x]
+    mov [rsi + 20], ax                       ; root-x
+    mov eax, [cursor_y]
+    mov [rsi + 22], ax                       ; root-y
+    mov [rsi + 24], r15w                     ; event-x
+    pop rax                                   ; event-y
+    mov [rsi + 26], ax                       ; event-y
+    mov eax, [button_state]
+    movzx ecx, byte [mod_state]
+    or eax, ecx
+    mov [rsi + 28], ax                       ; state
+    mov byte [rsi + 30], 1                   ; same-screen
+    mov byte [rsi + 31], 0
+    mov edi, [rdi]                           ; client fd
+    mov rax, SYS_WRITE
+    mov rdx, 32
+    syscall
+    pop r15
+    pop r14
     pop r13
     pop r12
     pop rbx
@@ -6784,6 +7074,13 @@ init_compositor:
     mov [drm_dumb_create + 0], eax
     mov [screen_h], eax
     mov word [windows + 14], ax
+    ; Re-centre the pointer on the real panel size.
+    mov eax, [screen_w]
+    shr eax, 1
+    mov [cursor_x], eax
+    mov eax, [screen_h]
+    shr eax, 1
+    mov [cursor_y], eax
     mov dword [drm_dumb_create + 8], 32
     mov dword [drm_dumb_create + 12], 0
     mov rax, SYS_IOCTL
