@@ -433,6 +433,12 @@ abs_last_x:         resd 1               ; touchpad absolute-position anchor:
 abs_last_y:         resd 1               ; last seen ABS_X/Y; cursor moves by
 abs_have_x:         resd 1               ; the delta. *_have flags clear on each
 abs_have_y:         resd 1               ; new finger contact (BTN_TOUCH).
+finger_count:       resd 1               ; fingers down now (1 move, 2 scroll)
+tap_fingers:        resd 1               ; max fingers during the current touch
+tap_moved:          resd 1               ; summed |ABS delta| during the touch
+scroll_accum:       resd 1               ; two-finger Y accumulator → notches
+tap_sec:            resq 1               ; BTN_TOUCH-down time (for tap timing)
+tap_usec:           resq 1
 
 ; ---- ConfigureWindow / ChangeWindowAttributes value-mask bits -------------
 ; (numeric defines used by the handlers; not in BSS)
@@ -6277,9 +6283,17 @@ dispatch_input_event:
     jmp .die_done
 .die_abs_x_move:
     mov eax, edx
-    sub eax, [abs_last_x]                     ; delta
+    sub eax, [abs_last_x]                     ; delta (1x sensitivity)
     mov [abs_last_x], edx
-    lea eax, [eax + eax]                      ; x2 sensitivity
+    ; tap_moved += |delta|
+    mov r8d, eax
+    mov r9d, r8d
+    sar r9d, 31
+    xor r8d, r9d
+    sub r8d, r9d
+    add [tap_moved], r8d
+    cmp dword [finger_count], 2               ; 2+ fingers: no cursor X move
+    jge .die_done
     add eax, [cursor_x]
     jns .die_abs_x_hi
     xor eax, eax
@@ -6300,7 +6314,14 @@ dispatch_input_event:
     mov eax, edx
     sub eax, [abs_last_y]
     mov [abs_last_y], edx
-    lea eax, [eax + eax]
+    mov r8d, eax
+    mov r9d, r8d
+    sar r9d, 31
+    xor r8d, r9d
+    sub r8d, r9d
+    add [tap_moved], r8d
+    cmp dword [finger_count], 2               ; 2+ fingers: scroll, don't move
+    jge .die_scroll_y
     add eax, [cursor_y]
     jns .die_abs_y_hi
     xor eax, eax
@@ -6311,15 +6332,43 @@ dispatch_input_event:
     cmovg eax, ecx
     mov [cursor_y], eax
     jmp .die_motion
+    ; Two-finger vertical scroll: accumulate Y delta, emit a wheel notch
+    ; (button 5 down / 4 up) every SCROLL_NOTCH units.
+.die_scroll_y:
+    add [scroll_accum], eax
+.die_scroll_dn:
+    cmp dword [scroll_accum], 60
+    jl .die_scroll_up
+    sub dword [scroll_accum], 60
+    mov edi, 4
+    mov esi, 5
+    call deliver_pointer_button
+    mov edi, 5
+    mov esi, 5
+    call deliver_pointer_button
+    jmp .die_scroll_dn
+.die_scroll_up:
+    cmp dword [scroll_accum], -60
+    jg .die_done
+    add dword [scroll_accum], 60
+    mov edi, 4
+    mov esi, 4
+    call deliver_pointer_button
+    mov edi, 5
+    mov esi, 4
+    call deliver_pointer_button
+    jmp .die_scroll_up
 
     ; --- Mouse / touchpad buttons (EV_KEY, code >= 0x100) -----------------
 .die_button:
-    ; BTN_TOUCH (0x14a) = finger contact, not a click: reset the motion
-    ; anchor so the next stroke is relative to where it starts.
-    cmp r12d, 0x14a
+    cmp r12d, 0x14a                          ; BTN_TOUCH (finger contact)
     je .die_btn_touch
-    ; Real buttons only: BTN_LEFT(0x110)->1, MIDDLE(0x112)->2, RIGHT(0x111)->3.
-    ; Other BTN_* (BTN_TOOL_FINGER/DOUBLETAP/...) are ignored.
+    cmp r12d, 0x145                          ; BTN_TOOL_FINGER (1 finger)
+    je .die_tool_one
+    cmp r12d, 0x14d                          ; BTN_TOOL_DOUBLETAP (2 fingers)
+    je .die_tool_two
+    ; Real buttons: BTN_LEFT(0x110)->1, MIDDLE(0x112)->2, RIGHT(0x111)->3.
+    ; Other BTN_* (TRIPLETAP, etc.) ignored.
     cmp r12d, 0x110
     je .die_btn_left
     cmp r12d, 0x111
@@ -6327,9 +6376,61 @@ dispatch_input_event:
     cmp r12d, 0x112
     je .die_btn_middle
     jmp .die_done
-.die_btn_touch:
+
+.die_tool_one:
+    test r13d, r13d
+    jz .die_done
+    mov dword [finger_count], 1
+    mov dword [abs_have_x], 0                 ; re-anchor on finger-config change
+    mov dword [abs_have_y], 0
+    jmp .die_done
+.die_tool_two:
+    test r13d, r13d
+    jz .die_done
+    mov dword [finger_count], 2
+    mov dword [tap_fingers], 2                ; for two-finger tap = right-click
     mov dword [abs_have_x], 0
     mov dword [abs_have_y], 0
+    mov dword [scroll_accum], 0
+    jmp .die_done
+
+.die_btn_touch:
+    mov dword [abs_have_x], 0                 ; re-anchor motion on each contact
+    mov dword [abs_have_y], 0
+    test r13d, r13d
+    jz .die_touch_up
+    ; Finger down: start tap tracking (timestamp + movement reset).
+    mov rax, [rbx + 0]
+    mov [tap_sec], rax
+    mov rax, [rbx + 8]
+    mov [tap_usec], rax
+    mov dword [tap_moved], 0
+    mov dword [tap_fingers], 1
+    jmp .die_done
+.die_touch_up:
+    mov dword [finger_count], 0
+    ; Tap = quick (<250ms) release with little movement → synthesize a click.
+    mov rax, [rbx + 0]
+    sub rax, [tap_sec]
+    imul rax, rax, 1000000
+    mov rcx, [rbx + 8]
+    sub rcx, [tap_usec]
+    add rax, rcx                              ; elapsed microseconds
+    cmp rax, 250000
+    jg .die_done
+    cmp dword [tap_moved], 50
+    jae .die_done
+    mov esi, 1                                ; 1-finger tap → left button
+    cmp dword [tap_fingers], 2
+    jne .die_tap_emit
+    mov esi, 3                                ; 2-finger tap → right button
+.die_tap_emit:
+    mov edi, 4                                ; ButtonPress
+    push rsi
+    call deliver_pointer_button
+    pop rsi
+    mov edi, 5                                ; ButtonRelease
+    call deliver_pointer_button
     jmp .die_done
 .die_btn_left:
     mov esi, 1
