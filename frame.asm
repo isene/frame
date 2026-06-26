@@ -75,6 +75,9 @@ DEFAULT REL
 %define DRM_MODE_PAGE_FLIP_EVENT       0x01
 %define DRM_IOCTL_MODE_CREATE_DUMB     0xC02064B2
 %define DRM_IOCTL_MODE_MAP_DUMB        0xC01064B3
+%define DRM_IOCTL_MODE_CURSOR          0xC01C64A3   ; _IOWR('d',0xA3,28)
+%define DRM_MODE_CURSOR_BO             0x01
+%define DRM_MODE_CURSOR_MOVE           0x02
 %define DRM_IOCTL_MODE_DESTROY_DUMB    0xC00464B4
 
 %define SYS_POLL        7
@@ -475,6 +478,13 @@ drm_crtc_save:      resb 104            ; struct drm_mode_crtc (GETCRTC)
 drm_crtc_set:       resb 104            ; struct drm_mode_crtc (SETCRTC)
 drm_dumb_create:    resb 32             ; struct drm_mode_create_dumb
 drm_dumb_map:       resb 16             ; struct drm_mode_map_dumb
+; --- DRM hardware cursor (64x64 ARGB on its own plane) ---------------------
+cursor_ready:       resd 1              ; 1 once the cursor BO is set on the CRTC
+cursor_handle:      resd 1              ; cursor dumb-BO handle
+cursor_fb_addr:     resq 1              ; mmap'd cursor pixels
+drm_cursor_create:  resb 32             ; CREATE_DUMB for the cursor BO
+drm_cursor_map:     resb 16             ; MAP_DUMB for the cursor BO
+drm_cursor:         resb 28             ; struct drm_mode_cursor (set + move)
 drm_dumb_destroy:   resb 8              ; struct drm_mode_destroy_dumb (+pad)
 drm_fb_cmd:         resb 28             ; struct drm_mode_fb_cmd
 drm_set_conn_id:    resd 1              ; connector ID array (just one)
@@ -6222,6 +6232,7 @@ dispatch_input_event:
     cmovg eax, ecx
     mov [cursor_y], eax
 .die_motion:
+    call cursor_move_hw                      ; move the sprite (one cheap ioctl)
     call deliver_pointer_motion
     jmp .die_done
 .die_wheel:
@@ -7298,6 +7309,9 @@ init_compositor:
 
     mov byte [compositor_active], 1
 
+    ; Bring up the hardware cursor sprite (non-fatal if unsupported).
+    call init_hw_cursor
+
     ; Install SIGINT / SIGTERM / SIGHUP handlers so Ctrl+C (or kill)
     ; restores the console cleanly instead of leaving a black panel.
     mov edi, SIGINT
@@ -7366,6 +7380,158 @@ init_compositor:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; init_hw_cursor — create a 64x64 ARGB cursor BO, draw an arrow into it, and
+; set it on the CRTC via the DRM cursor plane. Non-fatal on failure (leaves
+; cursor_ready=0; pointer events still work, just no visible sprite).
+; ----------------------------------------------------------------------------
+init_hw_cursor:
+    push rbx
+    ; CREATE_DUMB 64x64x32
+    lea rdi, [drm_cursor_create]
+    xor eax, eax
+    mov ecx, 4
+    rep stosq
+    mov dword [drm_cursor_create + 0], 64    ; height
+    mov dword [drm_cursor_create + 4], 64    ; width
+    mov dword [drm_cursor_create + 8], 32    ; bpp
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_CREATE_DUMB
+    lea rdx, [drm_cursor_create]
+    syscall
+    test rax, rax
+    js .ihc_fail
+    mov eax, [drm_cursor_create + 16]        ; handle
+    mov [cursor_handle], eax
+    ; MAP_DUMB
+    lea rdi, [drm_cursor_map]
+    xor eax, eax
+    mov ecx, 2
+    rep stosq
+    mov eax, [cursor_handle]
+    mov [drm_cursor_map + 0], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_MAP_DUMB
+    lea rdx, [drm_cursor_map]
+    syscall
+    test rax, rax
+    js .ihc_fail
+    ; mmap the BO: size = pitch * 64
+    mov eax, [drm_cursor_create + 20]        ; pitch
+    shl eax, 6                               ; * 64
+    xor edi, edi
+    mov esi, eax                             ; length
+    mov edx, PROT_RW
+    mov r10d, MAP_SHARED
+    mov r8, [drm_fd]
+    mov r9, [drm_cursor_map + 8]             ; offset
+    mov rax, SYS_MMAP
+    syscall
+    cmp rax, -4096
+    ja .ihc_fail
+    mov [cursor_fb_addr], rax
+    call draw_cursor_arrow
+    ; CURSOR ioctl — set the BO.
+    lea rdi, [drm_cursor]
+    xor eax, eax
+    mov ecx, 7
+    rep stosd
+    mov dword [drm_cursor + 0], DRM_MODE_CURSOR_BO
+    mov eax, [drm_chosen_crtc]
+    mov [drm_cursor + 4], eax                ; crtc_id
+    mov dword [drm_cursor + 16], 64          ; width
+    mov dword [drm_cursor + 20], 64          ; height
+    mov eax, [cursor_handle]
+    mov [drm_cursor + 24], eax               ; handle
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_CURSOR
+    lea rdx, [drm_cursor]
+    syscall
+    test rax, rax
+    js .ihc_fail
+    mov dword [cursor_ready], 1
+    call cursor_move_hw                      ; place at the centred start pos
+.ihc_fail:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; draw_cursor_arrow — paint a white arrow with a black outline (tip/hotspot
+; at 0,0) into the cursor BO. Background stays transparent (alpha 0).
+; ----------------------------------------------------------------------------
+draw_cursor_arrow:
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r15, [cursor_fb_addr]
+    mov r14d, [drm_cursor_create + 20]       ; pitch (bytes/row)
+    ; Zero the whole BO (transparent). dwords = pitch*64/4 = pitch*16.
+    mov rdi, r15
+    xor eax, eax
+    mov ecx, r14d
+    shl ecx, 4
+    rep stosd
+    xor r13d, r13d                           ; y
+.dca_row:
+    cmp r13d, 19                             ; ARROW_H
+    jge .dca_done
+    xor r12d, r12d                           ; x
+.dca_col:
+    cmp r12d, r13d                           ; while x <= y
+    jg .dca_row_next
+    mov eax, 0xFFFFFFFF                       ; white (opaque)
+    test r12d, r12d
+    jz .dca_black                            ; left edge
+    cmp r12d, r13d
+    je .dca_black                            ; diagonal edge
+    cmp r13d, 18                             ; bottom edge (ARROW_H-1)
+    je .dca_black
+    jmp .dca_plot
+.dca_black:
+    mov eax, 0xFF000000                       ; black (opaque)
+.dca_plot:
+    mov r8d, r13d
+    imul r8d, r14d                           ; y * pitch
+    lea r8, [r8 + r12*4]                     ; + x*4
+    mov [r15 + r8], eax
+    inc r12d
+    jmp .dca_col
+.dca_row_next:
+    inc r13d
+    jmp .dca_row
+.dca_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+; ----------------------------------------------------------------------------
+; cursor_move_hw — move the cursor sprite to (cursor_x, cursor_y) via one
+; CURSOR MOVE ioctl. No-op if the sprite isn't up (network-only).
+; ----------------------------------------------------------------------------
+cursor_move_hw:
+    cmp dword [cursor_ready], 0
+    je .cmh_done
+    mov dword [drm_cursor + 0], DRM_MODE_CURSOR_MOVE
+    mov eax, [drm_chosen_crtc]
+    mov [drm_cursor + 4], eax
+    mov eax, [cursor_x]
+    mov [drm_cursor + 8], eax                ; x
+    mov eax, [cursor_y]
+    mov [drm_cursor + 12], eax               ; y
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_CURSOR
+    lea rdx, [drm_cursor]
+    syscall
+.cmh_done:
     ret
 
 ; ----------------------------------------------------------------------------
