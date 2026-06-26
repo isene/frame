@@ -429,6 +429,10 @@ cursor_x:           resd 1               ; pointer position (root coords),
 cursor_y:           resd 1               ; updated by evdev REL motion
 button_state:       resd 1               ; held-button mask for event 'state'
                                          ; (Button1Mask 0x100, 2 0x200, 3 0x400)
+abs_last_x:         resd 1               ; touchpad absolute-position anchor:
+abs_last_y:         resd 1               ; last seen ABS_X/Y; cursor moves by
+abs_have_x:         resd 1               ; the delta. *_have flags clear on each
+abs_have_y:         resd 1               ; new finger contact (BTN_TOUCH).
 
 ; ---- ConfigureWindow / ChangeWindowAttributes value-mask bits -------------
 ; (numeric defines used by the handlers; not in BSS)
@@ -6088,7 +6092,9 @@ dispatch_input_event:
     mov rbx, rdi
     movzx eax, word [rbx + 16]               ; type
     cmp eax, EV_REL
-    je .die_rel                              ; pointer motion / wheel
+    je .die_rel                              ; mouse motion / wheel
+    cmp eax, EV_ABS
+    je .die_abs                              ; touchpad absolute motion
     cmp eax, EV_KEY
     jne .die_done
 
@@ -6250,14 +6256,83 @@ dispatch_input_event:
     call deliver_pointer_button
     jmp .die_done
 
-    ; --- Mouse buttons (EV_KEY, code >= 0x100) ----------------------------
+    ; --- Touchpad absolute motion (EV_ABS ABS_X/ABS_Y) --------------------
+    ; Precision touchpads report finger position absolutely, not as deltas.
+    ; Convert to relative cursor movement (delta from the last sample, x2 for
+    ; sensitivity). The anchor is reset on each new contact (BTN_TOUCH) so
+    ; lifting and re-placing a finger doesn't teleport the cursor.
+.die_abs:
+    movzx ecx, word [rbx + 18]               ; ABS code
+    mov edx, [rbx + 20]                      ; absolute value
+    test ecx, ecx                            ; ABS_X = 0
+    je .die_abs_x
+    cmp ecx, 1                               ; ABS_Y
+    je .die_abs_y
+    jmp .die_done                            ; ignore ABS_MT_* and others
+.die_abs_x:
+    cmp dword [abs_have_x], 0
+    jne .die_abs_x_move
+    mov [abs_last_x], edx                    ; first sample: anchor only
+    mov dword [abs_have_x], 1
+    jmp .die_done
+.die_abs_x_move:
+    mov eax, edx
+    sub eax, [abs_last_x]                     ; delta
+    mov [abs_last_x], edx
+    lea eax, [eax + eax]                      ; x2 sensitivity
+    add eax, [cursor_x]
+    jns .die_abs_x_hi
+    xor eax, eax
+.die_abs_x_hi:
+    mov ecx, [screen_w]
+    dec ecx
+    cmp eax, ecx
+    cmovg eax, ecx
+    mov [cursor_x], eax
+    jmp .die_motion
+.die_abs_y:
+    cmp dword [abs_have_y], 0
+    jne .die_abs_y_move
+    mov [abs_last_y], edx
+    mov dword [abs_have_y], 1
+    jmp .die_done
+.die_abs_y_move:
+    mov eax, edx
+    sub eax, [abs_last_y]
+    mov [abs_last_y], edx
+    lea eax, [eax + eax]
+    add eax, [cursor_y]
+    jns .die_abs_y_hi
+    xor eax, eax
+.die_abs_y_hi:
+    mov ecx, [screen_h]
+    dec ecx
+    cmp eax, ecx
+    cmovg eax, ecx
+    mov [cursor_y], eax
+    jmp .die_motion
+
+    ; --- Mouse / touchpad buttons (EV_KEY, code >= 0x100) -----------------
 .die_button:
-    ; Map BTN_LEFT(0x110)->1, BTN_MIDDLE(0x112)->2, BTN_RIGHT(0x111)->3.
-    mov esi, 1
+    ; BTN_TOUCH (0x14a) = finger contact, not a click: reset the motion
+    ; anchor so the next stroke is relative to where it starts.
+    cmp r12d, 0x14a
+    je .die_btn_touch
+    ; Real buttons only: BTN_LEFT(0x110)->1, MIDDLE(0x112)->2, RIGHT(0x111)->3.
+    ; Other BTN_* (BTN_TOOL_FINGER/DOUBLETAP/...) are ignored.
+    cmp r12d, 0x110
+    je .die_btn_left
     cmp r12d, 0x111
     je .die_btn_right
     cmp r12d, 0x112
     je .die_btn_middle
+    jmp .die_done
+.die_btn_touch:
+    mov dword [abs_have_x], 0
+    mov dword [abs_have_y], 0
+    jmp .die_done
+.die_btn_left:
+    mov esi, 1
     jmp .die_btn_have
 .die_btn_right:
     mov esi, 3
