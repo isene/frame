@@ -529,6 +529,9 @@ drm_event_buf:      resb 64                ; drain the flip-complete event
 ; ---- Phase 4f compositor state --------------------------------------------
 compositor_requested: resb 1               ; set by --display argv flag
 compositor_active:    resb 1               ; set to 1 after init_compositor wins
+comp_dirty:           resb 1               ; a draw happened; repaint once per
+                                           ; serve-loop cycle (coalesced) instead
+                                           ; of a full repaint + page-flip per req
 dirtyfb_logged:       resb 1               ; log DIRTYFB return code only once
 sig_sa_buf:           resb 32              ; kernel struct sigaction
 
@@ -2992,7 +2995,7 @@ serve_loop:
     xor ecx, ecx
 .sl_iw:
     cmp ecx, MAX_INPUTS
-    jge .sl_iter
+    jge .sl_flush
     mov eax, MAX_CLIENTS + 1
     add eax, ecx
     shl eax, 3
@@ -3008,6 +3011,17 @@ serve_loop:
 .sl_iw_next:
     inc ecx
     jmp .sl_iw
+
+.sl_flush:
+    ; Coalesced compositor repaint: at most ONE full repaint + page-flip per
+    ; poll cycle, after every ready client's whole request batch and all input
+    ; are drained. Drawing handlers set comp_dirty rather than repainting per
+    ; request — a client sending N draws/frame now costs 1 repaint, not N.
+    cmp byte [comp_dirty], 0
+    je .sl_iter
+    mov byte [comp_dirty], 0
+    call recomposite_screen
+    jmp .sl_iter
 
 ; ============================================================================
 ; client_process — read everything available on this client and drain
@@ -4965,7 +4979,7 @@ handle_destroy_window:
     mov ebx, edi
     mov edi, [rsi + 4]
     call window_destroy
-    call recomposite_screen
+    mov byte [comp_dirty], 1
     pop rbx
     ret
 
@@ -5019,7 +5033,7 @@ handle_map_window:
     jmp .mw_done
 .mw_just_map:
     mov byte [r12 + 28], 1
-    call recomposite_screen
+    mov byte [comp_dirty], 1
     ; If the window selected StructureNotify on ITSELF, send its own client
     ; MapNotify + ConfigureNotify (clients like glass wait for the latter
     ; before forking their shell / learning their geometry). Owner client
@@ -5081,7 +5095,7 @@ handle_unmap_window:
     jz .uw_done
     mov r12, rax
     mov byte [r12 + 28], 0
-    call recomposite_screen
+    mov byte [comp_dirty], 1
     mov edi, [r12 + 4]
     call window_lookup
     test rax, rax
@@ -5227,7 +5241,7 @@ handle_configure_window:
     mov qword [r13 + 32], 0
     mov dword [r13 + 40], 0
 .cfgw_recomp:
-    call recomposite_screen
+    mov byte [comp_dirty], 1
 .cfgw_done:
     pop r15
     pop r14
@@ -7531,7 +7545,7 @@ init_compositor:
     mov rdx, 1
     call write_stderr
 
-    call recomposite_screen
+    mov byte [comp_dirty], 1
     xor eax, eax
     pop r13
     pop r12
@@ -8383,7 +8397,7 @@ handle_poly_fill_rectangle:
     call window_lookup
     test rax, rax
     jz .pfr_ret
-    call recomposite_screen
+    mov byte [comp_dirty], 1
 .pfr_ret:
     add rsp, 16
     pop rbp
@@ -8586,7 +8600,7 @@ handle_put_image:
     call window_lookup
     test rax, rax
     jz .pi_ret
-    call recomposite_screen
+    mov byte [comp_dirty], 1
 .pi_ret:
     add rsp, 64
     pop rbp
@@ -8917,7 +8931,7 @@ handle_clear_area:
     movzx edx, word [r12 + 42]               ; backing_h
     mov r11d, [r12 + 44]                      ; back_pixel
     call fb_fill
-    call recomposite_screen
+    mov byte [comp_dirty], 1
 .ca_done:
     pop r13
     pop r12
@@ -9063,7 +9077,7 @@ handle_copy_area:
     call window_lookup
     test rax, rax
     jz .cpa_done
-    call recomposite_screen
+    mov byte [comp_dirty], 1
 .cpa_done:
     add rsp, 112
     pop rbp
@@ -9199,7 +9213,7 @@ handle_poly_rectangle:
     dec dword [rsp + 4]
     jmp .prr_loop
 .prr_recomp:
-    call recomposite_screen
+    mov byte [comp_dirty], 1
 .prr_done:
     add rsp, 16
     pop rbp
@@ -9677,7 +9691,7 @@ render_fill_rectangles:
     call window_lookup
     test rax, rax
     jz .rfr_done
-    call recomposite_screen
+    mov byte [comp_dirty], 1
 .rfr_done:
     add rsp, 16
     pop rbp
@@ -10264,7 +10278,7 @@ render_composite_glyphs:
     call window_lookup
     test rax, rax
     jz .cog_done
-    call recomposite_screen
+    mov byte [comp_dirty], 1
 .cog_done:
     add rsp, 16
     pop rbp
@@ -10467,7 +10481,7 @@ render_composite:
     call window_lookup
     test rax, rax
     jz .rc_done
-    call recomposite_screen
+    mov byte [comp_dirty], 1
 .rc_done:
     pop rbp
     pop r15
