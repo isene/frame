@@ -4936,9 +4936,15 @@ handle_change_window_attributes:
     mov eax, [r13 + 24]
     test eax, EM_SUBSTRUCTURE_REDIRECT
     jz .cwa_clear_redirect
-    mov [r13 + 30], bl
+    mov [r13 + 30], bl                       ; this client claims the redirect
     jmp .cwa_done
 .cwa_clear_redirect:
+    ; Only the CURRENT owner may relinquish SubstructureRedirect. Another
+    ; client changing its own event selection on a shared window (e.g. strip's
+    ; system-tray setup selecting on root) must NOT revoke the WM's redirect.
+    movsx eax, byte [r13 + 30]
+    cmp eax, ebx
+    jne .cwa_done
     mov byte [r13 + 30], -1
 .cwa_done:
     pop r13
