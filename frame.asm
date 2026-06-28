@@ -207,6 +207,9 @@ envp:               resq 1
 listen_fd:          resq 1
 client_fd:          resq 1
 display_num:        resq 1
+keymap_is_no:       resb 1                 ; ~/.framerc keymap=no → Norwegian
+framerc_path:       resb 256               ; "$HOME/.framerc"
+framerc_buf:        resb 512               ; ~/.framerc contents
 
 ; ---- Phase 4 multi-client state -------------------------------------------
 ; clients_meta[16] — one 16-byte slot per concurrent client.
@@ -545,6 +548,7 @@ input_event_batch:  resb INPUT_BATCH_BYTES
 ; ============================================================================
 SECTION .rodata
 x11_sock_dir:       db "/tmp/.X11-unix/X", 0
+str_framerc:        db "/.framerc", 0
 vendor_str:         db "frame"
 
 log_prefix:         db "frame: ", 0
@@ -963,6 +967,7 @@ _start:
     call init_pictures
     call init_properties
     call install_dump_handler
+    call read_framerc                        ; ~/.framerc → keymap_is_no
     call init_keysyms
     call init_input
     cmp byte [compositor_requested], 0
@@ -5733,8 +5738,148 @@ handle_list_properties:
 %define XK_Down         0xFF54
 
 ; ----------------------------------------------------------------------------
-; init_keysyms — populate keysym_table with US layout. Sparse population:
-; keycodes not listed here stay at the all-zeros init (= NoSymbol).
+; read_framerc — read ~/.framerc and set keymap_is_no from a `keymap = no`
+; line. No file / no key → keymap_is_no stays 0 (US default). Called once at
+; startup, before init_keysyms. Line-based key=value, the CHasm rc convention.
+; ----------------------------------------------------------------------------
+read_framerc:
+    push rbx
+    ; --- locate HOME in envp ---
+    mov rsi, [envp]
+    test rsi, rsi
+    jz .rf_done
+.rf_env:
+    mov rdi, [rsi]
+    test rdi, rdi
+    jz .rf_done                              ; end of envp, no HOME
+    cmp dword [rdi], 'HOME'
+    jne .rf_env_next
+    cmp byte [rdi + 4], '='
+    je .rf_home
+.rf_env_next:
+    add rsi, 8
+    jmp .rf_env
+.rf_home:
+    add rdi, 5                               ; → HOME value
+    lea rbx, [framerc_path]
+.rf_cp:
+    mov al, [rdi]
+    test al, al
+    jz .rf_cp_done
+    mov [rbx], al
+    inc rdi
+    inc rbx
+    jmp .rf_cp
+.rf_cp_done:
+    lea rsi, [str_framerc]                    ; append "/.framerc\0"
+.rf_app:
+    mov al, [rsi]
+    mov [rbx], al
+    test al, al
+    jz .rf_open
+    inc rsi
+    inc rbx
+    jmp .rf_app
+.rf_open:
+    mov rax, SYS_OPEN
+    lea rdi, [framerc_path]
+    xor esi, esi                             ; O_RDONLY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .rf_done                              ; no ~/.framerc → US default
+    mov rbx, rax                             ; fd
+    mov rax, SYS_READ
+    mov rdi, rbx
+    lea rsi, [framerc_buf]
+    mov edx, 511
+    syscall
+    push rax
+    mov rax, SYS_CLOSE
+    mov rdi, rbx
+    syscall
+    pop rax
+    test rax, rax
+    jle .rf_done
+    lea rsi, [framerc_buf]
+    mov byte [rsi + rax], 0                   ; NUL-terminate
+    call parse_framerc
+.rf_done:
+    pop rbx
+    ret
+
+; parse_framerc — scan framerc_buf for a `keymap` line; if its value is "no",
+; set keymap_is_no. First match wins; anything else leaves the US default.
+parse_framerc:
+    lea rsi, [framerc_buf]
+.pf_line:
+    mov al, [rsi]
+    test al, al
+    jz .pf_ret
+.pf_skip_ws:
+    mov al, [rsi]
+    cmp al, ' '
+    je .pf_ws_adv
+    cmp al, 9
+    je .pf_ws_adv
+    jmp .pf_key
+.pf_ws_adv:
+    inc rsi
+    jmp .pf_skip_ws
+.pf_key:
+    mov eax, [rsi]
+    cmp eax, 'keym'
+    jne .pf_next_line
+    mov ax, [rsi + 4]
+    cmp ax, 'ap'
+    jne .pf_next_line
+    add rsi, 6                               ; past "keymap"
+.pf_skip2:
+    mov al, [rsi]
+    cmp al, ' '
+    je .pf_s2_adv
+    cmp al, 9
+    je .pf_s2_adv
+    cmp al, '='
+    je .pf_s2_adv
+    jmp .pf_val
+.pf_s2_adv:
+    inc rsi
+    jmp .pf_skip2
+.pf_val:
+    cmp byte [rsi], 'n'
+    jne .pf_ret
+    cmp byte [rsi + 1], 'o'
+    jne .pf_ret
+    mov al, [rsi + 2]                         ; "no" must end here
+    test al, al
+    je .pf_set
+    cmp al, ' '
+    je .pf_set
+    cmp al, 9
+    je .pf_set
+    cmp al, 13
+    je .pf_set
+    cmp al, 10
+    je .pf_set
+    jmp .pf_ret
+.pf_set:
+    mov byte [keymap_is_no], 1
+    ret
+.pf_next_line:
+    mov al, [rsi]
+    test al, al
+    jz .pf_ret
+    inc rsi
+    cmp al, 10
+    jne .pf_next_line
+    jmp .pf_line
+.pf_ret:
+    ret
+
+; init_keysyms — populate keysym_table. Keys shared across layouts are set
+; unconditionally; the number row + punctuation branch on keymap_is_no
+; (US default, or Norwegian when ~/.framerc has keymap=no).
 ; ----------------------------------------------------------------------------
 init_keysyms:
     lea rdi, [keysym_table]
@@ -5743,19 +5888,9 @@ init_keysyms:
     rep stosd
 
     ; X11 keycode = evdev keycode + 8.
+    ; --- Keys identical in every layout: letters, modifiers, whitespace,
+    ;     function + navigation keys.
     KS 9,  XK_Escape, XK_Escape
-    KS 10, '1', '!'
-    KS 11, '2', '@'
-    KS 12, '3', '#'
-    KS 13, '4', '$'
-    KS 14, '5', '%'
-    KS 15, '6', '^'
-    KS 16, '7', '&'
-    KS 17, '8', '*'
-    KS 18, '9', '('
-    KS 19, '0', ')'
-    KS 20, '-', '_'
-    KS 21, '=', '+'
     KS 22, XK_BackSpace, XK_BackSpace
     KS 23, XK_Tab, XK_Tab
     KS 24, 'q', 'Q'
@@ -5768,8 +5903,6 @@ init_keysyms:
     KS 31, 'i', 'I'
     KS 32, 'o', 'O'
     KS 33, 'p', 'P'
-    KS 34, '[', '{'
-    KS 35, ']', '}'
     KS 36, XK_Return, XK_Return
     KS 37, XK_Control_L, XK_Control_L
     KS 38, 'a', 'A'
@@ -5781,11 +5914,7 @@ init_keysyms:
     KS 44, 'j', 'J'
     KS 45, 'k', 'K'
     KS 46, 'l', 'L'
-    KS 47, ';', ':'
-    KS 48, "'", '"'
-    KS 49, '`', '~'
     KS 50, XK_Shift_L, XK_Shift_L
-    KS 51, '\', '|'
     KS 52, 'z', 'Z'
     KS 53, 'x', 'X'
     KS 54, 'c', 'C'
@@ -5793,9 +5922,6 @@ init_keysyms:
     KS 56, 'b', 'B'
     KS 57, 'n', 'N'
     KS 58, 'm', 'M'
-    KS 59, ',', '<'
-    KS 60, '.', '>'
-    KS 61, '/', '?'
     KS 62, XK_Shift_R, XK_Shift_R
     KS 64, XK_Alt_L, XK_Alt_L
     KS 65, XK_space, XK_space
@@ -5820,6 +5946,57 @@ init_keysyms:
     KS 116, XK_Down, XK_Down
     KS 133, XK_Super_L, XK_Super_L
     KS 134, XK_Super_R, XK_Super_R
+
+    ; --- Number row + punctuation: layout-dependent.
+    cmp byte [keymap_is_no], 0
+    jne .iks_no
+    ; US (default)
+    KS 10, '1', '!'
+    KS 11, '2', '@'
+    KS 12, '3', '#'
+    KS 13, '4', '$'
+    KS 14, '5', '%'
+    KS 15, '6', '^'
+    KS 16, '7', '&'
+    KS 17, '8', '*'
+    KS 18, '9', '('
+    KS 19, '0', ')'
+    KS 20, '-', '_'
+    KS 21, '=', '+'
+    KS 34, '[', '{'
+    KS 35, ']', '}'
+    KS 47, ';', ':'
+    KS 48, "'", '"'
+    KS 49, '`', '~'
+    KS 51, '\', '|'
+    KS 59, ',', '<'
+    KS 60, '.', '>'
+    KS 61, '/', '?'
+    ret
+.iks_no:
+    ; Norwegian (ISO). Latin-1 keysyms equal their codepoints.
+    KS 10, '1', '!'
+    KS 11, '2', '"'
+    KS 12, '3', '#'
+    KS 13, '4', 0xA4              ; 4 / currency ¤
+    KS 14, '5', '%'
+    KS 15, '6', '&'
+    KS 16, '7', '/'
+    KS 17, '8', '('
+    KS 18, '9', ')'
+    KS 19, '0', '='
+    KS 20, '+', '?'
+    KS 21, '\', '`'              ; backslash / grave
+    KS 34, 0xE5, 0xC5            ; å / Å
+    KS 35, 0xA8, '^'            ; diaeresis / circumflex
+    KS 47, 0xF8, 0xD8            ; ø / Ø
+    KS 48, 0xE6, 0xC6            ; æ / Æ
+    KS 49, '|', 0xA7            ; bar / section §
+    KS 51, 0x27, '*'            ; apostrophe / asterisk
+    KS 59, ',', ';'
+    KS 60, '.', ':'
+    KS 61, '-', '_'
+    KS 94, '<', '>'            ; ISO key left of Z
     ret
 
 ; ----------------------------------------------------------------------------

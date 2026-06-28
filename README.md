@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.42-blue)
+![Version](https://img.shields.io/badge/version-0.0.43-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -215,6 +215,21 @@ real keysyms.
 `/dev/input/event*` is `crw-rw---- root:input` on most distros. Either
 `sudo`, or `sudo usermod -aG input geir && reboot`. From a VT (where
 phase 2b runs anyway) this is automatic if you use `sudo`.
+
+### Keyboard layout (`~/.framerc`)
+
+frame reads an optional `~/.framerc` (line-based `key = value`, the CHasm
+rc convention). One key so far:
+
+```
+keymap = no        # Norwegian (ISO). Default: us
+```
+
+`us` (the default, or no file) is the standard US layout. `no` is
+Norwegian: `Shift+6` = `&`, the `ø æ å` keys, `< >` on the ISO key left
+of `Z`, and Norwegian punctuation. The AltGr level (`@ { } [ ] $`) is
+not wired yet. The layout is delivered to clients via
+`GetKeyboardMapping`, so any X client (glass, xterm, …) picks it up.
 
 ## How it's built
 
