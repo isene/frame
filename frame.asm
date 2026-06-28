@@ -208,6 +208,7 @@ listen_fd:          resq 1
 client_fd:          resq 1
 display_num:        resq 1
 keymap_is_no:       resb 1                 ; ~/.framerc keymap=no → Norwegian
+pending_vt:         resd 1                 ; Ctrl+Alt+Fn target VT for switch_vt
 framerc_path:       resb 256               ; "$HOME/.framerc"
 framerc_buf:        resb 512               ; ~/.framerc contents
 
@@ -551,6 +552,7 @@ input_event_batch:  resb INPUT_BATCH_BYTES
 SECTION .rodata
 x11_sock_dir:       db "/tmp/.X11-unix/X", 0
 str_framerc:        db "/.framerc", 0
+str_dev_tty0:       db "/dev/tty0", 0
 vendor_str:         db "frame"
 
 log_prefix:         db "frame: ", 0
@@ -6447,22 +6449,39 @@ dispatch_input_event:
     mov [mod_state], ecx
 
 .die_check_grab:
-    ; Zap: Ctrl+Alt+Backspace (evdev keycode 14) on press → clean exit
-    ; (restore console + drop DRM master). The traditional X server quit
-    ; combo; gives the user a way out when frame is grabbing all evdev
-    ; input and the launching tty can't be used to stop it.
+    ; Ctrl+Alt+Backspace → zap (clean exit). Ctrl+Alt+F1..F12 → switch to
+    ; that VT. frame grabs the keyboard (EVIOCGRAB), so the kernel can't do
+    ; the VT switch itself — we detect the combo and call VT_ACTIVATE, exactly
+    ; like a real X server. Both are press-only and require Ctrl + left-Alt.
     cmp r13d, 1
-    jne .die_nozap
-    cmp r12d, 14
     jne .die_nozap
     movzx eax, byte [mod_state]
     and eax, MOD_CONTROL | MOD_MOD1
     cmp eax, MOD_CONTROL | MOD_MOD1
     jne .die_nozap
+    cmp r12d, 14                             ; Backspace → zap
+    jne .die_chk_vt
     call compositor_shutdown
     mov rax, SYS_EXIT
     xor edi, edi
     syscall
+.die_chk_vt:
+    cmp r12d, 59                             ; F1..F10 = evdev 59..68 → VT 1..10
+    jb .die_nozap
+    cmp r12d, 68
+    ja .die_chk_f11
+    lea edi, [r12d - 58]
+    call switch_vt                           ; does not return
+.die_chk_f11:
+    cmp r12d, 87                             ; F11 → VT 11
+    jne .die_chk_f12
+    mov edi, 11
+    call switch_vt
+.die_chk_f12:
+    cmp r12d, 88                             ; F12 → VT 12
+    jne .die_nozap
+    mov edi, 12
+    call switch_vt
 .die_nozap:
     ; x11_keycode = evdev_code + 8 (kept in r12d from here on).
     add r12d, 8
@@ -8310,6 +8329,32 @@ sig_restorer:
 ; ----------------------------------------------------------------------------
 exit_handler:
     call compositor_shutdown
+    mov rax, SYS_EXIT
+    xor edi, edi
+    syscall
+
+; ----------------------------------------------------------------------------
+; switch_vt — edi = target VT number. Restore the console + drop DRM master,
+; then VT_ACTIVATE to that VT, then exit (which releases the evdev grab so the
+; target VT gets the keyboard). The kernel can't switch VTs for us while we
+; hold the grab, so frame does it itself — same as a real X server.
+; ----------------------------------------------------------------------------
+switch_vt:
+    mov [pending_vt], edi
+    call compositor_shutdown
+    mov rax, SYS_OPEN
+    lea rdi, [str_dev_tty0]
+    mov esi, 2                               ; O_RDWR
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .sv_exit
+    mov rdi, rax                             ; /dev/tty0 fd
+    mov rax, SYS_IOCTL
+    mov esi, 0x5606                          ; VT_ACTIVATE
+    mov edx, [pending_vt]
+    syscall
+.sv_exit:
     mov rax, SYS_EXIT
     xor edi, edi
     syscall
