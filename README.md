@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.43-blue)
+![Version](https://img.shields.io/badge/version-0.0.44-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -227,9 +227,10 @@ keymap = no        # Norwegian (ISO). Default: us
 
 `us` (the default, or no file) is the standard US layout. `no` is
 Norwegian: `Shift+6` = `&`, the `ø æ å` keys, `< >` on the ISO key left
-of `Z`, and Norwegian punctuation. The AltGr level (`@ { } [ ] $`) is
-not wired yet. The layout is delivered to clients via
-`GetKeyboardMapping`, so any X client (glass, xterm, …) picks it up.
+of `Z`, Norwegian punctuation, and **AltGr** (right Alt = ISO_Level3_Shift
+= Mod5) for `@ £ $ { } [ ] \ € ~`. The layout is delivered to clients via
+`GetKeyboardMapping` (6 keysyms/keycode, AltGr at level 3), so any X
+client (glass, xterm, …) picks it up.
 
 ## How it's built
 

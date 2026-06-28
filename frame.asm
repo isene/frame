@@ -393,12 +393,13 @@ property_values:    resb PROPERTY_VALUES_CAP
 property_values_used: resd 1
 
 ; ---- Phase 4d input state -------------------------------------------------
-; keysym_table — flat per-X11-keycode keysym table. 2 keysyms per keycode
-; (unshifted + shifted). Indexed by (kc - X_MIN_KEYCODE) * 8 + offset.
-;
-; Range: X11 keycodes 8..255 → (255 - 8 + 1) × 8 = 1984 bytes.
+; keysym_table — flat per-X11-keycode keysym table. 6 keysyms per keycode:
+; index 0/1 = level 1/2 (unshifted/shifted), 2/3 unused (group 2), 4/5 =
+; level 3/4 (AltGr / AltGr+Shift). Indexed by (kc - X_MIN_KEYCODE) * 24 +
+; offset. The 4-5 placement matches glass's AltGr lookup (keycode*8 + 4).
 %define KEYCODE_RANGE        (X_MAX_KEYCODE - X_MIN_KEYCODE + 1)
-keysym_table:       resb KEYCODE_RANGE * 8
+%define KEYSYMS_PER_KC       6
+keysym_table:       resb KEYCODE_RANGE * 24
 
 ; key_grabs[256] — per-grab record (16 B):
 ;   +0  window (u32)     0 = empty slot
@@ -423,6 +424,7 @@ active_kbd_window:  resd 1
 %define MAX_INPUTS       16
 input_fds:          resd MAX_INPUTS
 input_fd_count:     resd 1
+grab_bits:          resb 96                ; EVIOCGBIT capability scratch
 mod_state:          resd 1
 focus_window:       resd 1               ; SetInputFocus target (0/1 = none/PointerRoot)
 screen_w:           resd 1               ; advertised screen size; defaults to
@@ -4134,11 +4136,10 @@ handle_get_keyboard_mapping:
     ; Header.
     lea rdi, [reply_buf]
     mov byte [rdi + 0], 1
-    mov byte [rdi + 1], 2                    ; keysyms-per-keycode = 2
+    mov byte [rdi + 1], KEYSYMS_PER_KC       ; keysyms-per-keycode = 6
     mov edx, [r12 + 8]
     mov [rdi + 2], dx
-    mov edx, ecx
-    shl edx, 1                               ; reply length = count × 2 (each keysym = 1 4u)
+    imul edx, ecx, KEYSYMS_PER_KC            ; reply length = count × 6 (4u each)
     mov [rdi + 4], edx
     mov dword [rdi + 8], 0
     mov dword [rdi + 12], 0
@@ -4157,21 +4158,28 @@ handle_get_keyboard_mapping:
     add rdi, 32
     mov esi, r14d
     sub esi, X_MIN_KEYCODE                   ; table index in keycode units
-    shl esi, 3                               ; bytes (8 per keycode)
+    imul esi, esi, 24                        ; bytes (24 per keycode)
     lea r9, [keysym_table + rsi]             ; source ptr
 .gkm_emit:
-    mov eax, [r9]
-    mov [rdi], eax
+    mov eax, [r9 + 0]
+    mov [rdi + 0], eax
     mov eax, [r9 + 4]
     mov [rdi + 4], eax
-    add r9, 8
-    add rdi, 8
+    mov eax, [r9 + 8]
+    mov [rdi + 8], eax
+    mov eax, [r9 + 12]
+    mov [rdi + 12], eax
+    mov eax, [r9 + 16]
+    mov [rdi + 16], eax
+    mov eax, [r9 + 20]
+    mov [rdi + 20], eax
+    add r9, 24
+    add rdi, 24
     dec ecx
     jnz .gkm_emit
     pop rcx
 .gkm_write:
-    mov edx, ecx
-    shl edx, 3                               ; body bytes = count × 8
+    imul edx, ecx, 24                        ; body bytes = count × 24
     add edx, 32                              ; total reply bytes
     mov edi, [r12]
     mov rax, SYS_WRITE
@@ -4598,10 +4606,25 @@ handle_get_modifier_mapping:
     mov dword [rdi + 20], 0
     mov dword [rdi + 24], 0
     mov dword [rdi + 28], 0
+    ; Body: 8 modifier rows × 2 keycodes (reply_buf +32..+47). Zero, then fill.
     mov dword [rdi + 32], 0
     mov dword [rdi + 36], 0
     mov dword [rdi + 40], 0
     mov dword [rdi + 44], 0
+    mov byte [rdi + 32], 50                   ; Shift   = Shift_L
+    mov byte [rdi + 33], 62                   ; Shift   = Shift_R
+    mov byte [rdi + 36], 37                   ; Control = Control_L
+    mov byte [rdi + 37], 105                  ; Control = Control_R
+    mov byte [rdi + 38], 64                   ; Mod1    = Alt_L
+    mov byte [rdi + 44], 133                  ; Mod4    = Super_L
+    mov byte [rdi + 45], 134                  ; Mod4    = Super_R
+    cmp byte [keymap_is_no], 0                ; right Alt (kc 108):
+    jne .gmm_no
+    mov byte [rdi + 39], 108                  ;   US → Mod1 (Alt_R)
+    jmp .gmm_send
+.gmm_no:
+    mov byte [rdi + 46], 108                  ;   NO → Mod5 (AltGr)
+.gmm_send:
 
     mov edi, [r12]
     mov rax, SYS_WRITE
@@ -5698,11 +5721,16 @@ handle_list_properties:
 ; ============================================================================
 
 ; ----------------------------------------------------------------------------
-; KS — set keysym_table[X11_KC]'s unshifted + shifted values.
+; KS — set keysym_table[X11_KC] level 1/2 (unshifted + shifted).
+; KSA — set level 3/4 (AltGr + AltGr+Shift), at indices 4/5.
 ; ----------------------------------------------------------------------------
 %macro KS 3
-    mov dword [keysym_table + (%1 - X_MIN_KEYCODE) * 8 + 0], %2
-    mov dword [keysym_table + (%1 - X_MIN_KEYCODE) * 8 + 4], %3
+    mov dword [keysym_table + (%1 - X_MIN_KEYCODE) * 24 + 0], %2
+    mov dword [keysym_table + (%1 - X_MIN_KEYCODE) * 24 + 4], %3
+%endmacro
+%macro KSA 3
+    mov dword [keysym_table + (%1 - X_MIN_KEYCODE) * 24 + 16], %2
+    mov dword [keysym_table + (%1 - X_MIN_KEYCODE) * 24 + 20], %3
 %endmacro
 
 ; X11 keysym values (subset of keysymdef.h we use).
@@ -5884,7 +5912,7 @@ parse_framerc:
 init_keysyms:
     lea rdi, [keysym_table]
     xor eax, eax
-    mov ecx, KEYCODE_RANGE * 2
+    mov ecx, KEYCODE_RANGE * 6
     rep stosd
 
     ; X11 keycode = evdev keycode + 8.
@@ -5997,6 +6025,63 @@ init_keysyms:
     KS 60, '.', ':'
     KS 61, '-', '_'
     KS 94, '<', '>'            ; ISO key left of Z
+    ; AltGr (level 3): the programming characters.
+    KS 108, 0xFE03, 0xFE03      ; right Alt = ISO_Level3_Shift (was Alt_R)
+    KSA 11, '@', 0              ; AltGr+2
+    KSA 12, 0xA3, 0            ; AltGr+3 = £
+    KSA 13, '$', 0             ; AltGr+4
+    KSA 16, '{', 0             ; AltGr+7
+    KSA 17, '[', 0             ; AltGr+8
+    KSA 18, ']', 0             ; AltGr+9
+    KSA 19, '}', 0             ; AltGr+0
+    KSA 20, '\', 0             ; AltGr++  = backslash
+    KSA 26, 0x20AC, 0          ; AltGr+e  = €
+    KSA 35, '~', 0             ; AltGr+¨  = tilde
+    ret
+
+; ----------------------------------------------------------------------------
+; maybe_grab_input — edi = fd. EVIOCGRAB the device iff it's a keyboard
+; (has KEY_SPACE) or a pointer (EV_REL/EV_ABS). Grabbing stops the kernel
+; from ALSO routing its events to the foreground VT (keystrokes were
+; leaking into TTY shells). Power button + lid switch are NOT grabbed, so
+; the lid still suspends (battery). Kernel releases the grab on fd close.
+; ----------------------------------------------------------------------------
+maybe_grab_input:
+    push rbx
+    mov ebx, edi                             ; save fd
+    ; EVIOCGBIT(0, 4): supported event-type bitmap → byte 0.
+    mov dword [grab_bits], 0
+    mov eax, SYS_IOCTL
+    mov edi, ebx
+    mov esi, 0x80044520                      ; EVIOCGBIT(0,4)
+    lea rdx, [grab_bits]
+    syscall
+    mov al, [grab_bits]
+    test al, 0x0C                             ; EV_REL(2) | EV_ABS(3) → pointer
+    jnz .mg_grab
+    test al, 0x02                             ; EV_KEY(1)?
+    jz .mg_done
+    ; EVIOCGBIT(EV_KEY, 96): key bitmap; KEY_SPACE(57) marks a real keyboard
+    ; (power/lid have EV_KEY but only KEY_POWER / switches).
+    lea rdi, [grab_bits]
+    xor eax, eax
+    mov ecx, 12
+    rep stosq
+    mov eax, SYS_IOCTL
+    mov edi, ebx
+    mov esi, 0x80604521                      ; EVIOCGBIT(EV_KEY,96)
+    lea rdx, [grab_bits]
+    syscall
+    test byte [grab_bits + 7], 0x02           ; KEY_SPACE = 57 = byte 7 bit 1
+    jz .mg_done
+.mg_grab:
+    mov eax, SYS_IOCTL
+    mov edi, ebx
+    mov esi, 0x40044590                      ; EVIOCGRAB
+    mov edx, 1
+    syscall
+.mg_done:
+    pop rbx
     ret
 
 ; ----------------------------------------------------------------------------
@@ -6062,6 +6147,8 @@ init_input:
     mov r13d, [input_fd_count]
     mov [input_fds + r13*4], eax
     inc dword [input_fd_count]
+    mov edi, eax                             ; fd → grab if keyboard/pointer
+    call maybe_grab_input
 .ii_next:
     inc ebx
     jmp .ii_loop
@@ -6250,6 +6337,7 @@ handle_grab_pointer:
 %define MOD_CONTROL     0x04
 %define MOD_MOD1        0x08
 %define MOD_MOD4        0x40
+%define MOD_MOD5        0x80                 ; AltGr / ISO_Level3_Shift
 
 ; ----------------------------------------------------------------------------
 ; process_input — edi = fd. Reads up to INPUT_BATCH_BYTES worth of
@@ -6335,6 +6423,11 @@ dispatch_input_event:
     jmp .die_apply_mod
 .die_alt:
     mov al, MOD_MOD1
+    cmp r12d, 100                             ; right Alt = AltGr in Norwegian
+    jne .die_apply_mod
+    cmp byte [keymap_is_no], 0
+    je .die_apply_mod
+    mov al, MOD_MOD5                          ; → Mod5 (state bit 7); glass level 3
     jmp .die_apply_mod
 .die_mod4:
     mov al, MOD_MOD4
@@ -7858,7 +7951,9 @@ draw_cursor_arrow:
 .dca_col:
     cmp r12d, r13d                           ; while x <= y
     jg .dca_row_next
-    mov eax, 0x80FFFFFF                       ; 50% transparent white interior
+    mov eax, 0x80808080                       ; 50% white, PREMULTIPLIED (DRM
+                                             ; cursor plane expects premult ARGB;
+                                             ; 0x80FFFFFF reads as opaque white)
     test r12d, r12d
     jz .dca_black                            ; left edge
     cmp r12d, r13d
