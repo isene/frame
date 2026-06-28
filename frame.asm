@@ -7675,18 +7675,18 @@ draw_cursor_arrow:
     rep stosd
     xor r13d, r13d                           ; y
 .dca_row:
-    cmp r13d, 19                             ; ARROW_H
+    cmp r13d, 15                             ; ARROW_H (slightly smaller)
     jge .dca_done
     xor r12d, r12d                           ; x
 .dca_col:
     cmp r12d, r13d                           ; while x <= y
     jg .dca_row_next
-    mov eax, 0xFFFFFFFF                       ; white (opaque)
+    mov eax, 0x80FFFFFF                       ; 50% transparent white interior
     test r12d, r12d
     jz .dca_black                            ; left edge
     cmp r12d, r13d
     je .dca_black                            ; diagonal edge
-    cmp r13d, 18                             ; bottom edge (ARROW_H-1)
+    cmp r13d, 14                             ; bottom edge (ARROW_H-1)
     je .dca_black
     jmp .dca_plot
 .dca_black:
