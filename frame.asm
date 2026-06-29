@@ -195,6 +195,10 @@ DEFAULT REL
 %define RENDER_ERROR_BASE    128
 %define RENDER_VERSION_MAJOR 0
 %define RENDER_VERSION_MINOR 11
+; ---- XKEYBOARD (XKB) extension — gateway for Qt/GTK (xkbcommon-x11) ---------
+%define XKB_MAJOR            135
+%define XKB_EVENT_BASE       85
+%define XKB_ERROR_BASE       137
 %define X_RID_MASK           0x001FFFFF
 
 ; ============================================================================
@@ -581,6 +585,7 @@ log_accepted_len   equ $ - log_accepted
 log_setup_ok:       db "setup reply sent (", 0
 log_setup_ok_2:     db " bytes)", 10
 log_setup_ok_2_len equ $ - log_setup_ok_2
+qext_nl:            db 10
 log_request_pre:    db "  req opcode=", 0
 log_request_mid:    db " len=", 0
 log_request_nl:     db 10
@@ -610,6 +615,8 @@ log_comp_size_len   equ $ - log_comp_size - 1
 log_pageflip:       db "frame: first PAGE_FLIP rc=", 0
 log_pageflip_len    equ $ - log_pageflip - 1
 str_render:         db "RENDER"
+str_xkb:            db "XKEYBOARD"
+log_xkb_minor:      db "xkb minor=", 0
 dbg_ag_tag:         db 10, "AG: "
 dbg_ag_tag_len      equ $ - dbg_ag_tag
 dbg_sp:             db " "
@@ -3331,6 +3338,8 @@ dispatch_request:
     je .dr_get_modifier_mapping
     cmp eax, RENDER_MAJOR
     je .dr_render
+    cmp eax, XKB_MAJOR
+    je .dr_xkb
     ; Unhandled — already logged.
     jmp .dr_done
 
@@ -3339,6 +3348,12 @@ dispatch_request:
     mov rsi, r12
     mov edx, r13d
     call handle_render
+    jmp .dr_done
+
+.dr_xkb:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_xkb
     jmp .dr_done
 
 .dr_intern_atom:
@@ -3729,27 +3744,46 @@ handle_query_extension:
     mov dword [rdi + 24], 0
     mov dword [rdi + 28], 0
 
-    ; Is the requested name "RENDER" (length 6)?
+    ; Recognised extensions: RENDER (len 6), XKEYBOARD (len 9). Else → absent.
     movzx eax, word [r13 + 4]                ; name-length
     cmp eax, 6
-    jne .qe_send
+    jne .qe_try_xkb
     lea rsi, [r13 + 8]
     lea rdi, [str_render]
     mov ecx, 6
-.qe_cmp:
-    mov al, [rsi]
-    cmp al, [rdi]
+.qe_cmp_r:
+    mov dl, [rsi]
+    cmp dl, [rdi]
     jne .qe_send
     inc rsi
     inc rdi
     dec ecx
-    jnz .qe_cmp
-    ; Match → report present with our major opcode.
+    jnz .qe_cmp_r
     lea rdi, [reply_buf]
     mov byte [rdi + 8], 1                    ; present = True
     mov byte [rdi + 9], RENDER_MAJOR         ; major-opcode
     mov byte [rdi + 10], 0                   ; first-event
     mov byte [rdi + 11], RENDER_ERROR_BASE   ; first-error
+    jmp .qe_send
+.qe_try_xkb:
+    cmp eax, 9
+    jne .qe_send
+    lea rsi, [r13 + 8]
+    lea rdi, [str_xkb]
+    mov ecx, 9
+.qe_cmp_x:
+    mov dl, [rsi]
+    cmp dl, [rdi]
+    jne .qe_send
+    inc rsi
+    inc rdi
+    dec ecx
+    jnz .qe_cmp_x
+    lea rdi, [reply_buf]
+    mov byte [rdi + 8], 1                    ; present = True
+    mov byte [rdi + 9], XKB_MAJOR
+    mov byte [rdi + 10], XKB_EVENT_BASE
+    mov byte [rdi + 11], XKB_ERROR_BASE
 
 .qe_send:
     mov edi, [r12]
@@ -3760,6 +3794,86 @@ handle_query_extension:
 
     pop r13
     pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_xkb — edi = slot, rsi = req. XKB extension, built incrementally.
+; minor 0 (XkbUseExtension) is answered (supported, version 1.0). Any other
+; minor opcode is logged so the oracle reveals what to implement next.
+; ============================================================================
+handle_xkb:
+    movzx eax, byte [rsi + 1]                ; XKB minor opcode
+    test eax, eax                            ; 0 = XkbUseExtension
+    jz .xkb_use_ext
+    cmp eax, 24                              ; 24 = XkbGetDeviceInfo
+    je .xkb_get_device_info
+    ; --- DIAG (temporary): log unhandled XKB minor opcode ---
+    push rax
+    mov rsi, log_xkb_minor
+    mov edx, 10
+    call write_stderr
+    pop rax
+    call write_u64_stderr
+    mov rsi, qext_nl
+    mov edx, 1
+    call write_stderr
+    ret
+
+.xkb_get_device_info:
+    ; Minimal reply: hand back the core-keyboard device ID (3). xkbcommon's
+    ; get_core_keyboard_device_id only reads reply.deviceID. wanted=0 from the
+    ; client → no name/buttons/LEDs, so the reply is just its 36-byte header.
+    push rbx
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr                    ; rax = client meta
+    mov r8d, [rax + 8]                        ; seq
+    mov r9d, [rax]                            ; fd
+    lea rdi, [reply_buf]
+    xor ecx, ecx
+    mov [rdi + 0], rcx
+    mov [rdi + 8], rcx
+    mov [rdi + 16], rcx
+    mov [rdi + 24], rcx
+    mov [rdi + 32], rcx
+    mov byte [rdi + 0], 1                     ; reply
+    mov byte [rdi + 1], 3                     ; deviceID = 3 (core keyboard)
+    mov [rdi + 2], r8w                        ; seq
+    mov dword [rdi + 4], 1                    ; length = 1 (36 bytes total)
+    mov edi, r9d                              ; fd
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 36
+    syscall
+    pop rbx
+    ret
+
+.xkb_use_ext:
+    push rbx
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1                    ; reply
+    mov byte [rdi + 1], 1                    ; supported = True
+    mov ecx, [rax + 8]
+    mov [rdi + 2], cx                        ; seq
+    mov dword [rdi + 4], 0                   ; reply length 0
+    mov word [rdi + 8], 1                    ; serverMajor = 1
+    mov word [rdi + 10], 0                   ; serverMinor = 0
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+    mov edi, [rax]                           ; fd
+    push rax
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+    pop rax
     pop rbx
     ret
 
