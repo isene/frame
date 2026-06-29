@@ -4261,14 +4261,16 @@ handle_randr:
     je .rr_get_size_range
     cmp eax, 31                              ; GetOutputPrimary
     je .rr_get_output_primary
-    ret                                      ; SelectInput(4) etc.: no reply
+    ret                                      ; SelectInput(4) / GetMonitors(42): none
+                                             ; (we advertise 1.4 so toolkits use
+                                             ;  GetScreenResources, not GetMonitors)
 
 .rr_query_version:
     mov esi, 32
     call xkb_reply_zero
     mov byte [rdi + 1], 0
     mov dword [rdi + 8], 1                    ; majorVersion = 1
-    mov dword [rdi + 12], 6                   ; minorVersion = 6
+    mov dword [rdi + 12], 4                   ; minorVersion = 4 (pre-GetMonitors)
     jmp .rr_write
 
 .rr_get_size_range:
