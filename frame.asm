@@ -213,6 +213,12 @@ mouse_sens:         resd 1                 ; pointer sensitivity %, ~/.framerc (
 cursor_rgb:         resd 1                 ; cursor fill colour 0xRRGGBB (def white)
 cursor_transp:      resd 1                 ; cursor % transparent (def 50)
 cursor_argb:        resd 1                 ; computed premultiplied interior pixel
+; Selection ownership (SetSelectionOwner / GetSelectionOwner). Small table;
+; the system tray needs strip to OWN _NET_SYSTEM_TRAY_S0 and apps to find it.
+SEL_MAX             equ 8
+sel_atoms:          resd SEL_MAX
+sel_owners:         resd SEL_MAX
+sel_count:          resd 1
 framerc_path:       resb 256               ; "$HOME/.framerc"
 framerc_buf:        resb 512               ; ~/.framerc contents
 
@@ -3228,6 +3234,8 @@ dispatch_request:
     je .dr_get_window_attributes
     cmp eax, 25
     je .dr_send_event
+    cmp eax, 22
+    je .dr_set_selection_owner
     cmp eax, 23
     je .dr_get_selection_owner
     cmp eax, 47
@@ -3498,8 +3506,15 @@ dispatch_request:
     call handle_send_event
     jmp .dr_done
 
+.dr_set_selection_owner:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_set_selection_owner
+    jmp .dr_done
+
 .dr_get_selection_owner:
     mov edi, ebx
+    mov rsi, r12
     call handle_get_selection_owner
     jmp .dr_done
 
@@ -11077,13 +11092,58 @@ render_composite:
     ret
 
 ; ----------------------------------------------------------------------------
-; handle_get_selection_owner — edi = slot. GetSelectionOwner (opcode 23).
-; Replies owner = None (0): we don't track selections yet. glass queries
-; this during init and BLOCKS on the reply, so it must be answered.
+; handle_set_selection_owner — edi = slot, rsi = req. SetSelectionOwner (22).
+; Request: +4 owner window, +8 selection atom, +12 time. Stores (selection →
+; owner) in a small table. No reply. The tray manager (strip) claims
+; _NET_SYSTEM_TRAY_S0 this way so tray apps can find it.
+; ----------------------------------------------------------------------------
+handle_set_selection_owner:
+    push rbx
+    mov ebx, [rsi + 4]                        ; owner window
+    mov ecx, [rsi + 8]                        ; selection atom
+    xor edx, edx
+.sso_find:
+    cmp edx, [sel_count]
+    jge .sso_add
+    cmp [sel_atoms + rdx*4], ecx
+    je .sso_set
+    inc edx
+    jmp .sso_find
+.sso_add:
+    cmp edx, SEL_MAX
+    jae .sso_done                             ; table full → drop
+    mov [sel_atoms + rdx*4], ecx
+    inc dword [sel_count]
+.sso_set:
+    mov [sel_owners + rdx*4], ebx
+.sso_done:
+    pop rbx
+    ret
+
+; handle_get_selection_owner — edi = slot, rsi = req. GetSelectionOwner (23).
+; Request: +4 selection atom. Replies the tracked owner (or None). glass
+; queries this during init and BLOCKS on the reply, so it must be answered.
 ; ----------------------------------------------------------------------------
 handle_get_selection_owner:
     push rbx
-    mov ebx, edi
+    push r12
+    mov ebx, edi                             ; slot
+    mov r12d, [rsi + 4]                       ; selection atom (save before clobber)
+    xor ecx, ecx                             ; owner = None
+    xor edx, edx
+.gso_find:
+    cmp edx, [sel_count]
+    jge .gso_have
+    mov eax, [sel_atoms + rdx*4]
+    cmp eax, r12d
+    jne .gso_next
+    mov ecx, [sel_owners + rdx*4]
+    jmp .gso_have
+.gso_next:
+    inc edx
+    jmp .gso_find
+.gso_have:
+    push rcx                                  ; owner
     mov eax, ebx
     call client_meta_addr
     lea rdi, [reply_buf]
@@ -11092,7 +11152,8 @@ handle_get_selection_owner:
     mov ecx, [rax + 8]                        ; seq
     mov [rdi + 2], cx
     mov dword [rdi + 4], 0                    ; length
-    mov dword [rdi + 8], 0                    ; owner = None
+    pop rcx                                   ; owner
+    mov [rdi + 8], ecx                        ; owner
     mov dword [rdi + 12], 0
     mov dword [rdi + 16], 0
     mov dword [rdi + 20], 0
@@ -11105,6 +11166,7 @@ handle_get_selection_owner:
     mov rdx, 32
     syscall
     pop rax
+    pop r12
     pop rbx
     ret
 
