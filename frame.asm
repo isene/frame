@@ -446,6 +446,14 @@ tap_moved:          resd 1               ; summed |ABS delta| during the touch
 scroll_accum:       resd 1               ; two-finger Y accumulator → notches
 tap_sec:            resq 1               ; BTN_TOUCH-down time (for tap timing)
 tap_usec:           resq 1
+; Multitouch slot tracking (MT-B). Drives the cursor only in 2-finger-drag
+; mode (button held), where the single-touch ABS_X/Y follows the wrong
+; (stationary click) finger. Two slots tracked; out-of-range → dead slot 2.
+mt_cur_slot:        resd 1
+mt_last_x:          resd 2
+mt_last_y:          resd 2
+mt_have_x:          resd 2
+mt_have_y:          resd 2
 
 ; ---- ConfigureWindow / ChangeWindowAttributes value-mask bits -------------
 ; (numeric defines used by the handlers; not in BSS)
@@ -6644,7 +6652,15 @@ dispatch_input_event:
     je .die_abs_x
     cmp ecx, 1                               ; ABS_Y
     je .die_abs_y
-    jmp .die_done                            ; ignore ABS_MT_* and others
+    cmp ecx, 0x2f                            ; ABS_MT_SLOT
+    je .die_mt_slot
+    cmp ecx, 0x39                            ; ABS_MT_TRACKING_ID
+    je .die_mt_trk
+    cmp ecx, 0x35                            ; ABS_MT_POSITION_X
+    je .die_mt_x
+    cmp ecx, 0x36                            ; ABS_MT_POSITION_Y
+    je .die_mt_y
+    jmp .die_done                            ; ignore pressure/other ABS
 .die_abs_x:
     cmp dword [abs_have_x], 0
     jne .die_abs_x_move
@@ -6662,10 +6678,8 @@ dispatch_input_event:
     xor r8d, r9d
     sub r8d, r9d
     add [tap_moved], r8d
-    cmp dword [finger_count], 2               ; <2 fingers: move
-    jl .die_abs_x_apply
-    cmp dword [button_state], 0                ; button held → drag: move anyway
-    je .die_done                               ; 2+ fingers, no button → scroll (skip X)
+    cmp dword [finger_count], 2               ; 2+ fingers: skip ABS X — a drag
+    jge .die_done                              ; uses MT (right finger), scroll is Y
 .die_abs_x_apply:
     SCALE_SENS
     add eax, [cursor_x]
@@ -6694,10 +6708,11 @@ dispatch_input_event:
     xor r8d, r9d
     sub r8d, r9d
     add [tap_moved], r8d
-    cmp dword [finger_count], 2               ; <2 fingers: move
+    cmp dword [finger_count], 2               ; <2 fingers: move from ABS
     jl .die_abs_y_apply
-    cmp dword [button_state], 0                ; button held → drag, not scroll
-    je .die_scroll_y
+    cmp dword [button_state], 0                ; 2+ fingers + button → drag: MT
+    jne .die_done                              ; handles it (skip ABS Y)
+    jmp .die_scroll_y                          ; 2+ fingers, no button → scroll
 .die_abs_y_apply:
     SCALE_SENS
     add eax, [cursor_y]
@@ -6736,6 +6751,82 @@ dispatch_input_event:
     mov esi, 4
     call deliver_pointer_button
     jmp .die_scroll_up
+
+    ; --- Multitouch (MT-B) per-finger tracking ----------------------------
+    ; Used only for the 2-finger drag (button held): the single-touch ABS_X/Y
+    ; follows the stationary click finger, so we follow the actual fingers
+    ; here. Each moving finger contributes its delta to the cursor; the still
+    ; click finger contributes ~0, so the cursor tracks the dragging finger.
+.die_mt_slot:
+    cmp edx, 2
+    jb .die_mts_ok
+    mov edx, 2                               ; clamp out-of-range to dead slot
+.die_mts_ok:
+    mov [mt_cur_slot], edx
+    jmp .die_done
+.die_mt_trk:
+    mov ecx, [mt_cur_slot]
+    cmp ecx, 2
+    jae .die_done
+    mov dword [mt_have_x + rcx*4], 0          ; re-anchor on finger touch / lift
+    mov dword [mt_have_y + rcx*4], 0
+    jmp .die_done
+.die_mt_x:
+    mov ecx, [mt_cur_slot]
+    cmp ecx, 2
+    jae .die_done
+    cmp dword [finger_count], 2               ; MT drives cursor only in
+    jl .die_done                              ; 2-finger-drag mode (button held);
+    cmp dword [button_state], 0               ; otherwise ABS_X/Y handles motion
+    je .die_done
+    cmp dword [mt_have_x + rcx*4], 0
+    jne .die_mt_x_move
+    mov [mt_last_x + rcx*4], edx              ; first sample: anchor only
+    mov dword [mt_have_x + rcx*4], 1
+    jmp .die_done
+.die_mt_x_move:
+    mov eax, edx
+    sub eax, [mt_last_x + rcx*4]
+    mov [mt_last_x + rcx*4], edx
+    SCALE_SENS
+    add eax, [cursor_x]
+    jns .die_mt_x_hi
+    xor eax, eax
+.die_mt_x_hi:
+    mov ecx, [screen_w]
+    dec ecx
+    cmp eax, ecx
+    cmovg eax, ecx
+    mov [cursor_x], eax
+    jmp .die_motion
+.die_mt_y:
+    mov ecx, [mt_cur_slot]
+    cmp ecx, 2
+    jae .die_done
+    cmp dword [finger_count], 2
+    jl .die_done
+    cmp dword [button_state], 0
+    je .die_done
+    cmp dword [mt_have_y + rcx*4], 0
+    jne .die_mt_y_move
+    mov [mt_last_y + rcx*4], edx
+    mov dword [mt_have_y + rcx*4], 1
+    jmp .die_done
+.die_mt_y_move:
+    mov eax, edx
+    sub eax, [mt_last_y + rcx*4]
+    mov [mt_last_y + rcx*4], edx
+    SCALE_SENS
+    add eax, [cursor_y]
+    jns .die_mt_y_hi
+    xor eax, eax
+.die_mt_y_hi:
+    mov ecx, [screen_h]
+    dec ecx
+    cmp eax, ecx
+    cmovg eax, ecx
+    mov [cursor_y], eax
+    jmp .die_motion
 
     ; --- Mouse / touchpad buttons (EV_KEY, code >= 0x100) -----------------
 .die_button:
