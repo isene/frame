@@ -632,6 +632,8 @@ str_randr:          db "RANDR"
 str_xinput:         db "XInputExtension"
 str_xi_pointer:     db "Virtual core pointer"      ; 20 bytes
 str_xi_keyboard:    db "Virtual core keyboard"     ; 21 bytes
+str_rel_x:          db "Rel X"
+str_rel_y:          db "Rel Y"
 log_xkb_minor:      db "xkb minor=", 0
 log_xi_minor:       db "xi minor=", 0
 
@@ -774,6 +776,8 @@ predef_atom_stream:
     ATM "CAP_HEIGHT"
     ATM "WM_CLASS"
     ATM "WM_TRANSIENT_FOR"
+    ATM "Rel X"                              ; XInput2 pointer axis labels
+    ATM "Rel Y"
     db 0                                     ; terminator
 
 ; ---- probe-mode strings ---------------------------------------------------
@@ -4469,7 +4473,19 @@ handle_xinput:
 .xi_query_device:
     push rbx
     push r12
+    push r13
+    push r14
     mov ebx, edi
+    ; Resolve the pointer axis-label atoms (GTK ignores axes with a None label).
+    lea rdi, [str_rel_x]
+    mov esi, 5
+    call atom_lookup
+    mov r13d, eax                             ; "Rel X" atom
+    lea rdi, [str_rel_y]
+    mov esi, 5
+    call atom_lookup
+    mov r14d, eax                             ; "Rel Y" atom
+    mov edi, ebx
     mov esi, 1228
     call xkb_reply_zero                       ; zeroes, header (type/seq/length=299)
     mov r12, rdi                              ; reply base
@@ -4492,22 +4508,18 @@ handle_xinput:
     mov word [r12 + 66], 10                   ; length
     mov word [r12 + 68], 2                    ; sourceid
     mov word [r12 + 70], 7                    ; num_buttons
-    ; ValuatorClass x at +104 (44, length 11)
+    ; ValuatorClass x at +104 — "Rel X", relative (min/max/value/mode all 0)
     mov word [r12 + 104], 2                   ; type = ValuatorClass
     mov word [r12 + 106], 11                  ; length
     mov word [r12 + 108], 2                   ; sourceid
     mov word [r12 + 110], 0                   ; number = 0 (x)
-    mov eax, [screen_w]
-    mov [r12 + 124], eax                      ; max.integral = screen_w
-    mov byte [r12 + 144], 1                   ; mode = Absolute
-    ; ValuatorClass y at +148
+    mov [r12 + 112], r13d                     ; label = "Rel X" atom
+    ; ValuatorClass y at +148 — "Rel Y"
     mov word [r12 + 148], 2                   ; type
     mov word [r12 + 150], 11                  ; length
     mov word [r12 + 152], 2                   ; sourceid
     mov word [r12 + 154], 1                   ; number = 1 (y)
-    mov eax, [screen_h]
-    mov [r12 + 168], eax                      ; max.integral = screen_h
-    mov byte [r12 + 188], 1                   ; mode = Absolute
+    mov [r12 + 156], r14d                     ; label = "Rel Y" atom
 
     ; --- Device 2: master keyboard (id 3) at +192 ---
     mov word [r12 + 192], 3                   ; deviceid
@@ -4539,6 +4551,8 @@ handle_xinput:
     lea rsi, [reply_buf]
     mov edx, r8d
     syscall
+    pop r14
+    pop r13
     pop r12
     pop rbx
     ret
@@ -5531,6 +5545,8 @@ init_windows:
 ; ----------------------------------------------------------------------------
 window_lookup:
     push rbx
+    test edi, edi                            ; xid 0 = None — never a window, and
+    jz .wl_miss                              ; would falsely match an empty slot
     xor ebx, ebx
 .wl_loop:
     cmp ebx, MAX_WINDOWS
@@ -5720,6 +5736,10 @@ handle_create_window:
 
     ; Initialise the record.
     movzx eax, byte [r12 + 1]
+    test al, al                              ; depth = CopyFromParent (0)?
+    jnz .cw_depth_set
+    mov al, 24                               ; inherit the root depth
+.cw_depth_set:
     mov [r13 + 18], al                       ; depth
     mov eax, [r12 + 8]
     mov [r13 + 4], eax                       ; parent
@@ -5736,6 +5756,10 @@ handle_create_window:
     mov ax, [r12 + 22]
     mov [r13 + 19], al                       ; class
     mov eax, [r12 + 24]
+    test eax, eax                            ; visual = CopyFromParent (0)?
+    jnz .cw_visual_set
+    mov eax, X_ROOT_VISUAL_24                ; inherit the root visual (0x20)
+.cw_visual_set:
     mov [r13 + 20], eax                      ; visual
     mov dword [r13 + 24], 0                  ; event_mask (default 0)
     mov byte  [r13 + 28], 0                  ; mapped (false)
