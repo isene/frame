@@ -210,6 +210,9 @@ display_num:        resq 1
 keymap_is_no:       resb 1                 ; ~/.framerc keymap=no → Norwegian
 pending_vt:         resd 1                 ; Ctrl+Alt+Fn target VT for switch_vt
 mouse_sens:         resd 1                 ; pointer sensitivity %, ~/.framerc (def 100)
+cursor_rgb:         resd 1                 ; cursor fill colour 0xRRGGBB (def white)
+cursor_transp:      resd 1                 ; cursor % transparent (def 50)
+cursor_argb:        resd 1                 ; computed premultiplied interior pixel
 framerc_path:       resb 256               ; "$HOME/.framerc"
 framerc_buf:        resb 512               ; ~/.framerc contents
 
@@ -5815,7 +5818,9 @@ handle_list_properties:
 ; ----------------------------------------------------------------------------
 read_framerc:
     push rbx
-    mov dword [mouse_sens], 100               ; default before parsing
+    mov dword [mouse_sens], 100               ; defaults before parsing
+    mov dword [cursor_rgb], 0xFFFFFF
+    mov dword [cursor_transp], 50
     ; --- locate HOME in envp ---
     mov rsi, [envp]
     test rsi, rsi
@@ -5877,6 +5882,55 @@ read_framerc:
     mov byte [rsi + rax], 0                   ; NUL-terminate
     call parse_framerc
 .rf_done:
+    call compute_cursor_argb                  ; fold colour+transparency → pixel
+    pop rbx
+    ret
+
+; compute_cursor_argb — build the premultiplied ARGB interior pixel from
+; cursor_rgb (0xRRGGBB) and cursor_transp (% transparent). Premultiplied
+; because the DRM cursor plane blends that way. alpha = 100-transp percent;
+; each channel is scaled by that alpha. Default white/50% → 0x80808080.
+compute_cursor_argb:
+    push rbx
+    mov eax, 100
+    sub eax, [cursor_transp]                  ; alpha % = 100 - transp
+    jns .cca_lo
+    xor eax, eax
+.cca_lo:
+    cmp eax, 100
+    jbe .cca_hi
+    mov eax, 100
+.cca_hi:
+    mov ebx, eax                              ; ebx = alpha % (0..100)
+    mov eax, ebx                              ; alpha byte = a%*255/100
+    imul eax, 255
+    xor edx, edx
+    div dword [const_100]
+    shl eax, 24
+    mov ecx, eax                              ; ecx = pixel accumulator
+    mov eax, [cursor_rgb]                     ; R' = R*a%/100
+    shr eax, 16
+    and eax, 0xFF
+    imul eax, ebx
+    xor edx, edx
+    div dword [const_100]
+    shl eax, 16
+    or ecx, eax
+    mov eax, [cursor_rgb]                     ; G'
+    shr eax, 8
+    and eax, 0xFF
+    imul eax, ebx
+    xor edx, edx
+    div dword [const_100]
+    shl eax, 8
+    or ecx, eax
+    mov eax, [cursor_rgb]                     ; B'
+    and eax, 0xFF
+    imul eax, ebx
+    xor edx, edx
+    div dword [const_100]
+    or ecx, eax
+    mov [cursor_argb], ecx
     pop rbx
     ret
 
@@ -5917,27 +5971,34 @@ parse_framerc:
     ; sensitivity = N ?
     mov eax, [rsi]
     cmp eax, 'sens'
-    jne .pf_next_line
+    jne .pf_chk_cursor
     mov ax, [rsi + 4]
     cmp ax, 'it'
-    jne .pf_next_line
+    jne .pf_chk_cursor
     call pf_to_value
-    xor eax, eax
-.pf_si_loop:
-    movzx ecx, byte [rsi]
-    cmp cl, '0'
-    jb .pf_si_done
-    cmp cl, '9'
-    ja .pf_si_done
-    imul eax, eax, 10
-    sub ecx, '0'
-    add eax, ecx
-    inc rsi
-    jmp .pf_si_loop
-.pf_si_done:
+    call pf_parse_dec
     test eax, eax
     jz .pf_next_line                          ; ignore 0 — would freeze the pointer
     mov [mouse_sens], eax
+    jmp .pf_next_line
+.pf_chk_cursor:
+    ; cursor_color = RRGGBB  /  cursor_transparency = N
+    mov eax, [rsi]
+    cmp eax, 'curs'
+    jne .pf_next_line
+    mov al, [rsi + 7]                          ; cursor_[c]olor / [t]ransparency
+    cmp al, 'c'
+    je .pf_cur_color
+    cmp al, 't'
+    jne .pf_next_line
+    call pf_to_value
+    call pf_parse_dec
+    mov [cursor_transp], eax
+    jmp .pf_next_line
+.pf_cur_color:
+    call pf_to_value
+    call pf_parse_hex
+    mov [cursor_rgb], eax
     jmp .pf_next_line
 .pf_next_line:
     mov al, [rsi]
@@ -5950,15 +6011,18 @@ parse_framerc:
 .pf_ret:
     ret
 
-; pf_to_value — rsi at a key; skip the key's letters, then ws / '=' , leaving
-; rsi on the value's first character.
+; pf_to_value — rsi at a key; skip the key's letters and '_', then ws / '=',
+; leaving rsi on the value's first character.
 pf_to_value:
 .ptv_key:
     mov al, [rsi]
+    cmp al, '_'
+    je .ptv_key_adv
     cmp al, 'a'
     jb .ptv_sep
     cmp al, 'z'
     ja .ptv_sep
+.ptv_key_adv:
     inc rsi
     jmp .ptv_key
 .ptv_sep:
@@ -5973,6 +6037,50 @@ pf_to_value:
 .ptv_adv:
     inc rsi
     jmp .ptv_sep
+
+; pf_parse_dec — rsi at first digit; eax = decimal value, rsi advanced past it.
+pf_parse_dec:
+    xor eax, eax
+.ppd_loop:
+    movzx ecx, byte [rsi]
+    cmp cl, '0'
+    jb .ppd_done
+    cmp cl, '9'
+    ja .ppd_done
+    imul eax, eax, 10
+    sub ecx, '0'
+    add eax, ecx
+    inc rsi
+    jmp .ppd_loop
+.ppd_done:
+    ret
+
+; pf_parse_hex — rsi at first hex digit; eax = value, rsi advanced. Accepts
+; 0-9 a-f A-F (e.g. cursor_color = ff8800).
+pf_parse_hex:
+    xor eax, eax
+.pph_loop:
+    movzx ecx, byte [rsi]
+    cmp cl, '0'
+    jb .pph_done
+    cmp cl, '9'
+    jbe .pph_dig
+    or cl, 0x20                               ; fold to lowercase
+    cmp cl, 'a'
+    jb .pph_done
+    cmp cl, 'f'
+    ja .pph_done
+    sub ecx, 'a' - 10
+    jmp .pph_acc
+.pph_dig:
+    sub ecx, '0'
+.pph_acc:
+    shl eax, 4
+    or eax, ecx
+    inc rsi
+    jmp .pph_loop
+.pph_done:
+    ret
 
 ; init_keysyms — populate keysym_table. Keys shared across layouts are set
 ; unconditionally; the number row + punctuation branch on keymap_is_no
@@ -8130,9 +8238,9 @@ draw_cursor_arrow:
 .dca_col:
     cmp r12d, r13d                           ; while x <= y
     jg .dca_row_next
-    mov eax, 0x80808080                       ; 50% white, PREMULTIPLIED (DRM
-                                             ; cursor plane expects premult ARGB;
-                                             ; 0x80FFFFFF reads as opaque white)
+    mov eax, [cursor_argb]                    ; interior: premultiplied fill from
+                                             ; ~/.framerc cursor_color/_transparency
+                                             ; (default 0x80808080 = 50% white)
     test r12d, r12d
     jz .dca_black                            ; left edge
     cmp r12d, r13d

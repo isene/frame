@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.47-blue)
+![Version](https://img.shields.io/badge/version-0.0.48-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -222,8 +222,10 @@ frame reads an optional `~/.framerc` (line-based `key = value`, the CHasm
 rc convention):
 
 ```
-keymap = no          # keyboard layout: us (default) or no (Norwegian)
-sensitivity = 75     # pointer speed, percent of raw (default 100)
+keymap = no                # keyboard layout: us (default) or no (Norwegian)
+sensitivity = 75           # pointer speed, percent of raw (default 100)
+cursor_color = ffffff      # cursor fill colour, RRGGBB hex (default ffffff)
+cursor_transparency = 50   # cursor % transparent: 0 solid .. 100 invisible (default 50)
 ```
 
 `keymap`: `us` (the default, or no file) is the standard US layout. `no`
@@ -235,6 +237,11 @@ client (glass, xterm, …) picks it up.
 
 `sensitivity`: scales pointer motion (touchpad + mouse) by this percent.
 `100` is raw 1:1; lower values slow the cursor for finer control.
+
+`cursor_color` / `cursor_transparency`: the arrow's interior fill and how
+see-through it is. The black outline is always kept for contrast. Colour
+is `RRGGBB` hex; transparency `0` is solid, `100` fully invisible. Free
+alpha — the DRM cursor plane blends it in hardware.
 
 ## How it's built
 
