@@ -4052,10 +4052,92 @@ handle_xkb:
     call xkb_reply_zero
     jmp .xkb_reply_write
 .xkb_get_names:
-    mov esi, 32                              ; which=0 → no name data
-    call xkb_reply_zero
-    mov byte [rdi + 12], X_MIN_KEYCODE       ; minKeyCode
-    mov byte [rdi + 13], X_MAX_KEYCODE       ; maxKeyCode
+    ; GetNames reply for which=0x1FF5 (what xkbcommon requests). All name atoms
+    ; are None(0) — xkbcommon skips GetAtomName for None, so components/types/
+    ; levels are unnamed but valid. Key names are REAL + unique ("K008".."K255")
+    ; since xkbcommon uses them as key identifiers. Body order (per XKB spec):
+    ; keycodes, symbols, types, compat, typeNames(4), KTLevelNames(counts+9),
+    ; [indicators/vmods/groups empty], keyNames(248), [aliases empty].
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov ebx, edi                             ; slot
+    lea rdi, [reply_buf + 32]                ; body after 32-byte header
+    ; keycodes+symbols+types+compat (4) + typeNames (4) = 8 None atoms
+    xor eax, eax
+    mov ecx, 8
+    rep stosd
+    ; KTLevelNames: name 0 levels per type (counts all 0, nKTLevels=0). Avoids
+    ; the num_levels>=wire check entirely; levels are simply unnamed (optional).
+    mov dword [rdi + 0], 0                    ; n_levels_per_type[4] = {0,0,0,0}
+    add rdi, 4
+    ; (indicatorNames / virtualModNames / groupNames all empty → 0 bytes)
+    ; keyNames: one XkbKeyNameRec ("Knnn") per keycode 8..255
+    mov r14d, X_MIN_KEYCODE
+    mov r12d, KEYCODE_RANGE
+.gn_keyname:
+    mov byte [rdi], 'K'
+    mov eax, r14d
+    xor edx, edx
+    mov ecx, 100
+    div ecx                                  ; al = hundreds
+    add al, '0'
+    mov [rdi + 1], al
+    mov eax, edx
+    xor edx, edx
+    mov ecx, 10
+    div ecx                                  ; al = tens, dl = units
+    add al, '0'
+    mov [rdi + 2], al
+    add dl, '0'
+    mov [rdi + 3], dl
+    add rdi, 4
+    inc r14d
+    dec r12d
+    jnz .gn_keyname
+    ; (keyAliases empty)
+    mov r12, rdi                             ; end-of-data ptr
+    ; --- header (32 bytes) ---
+    mov eax, ebx
+    call client_meta_addr
+    mov r13d, [rax + 8]                       ; seq
+    mov r15d, [rax]                           ; fd
+    lea rdi, [reply_buf]
+    xor ecx, ecx
+    mov [rdi + 0], rcx
+    mov [rdi + 8], rcx
+    mov [rdi + 16], rcx
+    mov [rdi + 24], rcx
+    mov byte [rdi + 0], 1                     ; reply
+    mov byte [rdi + 1], 3                     ; deviceID
+    mov [rdi + 2], r13w                       ; seq
+    mov rax, r12
+    lea rcx, [reply_buf]
+    sub rax, rcx                              ; total bytes
+    mov r8d, eax
+    sub eax, 32
+    shr eax, 2
+    mov [rdi + 4], eax                        ; length
+    mov dword [rdi + 8], 0x1FF5               ; which
+    mov byte [rdi + 12], X_MIN_KEYCODE        ; minKeyCode
+    mov byte [rdi + 13], X_MAX_KEYCODE        ; maxKeyCode
+    mov byte [rdi + 14], 4                    ; nTypes
+    mov byte [rdi + 18], X_MIN_KEYCODE        ; firstKey
+    mov byte [rdi + 19], KEYCODE_RANGE        ; nKeys
+    ; nKTLevels = 0 (no level names) — header already zeroed
+    mov edi, r15d                             ; fd
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov edx, r8d
+    syscall
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
 .xkb_reply_write:
     lea rsi, [reply_buf]
     mov edi, r15d
