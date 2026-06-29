@@ -1097,6 +1097,13 @@ socket_setup:
     syscall
     test rax, rax
     js .ss_fail
+    ; Make the socket world-connectable (0777), like every real X server, so
+    ; clients running as a different user (e.g. tray apps as the real user
+    ; while frame runs as root) can connect. /tmp/.X11-unix is already sticky.
+    mov rax, 90                          ; SYS_CHMOD
+    lea rdi, [sockaddr_buf + 2]          ; sun_path
+    mov esi, 0o777
+    syscall
     ; listen with a small backlog
     mov rax, SYS_LISTEN
     mov rdi, [listen_fd]
