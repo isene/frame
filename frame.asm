@@ -206,6 +206,10 @@ DEFAULT REL
 %define RR_CRTC_ID           0x60
 %define RR_OUTPUT_ID         0x61
 %define RR_MODE_ID           0x62
+; ---- XInputExtension (XInput2) — required by GTK4, queried by Qt -----------
+%define XI_MAJOR             131
+%define XI_EVENT_BASE        91
+%define XI_ERROR_BASE        151
 %define X_RID_MASK           0x001FFFFF
 
 ; ============================================================================
@@ -625,7 +629,11 @@ log_pageflip_len    equ $ - log_pageflip - 1
 str_render:         db "RENDER"
 str_xkb:            db "XKEYBOARD"
 str_randr:          db "RANDR"
+str_xinput:         db "XInputExtension"
+str_xi_pointer:     db "Virtual core pointer"      ; 20 bytes
+str_xi_keyboard:    db "Virtual core keyboard"     ; 21 bytes
 log_xkb_minor:      db "xkb minor=", 0
+log_xi_minor:       db "xi minor=", 0
 
 ; XKB key types served by GetMap. Four canonical-ish types; every real key is
 ; assigned FOUR_LEVEL (index 3, 4 levels: base / Shift / AltGr(Mod5) / both) so
@@ -3398,6 +3406,8 @@ dispatch_request:
     je .dr_xkb
     cmp eax, RR_MAJOR
     je .dr_randr
+    cmp eax, XI_MAJOR
+    je .dr_xinput
     ; Unhandled — already logged.
     jmp .dr_done
 
@@ -3418,6 +3428,12 @@ dispatch_request:
     mov edi, ebx
     mov rsi, r12
     call handle_randr
+    jmp .dr_done
+
+.dr_xinput:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_xinput
     jmp .dr_done
 
 .dr_intern_atom:
@@ -3851,7 +3867,7 @@ handle_query_extension:
     jmp .qe_send
 .qe_try_randr:
     cmp eax, 5
-    jne .qe_send
+    jne .qe_try_xinput
     lea rsi, [r13 + 8]
     lea rdi, [str_randr]
     mov ecx, 5
@@ -3868,6 +3884,26 @@ handle_query_extension:
     mov byte [rdi + 9], RR_MAJOR
     mov byte [rdi + 10], RR_EVENT_BASE
     mov byte [rdi + 11], RR_ERROR_BASE
+    jmp .qe_send
+.qe_try_xinput:
+    cmp eax, 15
+    jne .qe_send
+    lea rsi, [r13 + 8]
+    lea rdi, [str_xinput]
+    mov ecx, 15
+.qe_cmp_xi:
+    mov dl, [rsi]
+    cmp dl, [rdi]
+    jne .qe_send
+    inc rsi
+    inc rdi
+    dec ecx
+    jnz .qe_cmp_xi
+    lea rdi, [reply_buf]
+    mov byte [rdi + 8], 1                    ; present = True
+    mov byte [rdi + 9], XI_MAJOR
+    mov byte [rdi + 10], XI_EVENT_BASE
+    mov byte [rdi + 11], XI_ERROR_BASE
 
 .qe_send:
     mov edi, [r12]
@@ -4359,6 +4395,152 @@ handle_randr:
     mov edx, r8d
     mov eax, SYS_WRITE
     syscall
+    ret
+
+; ============================================================================
+; handle_xinput — edi = slot, rsi = req. XInput2 (required by GTK4). Built
+; incrementally: XIQueryVersion answered; other minors logged.
+; ============================================================================
+handle_xinput:
+    movzx eax, byte [rsi + 1]                ; XI minor opcode
+    cmp eax, 1                               ; X_GetExtensionVersion (XI1 probe)
+    je .xi_get_ext_version
+    cmp eax, 47                              ; XIQueryVersion (XI2)
+    je .xi_query_version
+    cmp eax, 48                              ; XIQueryDevice
+    je .xi_query_device
+    cmp eax, 46                              ; XISelectEvents (void, no reply)
+    je .xi_noop
+    cmp eax, 56                              ; XIListProperties → empty
+    je .xi_empty_reply
+    cmp eax, 59                              ; XIGetProperty → empty (type=None)
+    je .xi_empty_reply
+    ; --- DIAG (temp): log unhandled XI minor opcode ---
+    push rax
+    mov rsi, log_xi_minor
+    mov edx, 9
+    call write_stderr
+    pop rax
+    call write_u64_stderr
+    mov rsi, qext_nl
+    mov edx, 1
+    call write_stderr
+    ret
+
+.xi_get_ext_version:
+    mov esi, 32
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0
+    mov word [rdi + 8], 2                     ; major_version = 2
+    mov word [rdi + 10], 0                    ; minor_version = 0
+    mov byte [rdi + 12], 1                    ; present = True
+    jmp .xi_write
+
+.xi_query_version:
+    mov esi, 32
+    call xkb_reply_zero                       ; rdi=reply_buf, r15d=fd, r8d=total
+    mov byte [rdi + 1], 0                     ; RepType (override XKB deviceID)
+    mov word [rdi + 8], 2                     ; major_version = 2
+    mov word [rdi + 10], 0                    ; minor_version = 0
+    jmp .xi_write
+
+.xi_noop:                                     ; void requests (XISelectEvents)
+    ret
+
+.xi_empty_reply:                              ; ListProperties=0 / GetProperty=None
+    mov esi, 32
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0
+    ; all-zero body = 0 properties / type None, 0 items
+    ; fall through
+
+.xi_write:
+    lea rsi, [reply_buf]
+    mov edi, r15d
+    mov edx, r8d
+    mov eax, SYS_WRITE
+    syscall
+    ret
+
+; XIQueryDevice — enumerate two master devices so GTK4/Qt see input. Master
+; pointer (id 2): button class (7 buttons) + 2 valuator classes (x,y absolute).
+; Master keyboard (id 3): key class listing keycodes 8..255. Layout offsets are
+; fixed; total 1228 bytes. r12 holds the reply base.
+.xi_query_device:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov esi, 1228
+    call xkb_reply_zero                       ; zeroes, header (type/seq/length=299)
+    mov r12, rdi                              ; reply base
+    mov byte [r12 + 1], 0                     ; RepType
+    mov word [r12 + 8], 2                     ; num_devices
+
+    ; --- Device 1: master pointer (id 2) at +32 ---
+    mov word [r12 + 32], 2                    ; deviceid
+    mov word [r12 + 34], 1                    ; use = MasterPointer
+    mov word [r12 + 36], 3                    ; attachment = keyboard
+    mov word [r12 + 38], 3                    ; num_classes
+    mov word [r12 + 40], 20                   ; name_len
+    mov byte [r12 + 42], 1                    ; enabled
+    lea rdi, [r12 + 44]                        ; name
+    lea rsi, [str_xi_pointer]
+    mov ecx, 20
+    rep movsb
+    ; ButtonClass at +64 (8 hdr + 4 state + 28 labels = 40, length 10)
+    mov word [r12 + 64], 1                    ; type = ButtonClass
+    mov word [r12 + 66], 10                   ; length
+    mov word [r12 + 68], 2                    ; sourceid
+    mov word [r12 + 70], 7                    ; num_buttons
+    ; ValuatorClass x at +104 (44, length 11)
+    mov word [r12 + 104], 2                   ; type = ValuatorClass
+    mov word [r12 + 106], 11                  ; length
+    mov word [r12 + 108], 2                   ; sourceid
+    mov word [r12 + 110], 0                   ; number = 0 (x)
+    mov eax, [screen_w]
+    mov [r12 + 124], eax                      ; max.integral = screen_w
+    mov byte [r12 + 144], 1                   ; mode = Absolute
+    ; ValuatorClass y at +148
+    mov word [r12 + 148], 2                   ; type
+    mov word [r12 + 150], 11                  ; length
+    mov word [r12 + 152], 2                   ; sourceid
+    mov word [r12 + 154], 1                   ; number = 1 (y)
+    mov eax, [screen_h]
+    mov [r12 + 168], eax                      ; max.integral = screen_h
+    mov byte [r12 + 188], 1                   ; mode = Absolute
+
+    ; --- Device 2: master keyboard (id 3) at +192 ---
+    mov word [r12 + 192], 3                   ; deviceid
+    mov word [r12 + 194], 2                   ; use = MasterKeyboard
+    mov word [r12 + 196], 2                   ; attachment = pointer
+    mov word [r12 + 198], 1                   ; num_classes
+    mov word [r12 + 200], 21                  ; name_len
+    mov byte [r12 + 202], 1                   ; enabled
+    lea rdi, [r12 + 204]                       ; name
+    lea rsi, [str_xi_keyboard]
+    mov ecx, 21
+    rep movsb
+    ; KeyClass at +228 (8 hdr + 248*4 keycodes = 1000, length 250)
+    mov word [r12 + 228], 0                   ; type = KeyClass
+    mov word [r12 + 230], 250                 ; length
+    mov word [r12 + 232], 3                   ; sourceid
+    mov word [r12 + 234], KEYCODE_RANGE       ; num_keycodes = 248
+    lea rdi, [r12 + 236]
+    mov eax, X_MIN_KEYCODE
+.xiqd_kc:
+    mov [rdi], eax                            ; keycode
+    add rdi, 4
+    inc eax
+    cmp eax, X_MAX_KEYCODE + 1                ; 256 → writes 8..255 (248 keys)
+    jb .xiqd_kc
+
+    mov edi, r15d                             ; fd
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov edx, r8d
+    syscall
+    pop r12
+    pop rbx
     ret
 
 ; ============================================================================
