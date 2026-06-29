@@ -278,6 +278,7 @@ atom_strings:       resb ATOM_STRINGS_CAP
 ; bytes — at the full keycode range plus 1 keysym/keycode that's ~1 KB;
 ; future reply types like QueryFont return more).
 reply_buf:          resb 16384
+xkb_getmap_present: resd 1               ; GetMap reply present mask (echoes req)
 
 ; ---- Phase 4b/4g window table ---------------------------------------------
 ; windows[MAX_WINDOWS] — one 48-byte record per live window. Slot 0
@@ -617,6 +618,53 @@ log_pageflip_len    equ $ - log_pageflip - 1
 str_render:         db "RENDER"
 str_xkb:            db "XKEYBOARD"
 log_xkb_minor:      db "xkb minor=", 0
+
+; XKB key types served by GetMap. Four canonical-ish types; every real key is
+; assigned FOUR_LEVEL (index 3, 4 levels: base / Shift / AltGr(Mod5) / both) so
+; one uniform width-4 sym map covers base+shift+AltGr. Each xkbKeyTypeWireDesc
+; is 8 bytes (mask, realMods, vmods:2, numLevels, nMapEntries, preserve, pad)
+; followed by nMapEntries xkbKTSetMapEntryWireDesc (level, realMods, vmods:2).
+align 4
+xkb_types_blob:
+    db 0x00, 0x00              ; type 0 ONE_LEVEL: mask, realMods
+    dw 0x0000                  ;   vmods
+    db 1, 0, 0, 0              ;   numLevels=1, nMapEntries=0, preserve, pad
+    db 0x01, 0x01              ; type 1 TWO_LEVEL: mask=Shift
+    dw 0x0000
+    db 2, 1, 0, 0              ;   numLevels=2, nMapEntries=1
+    db 1, 0x01                 ;     entry: level1 on Shift
+    dw 0x0000
+    db 0x03, 0x03              ; type 2 ALPHABETIC: mask=Shift|Lock
+    dw 0x0000
+    db 2, 2, 0, 0              ;   numLevels=2, nMapEntries=2
+    db 1, 0x01                 ;     level1 on Shift
+    dw 0x0000
+    db 1, 0x02                 ;     level1 on Lock
+    dw 0x0000
+    db 0x81, 0x81              ; type 3 FOUR_LEVEL: mask=Shift|Mod5
+    dw 0x0000
+    db 4, 3, 0, 0              ;   numLevels=4, nMapEntries=3
+    db 1, 0x01                 ;     level1 on Shift
+    dw 0x0000
+    db 2, 0x80                 ;     level2 on Mod5 (AltGr)
+    dw 0x0000
+    db 3, 0x81                 ;     level3 on Shift|Mod5
+    dw 0x0000
+xkb_types_blob_end:
+XKB_TYPES_BYTES equ xkb_types_blob_end - xkb_types_blob
+
+; Modifier map: 8 keys → real-mod mask, sorted by keycode. kc108 is Alt_R(Mod1)
+; on US, AltGr(Mod5) on Norwegian — patched at emit time. 2 bytes each.
+xkb_modmap_blob:
+    db 37, 0x04                ; Control_L
+    db 50, 0x01                ; Shift_L
+    db 62, 0x01                ; Shift_R
+    db 64, 0x08                ; Alt_L (Mod1)
+    db 105, 0x04               ; Control_R
+    db 108, 0x08               ; Alt_R/AltGr  (mods byte = blob+11)
+    db 133, 0x40               ; Super_L (Mod4)
+    db 134, 0x40               ; Super_R (Mod4)
+XKB_MODMAP_BYTES equ $ - xkb_modmap_blob
 dbg_ag_tag:         db 10, "AG: "
 dbg_ag_tag_len      equ $ - dbg_ag_tag
 dbg_sp:             db " "
@@ -3808,6 +3856,16 @@ handle_xkb:
     jz .xkb_use_ext
     cmp eax, 24                              ; 24 = XkbGetDeviceInfo
     je .xkb_get_device_info
+    cmp eax, 8                               ; 8  = XkbGetMap
+    je .xkb_get_map
+    cmp eax, 6                               ; 6  = XkbGetControls
+    je .xkb_get_controls
+    cmp eax, 10                              ; 10 = XkbGetCompatMap
+    je .xkb_get_compat_map
+    cmp eax, 13                              ; 13 = XkbGetIndicatorMap
+    je .xkb_get_indicator_map
+    cmp eax, 17                              ; 17 = XkbGetNames
+    je .xkb_get_names
     ; --- DIAG (temporary): log unhandled XKB minor opcode ---
     push rax
     mov rsi, log_xkb_minor
@@ -3849,6 +3907,163 @@ handle_xkb:
     pop rbx
     ret
 
+.xkb_get_map:
+    ; Serialize frame's keyboard into an XKB GetMap reply: 40-byte header, then
+    ; key types (static blob), then a per-keycode symbol map for 8..255, then
+    ; the modifier map. present = KeyTypes|KeySyms|ModifierMap (0x07); actions/
+    ; behaviors/vmods/vmodmap omitted. Each real key → 1 group, width 4,
+    ; FOUR_LEVEL type, syms [base, shift, AltGr, AltGr+Shift] from keysym_table.
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov ebx, edi                             ; slot
+    ; Echo the request's `full` mask as the reply's present, OR'd with the
+    ; sections we always write (types|syms|modmap). xkbcommon rejects the map
+    ; unless present contains every component it requested; the extras it asks
+    ; for (actions/explicit/vmods/vmodmap) are legitimately empty (count 0).
+    movzx eax, word [rsi + 6]                ; req full mask
+    or  eax, 0x07
+    mov [xkb_getmap_present], eax
+
+    ; --- key types (copy the 56-byte static blob) ---
+    lea rdi, [reply_buf + 40]                ; data follows the 40-byte header
+    lea rsi, [xkb_types_blob]
+    mov ecx, XKB_TYPES_BYTES
+    rep movsb
+
+    ; --- per-keycode symbol maps (KEYCODE_RANGE keys) ---
+    xor r10d, r10d                           ; totalSyms
+    xor r14d, r14d                           ; keycode index 0..RANGE-1
+    lea r9, [keysym_table]
+.gm_sym_loop:
+    mov eax, [r9 + 0]                        ; base   (level 0)
+    mov ecx, [r9 + 4]                        ; shift  (level 1)
+    mov edx, [r9 + 16]                       ; AltGr  (level 2)
+    mov ebp, [r9 + 20]                       ; AltGr+Shift (level 3)
+    mov r11d, eax
+    or  r11d, ecx
+    or  r11d, edx
+    or  r11d, ebp
+    jz  .gm_sym_empty
+    mov dword [rdi + 0], 3                    ; ktIndex = {3,0,0,0} (FOUR_LEVEL)
+    mov byte  [rdi + 4], 1                    ; groupInfo: 1 group
+    mov byte  [rdi + 5], 4                    ; width
+    mov word  [rdi + 6], 4                    ; nSyms
+    mov [rdi + 8], eax
+    mov [rdi + 12], ecx
+    mov [rdi + 16], edx
+    mov [rdi + 20], ebp
+    add rdi, 24
+    add r10d, 4
+    jmp .gm_sym_next
+.gm_sym_empty:
+    mov dword [rdi + 0], 0                    ; ktIndex 0
+    mov dword [rdi + 4], 0                    ; groupInfo 0, width 0, nSyms 0
+    add rdi, 8
+.gm_sym_next:
+    add r9, 24
+    inc r14d
+    cmp r14d, KEYCODE_RANGE
+    jb  .gm_sym_loop
+
+    ; --- key actions: per-key counts, all zero (no actions) ---
+    ; Advertised present, so xkbcommon needs firstKeyAction == min_key_code and
+    ; one count byte per key in [min,max]. totalActs = 0 → no action structs.
+    mov ecx, KEYCODE_RANGE
+    xor eax, eax
+    rep stosb                                ; KEYCODE_RANGE zero count bytes
+
+    ; --- modifier map (copy 16-byte blob, patch kc108 for Norwegian) ---
+    lea rsi, [xkb_modmap_blob]
+    mov ecx, XKB_MODMAP_BYTES
+    rep movsb
+    cmp byte [keymap_is_no], 0
+    je  .gm_modmap_done
+    mov byte [rdi - 5], 0x80                  ; kc108 mods → Mod5 (AltGr)
+.gm_modmap_done:
+    mov r12, rdi                             ; end-of-data ptr
+
+    ; --- header (40 bytes) ---
+    mov eax, ebx
+    call client_meta_addr                    ; rax = meta
+    mov r13d, [rax + 8]                       ; seq
+    mov r15d, [rax]                           ; fd
+    lea rdi, [reply_buf]
+    xor ecx, ecx
+    mov [rdi + 0], rcx
+    mov [rdi + 8], rcx
+    mov [rdi + 16], rcx
+    mov [rdi + 24], rcx
+    mov [rdi + 32], rcx
+    mov byte [rdi + 0], 1                     ; reply
+    mov byte [rdi + 1], 3                     ; deviceID
+    mov [rdi + 2], r13w                       ; seq
+    mov rax, r12
+    lea rcx, [reply_buf]
+    sub rax, rcx                              ; total reply bytes
+    mov r8d, eax                              ; (saved for write)
+    sub eax, 32
+    shr eax, 2
+    mov [rdi + 4], eax                        ; length = (total-32)/4
+    mov byte [rdi + 10], X_MIN_KEYCODE        ; minKeyCode
+    mov byte [rdi + 11], X_MAX_KEYCODE        ; maxKeyCode
+    mov eax, [xkb_getmap_present]            ; present (req full | types|syms|modmap)
+    mov [rdi + 12], ax
+    mov byte [rdi + 15], 4                    ; nTypes
+    mov byte [rdi + 16], 4                    ; totalTypes
+    mov byte [rdi + 17], X_MIN_KEYCODE        ; firstKeySym
+    mov word [rdi + 18], r10w                 ; totalSyms
+    mov byte [rdi + 20], KEYCODE_RANGE        ; nKeySyms
+    mov byte [rdi + 21], X_MIN_KEYCODE        ; firstKeyAction
+    mov byte [rdi + 24], KEYCODE_RANGE        ; nKeyActions (totalActs stays 0)
+    mov byte [rdi + 31], 37                   ; firstModMapKey
+    mov byte [rdi + 32], 8                    ; nModMapKeys
+    mov byte [rdi + 33], 8                    ; totalModMapKeys
+    mov edi, r15d                             ; fd
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov edx, r8d
+    syscall
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+    ; The remaining keymap replies xkbcommon needs are minimal-but-valid: it
+    ; reads all five before validating, and the real keyboard data is already
+    ; in GetMap. These are mostly-zero fixed replies via xkb_reply_zero.
+.xkb_get_controls:
+    mov esi, 92                              ; fixed size incl. perKeyRepeat[32]
+    call xkb_reply_zero
+    mov byte [rdi + 9], 1                    ; numGroups = 1
+    jmp .xkb_reply_write
+.xkb_get_compat_map:
+    mov esi, 32                              ; groups=0, nSI=0 → no body
+    call xkb_reply_zero
+    jmp .xkb_reply_write
+.xkb_get_indicator_map:
+    mov esi, 32                              ; which=0, nIndicators=0 → no body
+    call xkb_reply_zero
+    jmp .xkb_reply_write
+.xkb_get_names:
+    mov esi, 32                              ; which=0 → no name data
+    call xkb_reply_zero
+    mov byte [rdi + 12], X_MIN_KEYCODE       ; minKeyCode
+    mov byte [rdi + 13], X_MAX_KEYCODE       ; maxKeyCode
+.xkb_reply_write:
+    lea rsi, [reply_buf]
+    mov edi, r15d
+    mov edx, r8d
+    mov eax, SYS_WRITE
+    syscall
+    ret
+
 .xkb_use_ext:
     push rbx
     mov ebx, edi
@@ -3874,6 +4089,36 @@ handle_xkb:
     mov rdx, 32
     syscall
     pop rax
+    pop rbx
+    ret
+
+; xkb_reply_zero — edi=slot, esi=total bytes. Zeroes reply_buf and writes the
+; common reply header (type=1, deviceID=3, seq, length=(total-32)/4). Returns
+; rdi=reply_buf, r15d=fd, r8d=total for the caller to patch fields + write.
+; (Non-local label: kept outside handle_xkb's local-label scope on purpose.)
+xkb_reply_zero:
+    push rbx
+    mov ebx, edi
+    mov r8d, esi
+    mov eax, ebx
+    call client_meta_addr
+    mov r15d, [rax]                          ; fd
+    mov r9d, [rax + 8]                        ; seq
+    lea rdi, [reply_buf]
+    mov ecx, r8d
+    add ecx, 7
+    shr ecx, 3                               ; qwords to clear
+    xor eax, eax
+    push rdi
+    rep stosq
+    pop rdi
+    mov byte [rdi + 0], 1                     ; reply
+    mov byte [rdi + 1], 3                     ; deviceID
+    mov [rdi + 2], r9w                        ; seq
+    mov eax, r8d
+    sub eax, 32
+    shr eax, 2
+    mov [rdi + 4], eax                        ; length
     pop rbx
     ret
 
