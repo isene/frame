@@ -199,6 +199,13 @@ DEFAULT REL
 %define XKB_MAJOR            135
 %define XKB_EVENT_BASE       85
 %define XKB_ERROR_BASE       137
+; ---- RANDR extension — gives toolkits real screen geometry (1 crtc/output/mode)
+%define RR_MAJOR             139
+%define RR_EVENT_BASE        89
+%define RR_ERROR_BASE        147
+%define RR_CRTC_ID           0x60
+%define RR_OUTPUT_ID         0x61
+%define RR_MODE_ID           0x62
 %define X_RID_MASK           0x001FFFFF
 
 ; ============================================================================
@@ -617,6 +624,7 @@ log_pageflip:       db "frame: first PAGE_FLIP rc=", 0
 log_pageflip_len    equ $ - log_pageflip - 1
 str_render:         db "RENDER"
 str_xkb:            db "XKEYBOARD"
+str_randr:          db "RANDR"
 log_xkb_minor:      db "xkb minor=", 0
 
 ; XKB key types served by GetMap. Four canonical-ish types; every real key is
@@ -3388,6 +3396,8 @@ dispatch_request:
     je .dr_render
     cmp eax, XKB_MAJOR
     je .dr_xkb
+    cmp eax, RR_MAJOR
+    je .dr_randr
     ; Unhandled — already logged.
     jmp .dr_done
 
@@ -3402,6 +3412,12 @@ dispatch_request:
     mov edi, ebx
     mov rsi, r12
     call handle_xkb
+    jmp .dr_done
+
+.dr_randr:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_randr
     jmp .dr_done
 
 .dr_intern_atom:
@@ -3815,7 +3831,7 @@ handle_query_extension:
     jmp .qe_send
 .qe_try_xkb:
     cmp eax, 9
-    jne .qe_send
+    jne .qe_try_randr
     lea rsi, [r13 + 8]
     lea rdi, [str_xkb]
     mov ecx, 9
@@ -3832,6 +3848,26 @@ handle_query_extension:
     mov byte [rdi + 9], XKB_MAJOR
     mov byte [rdi + 10], XKB_EVENT_BASE
     mov byte [rdi + 11], XKB_ERROR_BASE
+    jmp .qe_send
+.qe_try_randr:
+    cmp eax, 5
+    jne .qe_send
+    lea rsi, [r13 + 8]
+    lea rdi, [str_randr]
+    mov ecx, 5
+.qe_cmp_rr:
+    mov dl, [rsi]
+    cmp dl, [rdi]
+    jne .qe_send
+    inc rsi
+    inc rdi
+    dec ecx
+    jnz .qe_cmp_rr
+    lea rdi, [reply_buf]
+    mov byte [rdi + 8], 1                    ; present = True
+    mov byte [rdi + 9], RR_MAJOR
+    mov byte [rdi + 10], RR_EVENT_BASE
+    mov byte [rdi + 11], RR_ERROR_BASE
 
 .qe_send:
     mov edi, [r12]
@@ -4202,6 +4238,125 @@ xkb_reply_zero:
     shr eax, 2
     mov [rdi + 4], eax                        ; length
     pop rbx
+    ret
+
+; ============================================================================
+; handle_randr — edi = slot, rsi = req. RANDR: frame models its panel as one
+; CRTC + one output + one mode, so toolkits see a real screen (not "fake").
+; Reuses xkb_reply_zero for the common header (then overwrites byte[1]).
+; ============================================================================
+handle_randr:
+    movzx eax, byte [rsi + 1]                ; RANDR minor opcode
+    cmp eax, 0                               ; QueryVersion
+    je .rr_query_version
+    cmp eax, 8                               ; GetScreenResources
+    je .rr_get_resources
+    cmp eax, 25                              ; GetScreenResourcesCurrent
+    je .rr_get_resources
+    cmp eax, 9                               ; GetOutputInfo
+    je .rr_get_output_info
+    cmp eax, 20                              ; GetCrtcInfo
+    je .rr_get_crtc_info
+    cmp eax, 6                               ; GetScreenSizeRange
+    je .rr_get_size_range
+    cmp eax, 31                              ; GetOutputPrimary
+    je .rr_get_output_primary
+    ret                                      ; SelectInput(4) etc.: no reply
+
+.rr_query_version:
+    mov esi, 32
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0
+    mov dword [rdi + 8], 1                    ; majorVersion = 1
+    mov dword [rdi + 12], 6                   ; minorVersion = 6
+    jmp .rr_write
+
+.rr_get_size_range:
+    mov esi, 32
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0
+    mov word [rdi + 8], 320                   ; minWidth
+    mov word [rdi + 10], 200                  ; minHeight
+    mov word [rdi + 12], 0x4000               ; maxWidth
+    mov word [rdi + 14], 0x4000               ; maxHeight
+    jmp .rr_write
+
+.rr_get_output_primary:
+    mov esi, 32
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0
+    mov dword [rdi + 8], RR_OUTPUT_ID         ; output
+    jmp .rr_write
+
+.rr_get_resources:
+    mov esi, 80                              ; 32 header + 48 body (1 crtc/out/mode)
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0
+    mov dword [rdi + 8], 1                    ; timestamp
+    mov dword [rdi + 12], 1                   ; configTimestamp
+    mov word [rdi + 16], 1                    ; nCrtcs
+    mov word [rdi + 18], 1                    ; nOutputs
+    mov word [rdi + 20], 1                    ; nModes
+    mov word [rdi + 22], 7                    ; nbytesNames ("default")
+    mov dword [rdi + 32], RR_CRTC_ID          ; crtcs[0]
+    mov dword [rdi + 36], RR_OUTPUT_ID        ; outputs[0]
+    mov dword [rdi + 40], RR_MODE_ID          ; modeInfo.id
+    mov eax, [screen_w]
+    mov [rdi + 44], ax                        ; modeInfo.width
+    mov eax, [screen_h]
+    mov [rdi + 46], ax                        ; modeInfo.height
+    mov dword [rdi + 48], 148500000           ; dotClock
+    mov word [rdi + 56], 2200                 ; hTotal  (refresh ≈ 60)
+    mov word [rdi + 64], 1125                 ; vTotal
+    mov word [rdi + 66], 7                    ; modeInfo.nameLength
+    mov dword [rdi + 72], 'defa'              ; names block: "default"
+    mov word [rdi + 76], 'ul'
+    mov byte [rdi + 78], 't'
+    jmp .rr_write
+
+.rr_get_output_info:
+    mov esi, 52                              ; 36 header + 16 body
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0                     ; status = Success
+    mov dword [rdi + 8], 1                    ; timestamp
+    mov dword [rdi + 12], RR_CRTC_ID          ; crtc
+    mov dword [rdi + 16], X_SCREEN_W_MM       ; mmWidth
+    mov dword [rdi + 20], X_SCREEN_H_MM       ; mmHeight
+    mov word [rdi + 26], 1                    ; nCrtcs (connection=Connected at +24)
+    mov word [rdi + 28], 1                    ; nModes
+    mov word [rdi + 30], 1                    ; nPreferred
+    mov word [rdi + 34], 7                    ; nameLength
+    mov dword [rdi + 36], RR_CRTC_ID          ; crtcs[0]
+    mov dword [rdi + 40], RR_MODE_ID          ; modes[0]
+    mov dword [rdi + 44], 'defa'              ; name "default"
+    mov word [rdi + 48], 'ul'
+    mov byte [rdi + 50], 't'
+    jmp .rr_write
+
+.rr_get_crtc_info:
+    mov esi, 40                              ; 32 header + 8 body
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0                     ; status
+    mov dword [rdi + 8], 1                    ; timestamp (x=0,y=0 at +12,+14)
+    mov eax, [screen_w]
+    mov [rdi + 16], ax                        ; width
+    mov eax, [screen_h]
+    mov [rdi + 18], ax                        ; height
+    mov dword [rdi + 20], RR_MODE_ID          ; mode
+    mov word [rdi + 24], 1                    ; rotation = Rotate_0
+    mov word [rdi + 26], 1                    ; rotations
+    mov word [rdi + 28], 1                    ; nOutput
+    mov word [rdi + 30], 1                    ; nPossibleOutput
+    mov dword [rdi + 32], RR_OUTPUT_ID        ; outputs[0]
+    mov dword [rdi + 36], RR_OUTPUT_ID        ; possibleOutputs[0]
+    jmp .rr_write
+
+.rr_write:
+    lea rsi, [reply_buf]
+    mov edi, r15d
+    mov edx, r8d
+    mov eax, SYS_WRITE
+    syscall
     ret
 
 ; ============================================================================
