@@ -3384,6 +3384,8 @@ dispatch_request:
     je .dr_set_input_focus
     cmp eax, 43
     je .dr_get_input_focus
+    cmp eax, 38
+    je .dr_query_pointer
     cmp eax, 55
     je .dr_create_gc
     cmp eax, 97
@@ -3428,6 +3430,12 @@ dispatch_request:
     mov edi, ebx
     mov rsi, r12
     call handle_xkb
+    jmp .dr_done
+
+.dr_query_pointer:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_query_pointer
     jmp .dr_done
 
 .dr_randr:
@@ -4280,6 +4288,32 @@ xkb_reply_zero:
     shr eax, 2
     mov [rdi + 4], eax                        ; length
     pop rbx
+    ret
+
+; ============================================================================
+; handle_query_pointer — edi = slot, rsi = req. Reports the cursor position and
+; button/modifier state. GTK and Qt issue this during seat setup and BLOCK on
+; the reply; an unanswered QueryPointer stalls the client forever before it
+; ever maps a window (the cause of "GTK maps nothing on frame").
+; ============================================================================
+handle_query_pointer:
+    mov esi, 32
+    call xkb_reply_zero                       ; rdi=reply, r15d=fd, r8d=total
+    mov byte [rdi + 1], 1                      ; sameScreen = True
+    mov dword [rdi + 8], X_ROOT_WINDOW         ; root
+    mov dword [rdi + 12], 0                    ; child = None (no mapped window yet)
+    mov eax, [cursor_x]
+    mov [rdi + 16], ax                         ; rootX
+    mov [rdi + 20], ax                         ; winX (queried window is the root)
+    mov eax, [cursor_y]
+    mov [rdi + 18], ax                         ; rootY
+    mov [rdi + 22], ax                         ; winY
+    ; mask (+24) = 0: no buttons / modifiers held
+    lea rsi, [reply_buf]
+    mov edi, r15d
+    mov edx, r8d
+    mov eax, SYS_WRITE
+    syscall
     ret
 
 ; ============================================================================
