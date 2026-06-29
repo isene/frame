@@ -209,6 +209,7 @@ client_fd:          resq 1
 display_num:        resq 1
 keymap_is_no:       resb 1                 ; ~/.framerc keymap=no → Norwegian
 pending_vt:         resd 1                 ; Ctrl+Alt+Fn target VT for switch_vt
+mouse_sens:         resd 1                 ; pointer sensitivity %, ~/.framerc (def 100)
 framerc_path:       resb 256               ; "$HOME/.framerc"
 framerc_buf:        resb 512               ; ~/.framerc contents
 
@@ -553,6 +554,7 @@ SECTION .rodata
 x11_sock_dir:       db "/tmp/.X11-unix/X", 0
 str_framerc:        db "/.framerc", 0
 str_dev_tty0:       db "/dev/tty0", 0
+const_100:          dd 100
 vendor_str:         db "frame"
 
 log_prefix:         db "frame: ", 0
@@ -4974,11 +4976,34 @@ handle_change_window_attributes:
     mov ecx, [r12 + 8]
     test ecx, ecx
     jz .cwa_done
+    ; frame keeps ONE event_mask per window, but X masks are per-client. If a
+    ; NON-owner (e.g. the WM selecting PropertyChange on a client's window)
+    ; changes attributes, OR its selection into the existing mask instead of
+    ; overwriting — else it wipes the owner's ButtonPress/Motion bits and input
+    ; to that window dies. Owner slot is encoded in the xid's high bits (bogus
+    ; for root → treated as non-owner, so root's mask accumulates, which is
+    ; what we want for SubstructureRedirect/Notify selectors).
+    mov eax, [r13]                           ; window xid
+    sub eax, X_RID_BASE
+    shr eax, 21                              ; owner slot
+    cmp eax, ebx                             ; requester slot
+    je .cwa_owner
+    mov eax, [r13 + 24]                       ; existing mask
+    push rax
+    lea rdx, [r12 + 12]
+    call apply_cw_values                      ; [r13+24] = requester's new mask
+    mov r8d, [r13 + 24]                       ; r8d = THIS request's selection
+    pop rax
+    or [r13 + 24], eax                        ; combined mask for delivery
+    jmp .cwa_redirect
+.cwa_owner:
     lea rdx, [r12 + 12]
     call apply_cw_values
-    ; SubstructureRedirect ownership transfer.
-    mov eax, [r13 + 24]
-    test eax, EM_SUBSTRUCTURE_REDIRECT
+    mov r8d, [r13 + 24]                       ; owner's new (full) mask
+.cwa_redirect:
+    ; SubstructureRedirect ownership keys on what THIS request selected (r8d),
+    ; not the combined mask — else every later CWA would re-claim redirect.
+    test r8d, EM_SUBSTRUCTURE_REDIRECT
     jz .cwa_clear_redirect
     mov [r13 + 30], bl                       ; this client claims the redirect
     jmp .cwa_done
@@ -5735,6 +5760,14 @@ handle_list_properties:
     mov dword [keysym_table + (%1 - X_MIN_KEYCODE) * 24 + 20], %3
 %endmacro
 
+; SCALE_SENS — scale the cursor delta in eax by mouse_sens%: eax = eax*sens/100.
+; Clobbers edx (and eax). mouse_sens defaults to 100 (= no change).
+%macro SCALE_SENS 0
+    imul eax, [mouse_sens]
+    cdq
+    idiv dword [const_100]
+%endmacro
+
 ; X11 keysym values (subset of keysymdef.h we use).
 %define XK_BackSpace    0xFF08
 %define XK_Tab          0xFF09
@@ -5774,6 +5807,7 @@ handle_list_properties:
 ; ----------------------------------------------------------------------------
 read_framerc:
     push rbx
+    mov dword [mouse_sens], 100               ; default before parsing
     ; --- locate HOME in envp ---
     mov rsi, [envp]
     test rsi, rsi
@@ -5857,45 +5891,46 @@ parse_framerc:
     inc rsi
     jmp .pf_skip_ws
 .pf_key:
+    ; keymap = no ?
     mov eax, [rsi]
     cmp eax, 'keym'
-    jne .pf_next_line
+    jne .pf_chk_sens
     mov ax, [rsi + 4]
     cmp ax, 'ap'
-    jne .pf_next_line
-    add rsi, 6                               ; past "keymap"
-.pf_skip2:
-    mov al, [rsi]
-    cmp al, ' '
-    je .pf_s2_adv
-    cmp al, 9
-    je .pf_s2_adv
-    cmp al, '='
-    je .pf_s2_adv
-    jmp .pf_val
-.pf_s2_adv:
-    inc rsi
-    jmp .pf_skip2
-.pf_val:
+    jne .pf_chk_sens
+    call pf_to_value
     cmp byte [rsi], 'n'
-    jne .pf_ret
+    jne .pf_next_line
     cmp byte [rsi + 1], 'o'
-    jne .pf_ret
-    mov al, [rsi + 2]                         ; "no" must end here
-    test al, al
-    je .pf_set
-    cmp al, ' '
-    je .pf_set
-    cmp al, 9
-    je .pf_set
-    cmp al, 13
-    je .pf_set
-    cmp al, 10
-    je .pf_set
-    jmp .pf_ret
-.pf_set:
+    jne .pf_next_line
     mov byte [keymap_is_no], 1
-    ret
+    jmp .pf_next_line
+.pf_chk_sens:
+    ; sensitivity = N ?
+    mov eax, [rsi]
+    cmp eax, 'sens'
+    jne .pf_next_line
+    mov ax, [rsi + 4]
+    cmp ax, 'it'
+    jne .pf_next_line
+    call pf_to_value
+    xor eax, eax
+.pf_si_loop:
+    movzx ecx, byte [rsi]
+    cmp cl, '0'
+    jb .pf_si_done
+    cmp cl, '9'
+    ja .pf_si_done
+    imul eax, eax, 10
+    sub ecx, '0'
+    add eax, ecx
+    inc rsi
+    jmp .pf_si_loop
+.pf_si_done:
+    test eax, eax
+    jz .pf_next_line                          ; ignore 0 — would freeze the pointer
+    mov [mouse_sens], eax
+    jmp .pf_next_line
 .pf_next_line:
     mov al, [rsi]
     test al, al
@@ -5906,6 +5941,30 @@ parse_framerc:
     jmp .pf_line
 .pf_ret:
     ret
+
+; pf_to_value — rsi at a key; skip the key's letters, then ws / '=' , leaving
+; rsi on the value's first character.
+pf_to_value:
+.ptv_key:
+    mov al, [rsi]
+    cmp al, 'a'
+    jb .ptv_sep
+    cmp al, 'z'
+    ja .ptv_sep
+    inc rsi
+    jmp .ptv_key
+.ptv_sep:
+    mov al, [rsi]
+    cmp al, ' '
+    je .ptv_adv
+    cmp al, 9
+    je .ptv_adv
+    cmp al, '='
+    je .ptv_adv
+    ret
+.ptv_adv:
+    inc rsi
+    jmp .ptv_sep
 
 ; init_keysyms — populate keysym_table. Keys shared across layouts are set
 ; unconditionally; the number row + punctuation branch on keymap_is_no
@@ -6530,8 +6589,9 @@ dispatch_input_event:
     je .die_wheel
     jmp .die_done
 .die_rel_x:
-    mov eax, [cursor_x]
-    add eax, edx
+    mov eax, edx
+    SCALE_SENS
+    add eax, [cursor_x]
     jns .die_rx_hi
     xor eax, eax
 .die_rx_hi:
@@ -6542,8 +6602,9 @@ dispatch_input_event:
     mov [cursor_x], eax
     jmp .die_motion
 .die_rel_y:
-    mov eax, [cursor_y]
-    add eax, edx
+    mov eax, edx
+    SCALE_SENS
+    add eax, [cursor_y]
     jns .die_ry_hi
     xor eax, eax
 .die_ry_hi:
@@ -6601,8 +6662,12 @@ dispatch_input_event:
     xor r8d, r9d
     sub r8d, r9d
     add [tap_moved], r8d
-    cmp dword [finger_count], 2               ; 2+ fingers: no cursor X move
-    jge .die_done
+    cmp dword [finger_count], 2               ; <2 fingers: move
+    jl .die_abs_x_apply
+    cmp dword [button_state], 0                ; button held → drag: move anyway
+    je .die_done                               ; 2+ fingers, no button → scroll (skip X)
+.die_abs_x_apply:
+    SCALE_SENS
     add eax, [cursor_x]
     jns .die_abs_x_hi
     xor eax, eax
@@ -6629,8 +6694,12 @@ dispatch_input_event:
     xor r8d, r9d
     sub r8d, r9d
     add [tap_moved], r8d
-    cmp dword [finger_count], 2               ; 2+ fingers: scroll, don't move
-    jge .die_scroll_y
+    cmp dword [finger_count], 2               ; <2 fingers: move
+    jl .die_abs_y_apply
+    cmp dword [button_state], 0                ; button held → drag, not scroll
+    je .die_scroll_y
+.die_abs_y_apply:
+    SCALE_SENS
     add eax, [cursor_y]
     jns .die_abs_y_hi
     xor eax, eax

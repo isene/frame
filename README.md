@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.45-blue)
+![Version](https://img.shields.io/badge/version-0.0.46-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -216,21 +216,25 @@ real keysyms.
 `sudo`, or `sudo usermod -aG input geir && reboot`. From a VT (where
 phase 2b runs anyway) this is automatic if you use `sudo`.
 
-### Keyboard layout (`~/.framerc`)
+### Config (`~/.framerc`)
 
 frame reads an optional `~/.framerc` (line-based `key = value`, the CHasm
-rc convention). One key so far:
+rc convention):
 
 ```
-keymap = no        # Norwegian (ISO). Default: us
+keymap = no          # keyboard layout: us (default) or no (Norwegian)
+sensitivity = 75     # pointer speed, percent of raw (default 100)
 ```
 
-`us` (the default, or no file) is the standard US layout. `no` is
-Norwegian: `Shift+6` = `&`, the `ø æ å` keys, `< >` on the ISO key left
+`keymap`: `us` (the default, or no file) is the standard US layout. `no`
+is Norwegian: `Shift+6` = `&`, the `ø æ å` keys, `< >` on the ISO key left
 of `Z`, Norwegian punctuation, and **AltGr** (right Alt = ISO_Level3_Shift
-= Mod5) for `@ £ $ { } [ ] \ € ~`. The layout is delivered to clients via
+= Mod5) for `@ £ $ { } [ ] \ € ~`. Delivered to clients via
 `GetKeyboardMapping` (6 keysyms/keycode, AltGr at level 3), so any X
 client (glass, xterm, …) picks it up.
+
+`sensitivity`: scales pointer motion (touchpad + mouse) by this percent.
+`100` is raw 1:1; lower values slow the cursor for finer control.
 
 ## How it's built
 
