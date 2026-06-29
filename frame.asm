@@ -634,6 +634,7 @@ str_xi_pointer:     db "Virtual core pointer"      ; 20 bytes
 str_xi_keyboard:    db "Virtual core keyboard"     ; 21 bytes
 str_rel_x:          db "Rel X"
 str_rel_y:          db "Rel Y"
+str_monitor_default: db "default"
 log_xkb_minor:      db "xkb minor=", 0
 log_xi_minor:       db "xi minor=", 0
 
@@ -778,6 +779,7 @@ predef_atom_stream:
     ATM "WM_TRANSIENT_FOR"
     ATM "Rel X"                              ; XInput2 pointer axis labels
     ATM "Rel Y"
+    ATM "default"                            ; RANDR monitor / output name
     db 0                                     ; terminator
 
 ; ---- probe-mode strings ---------------------------------------------------
@@ -4301,9 +4303,11 @@ handle_randr:
     je .rr_get_size_range
     cmp eax, 31                              ; GetOutputPrimary
     je .rr_get_output_primary
-    ret                                      ; SelectInput(4) / GetMonitors(42): none
-                                             ; (we advertise 1.4 so toolkits use
-                                             ;  GetScreenResources, not GetMonitors)
+    cmp eax, 42                              ; GetMonitors — strip calls this DIRECTLY
+    je .rr_get_monitors                      ; (ignores the advertised version), so it
+                                             ; MUST be answered or strip hangs. Qt won't
+                                             ; call it: we advertise 1.4 (< 1.5).
+    ret                                      ; RRSelectInput(4): no reply
 
 .rr_query_version:
     mov esi, 32
@@ -4391,6 +4395,38 @@ handle_randr:
     mov word [rdi + 30], 1                    ; nPossibleOutput
     mov dword [rdi + 32], RR_OUTPUT_ID        ; outputs[0]
     mov dword [rdi + 36], RR_OUTPUT_ID        ; possibleOutputs[0]
+    jmp .rr_write
+
+.rr_get_monitors:
+    ; xRRGetMonitorsReply: 32-byte header + one MONITORINFO (24) + 1 output (4).
+    mov esi, 60
+    call xkb_reply_zero
+    mov byte  [rdi + 1], 0
+    mov dword [rdi + 8],  1                   ; timestamp
+    mov dword [rdi + 12], 1                   ; nmonitors = 1
+    mov dword [rdi + 16], 1                   ; noutputs (total) = 1
+    ; resolve the monitor-name atom ("default"); save rdi/r8/r15 across the call
+    push rdi
+    push r8
+    push r15
+    lea rdi, [str_monitor_default]
+    mov esi, 7
+    call atom_lookup
+    pop r15
+    pop r8
+    pop rdi
+    mov [rdi + 32], eax                       ; MONITORINFO.name (atom)
+    mov byte [rdi + 36], 1                    ; primary  = True
+    mov byte [rdi + 37], 1                    ; automatic = True
+    mov word [rdi + 38], 1                    ; noutput  = 1
+    ; x, y at +40/+42 stay 0
+    mov eax, [screen_w]
+    mov [rdi + 44], ax                        ; width  (pixels)
+    mov eax, [screen_h]
+    mov [rdi + 46], ax                        ; height (pixels)
+    mov dword [rdi + 48], X_SCREEN_W_MM       ; widthInMillimeters
+    mov dword [rdi + 52], X_SCREEN_H_MM       ; heightInMillimeters
+    mov dword [rdi + 56], RR_OUTPUT_ID        ; outputs[0]
     jmp .rr_write
 
 .rr_write:
