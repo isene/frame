@@ -3952,6 +3952,10 @@ handle_xkb:
     je .xkb_get_indicator_map
     cmp eax, 17                              ; 17 = XkbGetNames
     je .xkb_get_names
+    cmp eax, 1                               ; 1  = XkbSelectEvents (void, no reply)
+    je .xkb_select_events
+    cmp eax, 21                              ; 21 = XkbPerClientFlags (GTK blocks on it)
+    je .xkb_per_client_flags
     ; --- DIAG (temporary): log unhandled XKB minor opcode ---
     push rax
     mov rsi, log_xkb_minor
@@ -3962,6 +3966,30 @@ handle_xkb:
     mov rsi, qext_nl
     mov edx, 1
     call write_stderr
+    ret
+
+.xkb_select_events:
+    ret                                       ; XkbSelectEvents is void — no reply
+
+.xkb_per_client_flags:
+    ; GTK calls XkbSetDetectableAutoRepeat → PerClientFlags and BLOCKS on the
+    ; reply. Echo: supported = all per-client flags, value = the bits it set.
+    mov r9, [rsi + 8]                         ; change (lo32) | value (hi32)
+    push r9
+    mov esi, 32
+    call xkb_reply_zero                       ; rdi=reply, r15d=fd, r8d=total
+    pop r9
+    mov byte [rdi + 1], 0
+    mov dword [rdi + 8], 0x1F                  ; supported (5 per-client flags)
+    mov eax, r9d                               ; change mask
+    shr r9, 32                                 ; r9d = requested value
+    and r9d, eax                               ; value within the change mask
+    mov [rdi + 12], r9d                        ; value
+    lea rsi, [reply_buf]
+    mov edi, r15d
+    mov edx, r8d
+    mov eax, SYS_WRITE
+    syscall
     ret
 
 .xkb_get_device_info:
