@@ -3386,6 +3386,8 @@ dispatch_request:
     je .dr_get_input_focus
     cmp eax, 38
     je .dr_query_pointer
+    cmp eax, 40
+    je .dr_translate_coords
     cmp eax, 55
     je .dr_create_gc
     cmp eax, 97
@@ -3436,6 +3438,12 @@ dispatch_request:
     mov edi, ebx
     mov rsi, r12
     call handle_query_pointer
+    jmp .dr_done
+
+.dr_translate_coords:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_translate_coordinates
     jmp .dr_done
 
 .dr_randr:
@@ -4342,6 +4350,85 @@ handle_query_pointer:
     mov edx, r8d
     mov eax, SYS_WRITE
     syscall
+    ret
+
+; ============================================================================
+; window_abs_xy — edi = window xid. Returns r10d = absolute x, r11d = absolute
+; y (signed), summing the x/y of every ancestor up to (not incl.) the root.
+; ============================================================================
+window_abs_xy:
+    push rbx
+    push r12
+    push r13
+    xor r12d, r12d                            ; abs x
+    xor r13d, r13d                            ; abs y
+.wax_loop:
+    test edi, edi
+    jz .wax_done
+    call window_lookup
+    test rax, rax
+    jz .wax_done
+    cmp dword [rax], X_ROOT_WINDOW
+    je .wax_done
+    movsx ecx, word [rax + 8]
+    add r12d, ecx
+    movsx ecx, word [rax + 10]
+    add r13d, ecx
+    mov edi, [rax + 4]                        ; parent xid
+    jmp .wax_loop
+.wax_done:
+    mov r10d, r12d
+    mov r11d, r13d
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_translate_coordinates — edi = slot, rsi = req. GTK calls this during
+; show (gdk_window_get_origin) and BLOCKS on the reply; without it GTK never
+; maps its toplevel, so tile never manages the window (it stays invisible).
+; req: +4 src-window  +8 dst-window  +12 src-x (INT16)  +14 src-y (INT16)
+; ============================================================================
+handle_translate_coordinates:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov ebx, edi                              ; slot
+    mov r14, rsi                              ; req
+    mov edi, [r14 + 4]                        ; src window
+    call window_abs_xy                        ; r10d = abs x, r11d = abs y
+    movsx eax, word [r14 + 12]
+    add r10d, eax                             ; absolute point x
+    movsx eax, word [r14 + 14]
+    add r11d, eax                             ; absolute point y
+    mov r12d, r10d                            ; save point
+    mov r13d, r11d
+    mov edi, [r14 + 8]                        ; dst window
+    call window_abs_xy
+    sub r12d, r10d                            ; dst-x = point - dst.abs
+    sub r13d, r11d                            ; dst-y
+    mov edi, ebx
+    mov esi, 32
+    push r12
+    push r13
+    call xkb_reply_zero                       ; rdi=reply, r15d=fd, r8d=total
+    pop r13
+    pop r12
+    mov byte [rdi + 1], 1                     ; sameScreen = True
+    mov dword [rdi + 8], 0                    ; child = None
+    mov [rdi + 12], r12w                      ; dst-x
+    mov [rdi + 14], r13w                      ; dst-y
+    lea rsi, [reply_buf]
+    mov edi, r15d
+    mov edx, r8d
+    mov eax, SYS_WRITE
+    syscall
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; ============================================================================
