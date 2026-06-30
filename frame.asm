@@ -3964,6 +3964,8 @@ handle_xkb:
     je .xkb_select_events
     cmp eax, 21                              ; 21 = XkbPerClientFlags (GTK blocks on it)
     je .xkb_per_client_flags
+    cmp eax, 4                               ; 4  = XkbGetState (GIMP uses it)
+    je .xkb_get_state
     ; --- DIAG (temporary): log unhandled XKB minor opcode ---
     push rax
     mov rsi, log_xkb_minor
@@ -3978,6 +3980,17 @@ handle_xkb:
 
 .xkb_select_events:
     ret                                       ; XkbSelectEvents is void — no reply
+
+.xkb_get_state:                               ; idle state: no mods, group 0, no buttons
+    mov esi, 32
+    call xkb_reply_zero
+    mov byte [rdi + 1], 3                      ; deviceID = core keyboard
+    lea rsi, [reply_buf]
+    mov edi, r15d
+    mov edx, r8d
+    mov eax, SYS_WRITE
+    syscall
+    ret
 
 .xkb_per_client_flags:
     ; GTK calls XkbSetDetectableAutoRepeat → PerClientFlags and BLOCKS on the
@@ -4047,8 +4060,11 @@ handle_xkb:
     ; unless present contains every component it requested; the extras it asks
     ; for (actions/explicit/vmods/vmodmap) are legitimately empty (count 0).
     movzx eax, word [rsi + 6]                ; req full mask
-    or  eax, 0x07
-    mov [xkb_getmap_present], eax
+    or  eax, 0x17                            ; types|syms|modmap + KeyActions(0x10):
+    mov [xkb_getmap_present], eax            ; the action section is ALWAYS written,
+                                             ; so present MUST declare it or libX11's
+                                             ; _XkbReadGetMapReply reads modmap at the
+                                             ; wrong offset and SIGSEGVs (GIMP crash).
 
     ; --- key types (copy the 56-byte static blob) ---
     lea rdi, [reply_buf + 40]                ; data follows the 40-byte header
@@ -4606,6 +4622,8 @@ handle_xinput:
     je .xi_empty_reply
     cmp eax, 45                              ; XIGetClientPointer (GTK4 blocks on it)
     je .xi_get_client_pointer
+    cmp eax, 40                              ; XIQueryPointer (GIMP blocks on it)
+    je .xi_query_pointer
     ; --- DIAG (temp): log unhandled XI minor opcode ---
     push rax
     mov rsi, log_xi_minor
@@ -4634,6 +4652,52 @@ handle_xinput:
     mov byte [rdi + 8], 1                     ; set = True
     mov word [rdi + 10], 2                    ; deviceid = master pointer (2)
     jmp .xi_write
+
+.xi_query_pointer:                            ; XI2 form of QueryPointer (56-byte reply)
+    push rbx
+    push r13
+    push r14
+    mov ebx, edi                              ; slot
+    mov edi, [rsi + 4]                        ; queried window
+    call window_abs_xy                        ; r10d=abs x, r11d=abs y
+    mov r13d, [cursor_x]
+    sub r13d, r10d                            ; win_x (pixels)
+    mov r14d, [cursor_y]
+    sub r14d, r11d                            ; win_y (pixels)
+    mov edi, ebx
+    mov esi, 56
+    push r13
+    push r14
+    call xkb_reply_zero                       ; rdi=reply, r15d=fd, r8d=total
+    pop r14
+    pop r13
+    mov byte [rdi + 1], 0
+    mov dword [rdi + 8], X_ROOT_WINDOW         ; root
+    mov dword [rdi + 12], 0                    ; child = None
+    mov eax, [cursor_x]
+    shl eax, 16
+    mov [rdi + 16], eax                        ; root_x (FP1616)
+    mov eax, [cursor_y]
+    shl eax, 16
+    mov [rdi + 20], eax                        ; root_y
+    mov eax, r13d
+    shl eax, 16
+    mov [rdi + 24], eax                        ; win_x
+    mov eax, r14d
+    shl eax, 16
+    mov [rdi + 28], eax                        ; win_y
+    mov word [rdi + 32], 1                     ; same_screen = True
+    mov word [rdi + 34], 0                     ; buttons_len = 0
+    ; mods (+36..52) + group (+52..56) left zero
+    lea rsi, [reply_buf]
+    mov edi, r15d
+    mov edx, r8d
+    mov eax, SYS_WRITE
+    syscall
+    pop r14
+    pop r13
+    pop rbx
+    ret
 
 .xi_query_version:
     mov esi, 32
