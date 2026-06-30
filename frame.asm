@@ -464,6 +464,8 @@ cursor_x:           resd 1               ; pointer position (root coords),
 cursor_y:           resd 1               ; updated by evdev REL motion
 button_state:       resd 1               ; held-button mask for event 'state'
                                          ; (Button1Mask 0x100, 2 0x200, 3 0x400)
+ptr_grab_win:       resd 1               ; active pointer-grab window xid (0 = none)
+ptr_grab_mask:      resd 1               ; the grab's event mask (SETofPOINTEREVENT)
 abs_last_x:         resd 1               ; touchpad absolute-position anchor:
 abs_last_y:         resd 1               ; last seen ABS_X/Y; cursor moves by
 abs_have_x:         resd 1               ; the delta. *_have flags clear on each
@@ -3599,11 +3601,12 @@ dispatch_request:
 
 .dr_grab_pointer:
     mov edi, ebx
+    mov rsi, r12
     call handle_grab_pointer
     jmp .dr_done
 
 .dr_ungrab_pointer:
-    ; No-op (we don't track pointer grabs yet); no reply.
+    mov dword [ptr_grab_win], 0              ; release the pointer grab
     jmp .dr_done
 
 .dr_grab_keyboard:
@@ -6130,10 +6133,25 @@ handle_change_window_attributes:
 ; ============================================================================
 handle_destroy_window:
     push rbx
+    push r12
     mov ebx, edi
     mov edi, [rsi + 4]
+    mov r12d, edi                            ; save xid
+    call window_lookup
+    test rax, rax
+    jz .hd_clear
+    mov ecx, [rax]                           ; if it held the grab, drop it
+    cmp ecx, [ptr_grab_win]
+    jne .hd_nograb
+    mov dword [ptr_grab_win], 0
+.hd_nograb:
+    mov rdi, rax                             ; Expose the region it was covering
+    call expose_under_window
+.hd_clear:
+    mov edi, r12d
     call window_destroy
     mov byte [comp_dirty], 1
+    pop r12
     pop rbx
     ret
 
@@ -6253,6 +6271,13 @@ handle_unmap_window:
     mov r12, rax
     mov byte [r12 + 28], 0
     mov byte [comp_dirty], 1
+    mov eax, [r12]                            ; if this window held the grab, drop it
+    cmp eax, [ptr_grab_win]
+    jne .uw_nograb
+    mov dword [ptr_grab_win], 0
+.uw_nograb:
+    mov rdi, r12                              ; Expose the region it was covering
+    call expose_under_window
     mov edi, [r12 + 4]
     call window_lookup
     test rax, rax
@@ -7571,6 +7596,10 @@ handle_grab_keyboard:
 ; handle_grab_pointer — edi = slot. Phase 4d.1 stub: replies Success.
 ; ============================================================================
 handle_grab_pointer:
+    mov eax, [rsi + 4]                        ; grab-window → activate the grab
+    mov [ptr_grab_win], eax
+    movzx eax, word [rsi + 8]                 ; event-mask (SETofPOINTEREVENT)
+    mov [ptr_grab_mask], eax
     push rbx
     push r12
     mov ebx, edi
@@ -8153,6 +8182,148 @@ dispatch_input_event:
 ; (cursor_x, cursor_y). Returns its record ptr in rax, or 0 (over root).
 ; Last match in table order wins (≈ most-recently-created on top).
 ; ----------------------------------------------------------------------------
+; ----------------------------------------------------------------------------
+; send_expose — edi = client slot, esi = window xid, edx = x, ecx = y,
+; r8d = width, r9d = height. Emits a 32-byte Expose event (count = 0).
+; ----------------------------------------------------------------------------
+send_expose:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12d, esi                            ; xid
+    mov r13d, edx                            ; x
+    mov r14d, ecx                            ; y
+    mov r15d, r8d                            ; width
+    push r9                                   ; height
+    mov eax, edi                             ; slot
+    call client_meta_addr                    ; rax = meta (+0 fd, +8 seq)
+    mov rbx, rax
+    lea rsi, [reply_buf]
+    xor eax, eax
+    mov [rsi + 0], rax
+    mov [rsi + 8], rax
+    mov [rsi + 16], rax
+    mov [rsi + 24], rax
+    mov byte [rsi + 0], 12                    ; Expose
+    mov eax, [rbx + 8]
+    mov [rsi + 2], ax                         ; seq
+    mov [rsi + 4], r12d                       ; window
+    mov [rsi + 8], r13w                       ; x
+    mov [rsi + 10], r14w                      ; y
+    mov [rsi + 12], r15w                      ; width
+    pop rax                                   ; height
+    mov [rsi + 14], ax                        ; height (+16 count stays 0)
+    mov edi, [rbx]                            ; fd
+    mov edx, 32
+    mov rax, SYS_WRITE
+    syscall
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; expose_under_window — rdi = record of a window being hidden/destroyed. For
+; each OTHER mapped non-root window below it (lower stk) that selected
+; ExposureMask and overlaps it, send an Expose for the overlap (in that
+; window's coords) so the client repaints the region it blanked.
+; ----------------------------------------------------------------------------
+expose_under_window:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi                             ; hidden window record
+    xor ebx, ebx
+.euw_loop:
+    cmp ebx, MAX_WINDOWS
+    jge .euw_done
+    mov rax, rbx
+    imul rax, WINDOW_REC_SIZE
+    lea r13, [windows + rax]                  ; candidate W
+    cmp r13, r12
+    je .euw_next                             ; skip self
+    mov eax, [r13]
+    test eax, eax
+    jz .euw_next
+    cmp eax, X_ROOT_WINDOW
+    je .euw_next
+    cmp byte [r13 + 28], 0                    ; mapped?
+    je .euw_next
+    test dword [r13 + 24], 0x8000             ; ExposureMask selected?
+    jz .euw_next
+    mov eax, [r13 + 48]                       ; W.stk
+    cmp eax, [r12 + 48]                       ; W below the hidden window?
+    jae .euw_next
+    ; --- x overlap: ex (r14d), iw (r10d) ---
+    movsx r14d, word [r12 + 8]                ; hidden.x
+    movsx eax, word [r13 + 8]                 ; W.x
+    sub r14d, eax                             ; px = hidden.x - W.x
+    mov eax, r14d
+    movzx ecx, word [r12 + 12]                ; hidden.w
+    add eax, ecx                             ; px + hidden.w (right edge in W)
+    movzx ecx, word [r13 + 12]                ; W.w
+    cmp eax, ecx
+    jle .euw_x2
+    mov eax, ecx                             ; clamp to W.w
+.euw_x2:                                      ; eax = ex2
+    test r14d, r14d
+    jns .euw_xpos
+    xor r14d, r14d                            ; ex = max(0, px)
+.euw_xpos:
+    sub eax, r14d                             ; iw = ex2 - ex
+    jle .euw_next
+    mov r10d, eax                             ; iw
+    ; --- y overlap: ey (r15d), ih (r11d) ---
+    movsx r15d, word [r12 + 10]               ; hidden.y
+    movsx eax, word [r13 + 10]                ; W.y
+    sub r15d, eax                             ; py
+    mov eax, r15d
+    movzx ecx, word [r12 + 14]                ; hidden.h
+    add eax, ecx
+    movzx ecx, word [r13 + 14]                ; W.h
+    cmp eax, ecx
+    jle .euw_y2
+    mov eax, ecx
+.euw_y2:                                      ; eax = ey2
+    test r15d, r15d
+    jns .euw_ypos
+    xor r15d, r15d                            ; ey = max(0, py)
+.euw_ypos:
+    sub eax, r15d                             ; ih = ey2 - ey
+    jle .euw_next
+    mov r11d, eax                             ; ih
+    ; --- W's client slot from its xid ---
+    mov eax, [r13]
+    cmp eax, X_RID_BASE
+    jb .euw_next
+    sub eax, X_RID_BASE
+    shr eax, 21
+    cmp eax, MAX_CLIENTS
+    jae .euw_next
+    mov edi, eax                             ; client slot
+    mov esi, [r13]                            ; W xid
+    mov edx, r14d                             ; x
+    mov ecx, r15d                             ; y
+    mov r8d, r10d                             ; width
+    mov r9d, r11d                             ; height
+    call send_expose
+.euw_next:
+    inc ebx
+    jmp .euw_loop
+.euw_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 window_at_point:
     push rbx
     push r12
@@ -8207,12 +8378,24 @@ window_at_point:
 ; ----------------------------------------------------------------------------
 deliver_pointer_motion:
     push rbx
+    cmp dword [ptr_grab_win], 0              ; pointer grabbed? route to grab window
+    je .dpm_point
+    mov edi, [ptr_grab_win]
+    call window_lookup
+    test rax, rax
+    jz .dpm_done
+    mov rbx, rax
+    test dword [ptr_grab_mask], 0x40         ; grab's mask wants motion?
+    jz .dpm_done
+    jmp .dpm_send
+.dpm_point:
     call window_at_point
     test rax, rax
     jz .dpm_done
     mov rbx, rax
     test dword [rbx + 24], 0x40              ; PointerMotionMask
     jz .dpm_done
+.dpm_send:
     mov eax, [rbx]                           ; xid → owner slot
     cmp eax, X_RID_BASE
     jb .dpm_done
@@ -8246,6 +8429,22 @@ deliver_pointer_button:
     push r13
     mov r12d, edi                            ; code
     mov r13d, esi                            ; button
+    cmp dword [ptr_grab_win], 0              ; pointer grabbed? (open menu, DND...)
+    je .dpb_point
+    mov edi, [ptr_grab_win]                  ; yes → deliver to the grab window
+    call window_lookup
+    test rax, rax
+    jz .dpb_done
+    mov rbx, rax
+    mov ecx, 0x04
+    cmp r12d, 4
+    je .dpb_gmask
+    mov ecx, 0x08
+.dpb_gmask:
+    test [ptr_grab_mask], ecx                ; grab's mask wants this button event?
+    jz .dpb_done
+    jmp .dpb_send
+.dpb_point:
     call window_at_point
     test rax, rax
     jz .dpb_done
@@ -8257,6 +8456,7 @@ deliver_pointer_button:
 .dpb_mask:
     test [rbx + 24], ecx
     jz .dpb_done
+.dpb_send:
     mov eax, [rbx]
     cmp eax, X_RID_BASE
     jb .dpb_done
