@@ -319,8 +319,11 @@ xkb_getmap_present: resd 1               ; GetMap reply present mask (echoes req
 ;   +42 backing_h (u16)      — backing buffer height
 ;   +44 back_pixel (u32)     — CW_BACK_PIXEL; backing init colour
 %define MAX_WINDOWS      512
-%define WINDOW_REC_SIZE  48
+%define WINDOW_REC_SIZE  56          ; was 48; +48 stk (u32) z-order, +52 pad
 windows:            resb MAX_WINDOWS * WINDOW_REC_SIZE
+win_stk_next:       resd 1               ; monotonic z-order; ++ on each map/raise
+rs_last_stk:        resd 1               ; recomposite: stk of last window drawn
+rs_min_stk:         resd 1               ; recomposite: min stk found this pass
 
 ; ---- Phase 4g graphics-context table --------------------------------------
 ; gcs[MAX_GCS] — 16-byte records keyed by GC XID. Clients create GCs with
@@ -6185,6 +6188,9 @@ handle_map_window:
 .mw_just_map:
     mov byte [r12 + 28], 1
     mov byte [comp_dirty], 1
+    inc dword [win_stk_next]                   ; mapping raises to top of z-order
+    mov eax, [win_stk_next]
+    mov [r12 + 48], eax
     ; If the window selected StructureNotify on ITSELF, send its own client
     ; MapNotify + ConfigureNotify (clients like glass wait for the latter
     ; before forking their shell / learning their geometry). Owner client
@@ -6367,7 +6373,14 @@ handle_configure_window:
 .cfgw_no_sib:
     test ecx, CFG_STACK_MODE
     jz .cfgw_apply_done
+    mov eax, [r14]                            ; stack-mode value (al = mode)
     add r14, 4
+    test al, al                               ; Above (0) → raise to top of z-order
+    jnz .cfgw_apply_done
+    inc dword [win_stk_next]
+    mov eax, [win_stk_next]
+    mov [r13 + 48], eax
+    mov byte [comp_dirty], 1
 .cfgw_apply_done:
     ; If the window resized and has a backing buffer at the old size,
     ; drop it — the client will re-create it at the new size on its
@@ -8142,10 +8155,12 @@ dispatch_input_event:
 ; ----------------------------------------------------------------------------
 window_at_point:
     push rbx
+    push r12
     mov r10d, [cursor_x]
     mov r11d, [cursor_y]
     xor ebx, ebx
     xor eax, eax                             ; best = none
+    xor r12d, r12d                           ; best stk = 0 (topmost wins)
 .wap_loop:
     cmp ebx, MAX_WINDOWS
     jge .wap_done
@@ -8173,11 +8188,16 @@ window_at_point:
     add r9d, ecx
     cmp r11d, r9d
     jge .wap_next
-    mov rax, r8                               ; match
+    mov r9d, [r8 + 48]                         ; covers point — compare z-order
+    cmp r9d, r12d
+    jbe .wap_next                             ; below current best → keep best
+    mov r12d, r9d                              ; new topmost stk
+    mov rax, r8                               ; new topmost window
 .wap_next:
     inc ebx
     jmp .wap_loop
 .wap_done:
+    pop r12
     pop rbx
     ret
 
@@ -9402,28 +9422,50 @@ recomposite_screen:
     mov eax, COMP_BG_COLOR
     rep stosd
 
-    ; --- Walk the window table, draw every mapped non-root window.
-    xor ebx, ebx
-.rs_loop:
+    ; --- Draw mapped non-root windows in ascending z-order (stk) so they
+    ; paint bottom-to-top regardless of slot/creation order. Each pass finds
+    ; the smallest stk strictly above the last drawn; O(n^2) over a handful
+    ; of windows, once per coalesced repaint.
+    mov dword [rs_last_stk], 0
+.rs_pass:
+    xor ebx, ebx                             ; slot
+    xor r12, r12                             ; chosen rec = none
+    mov dword [rs_min_stk], 0xFFFFFFFF
+.rs_find:
     cmp ebx, MAX_WINDOWS
-    jge .rs_done_pop
+    jge .rs_find_done
     mov rax, rbx
     imul rax, WINDOW_REC_SIZE
-    lea r12, [windows + rax]
-    mov eax, [r12]
-    test eax, eax
-    jz .rs_next
-    cmp eax, X_ROOT_WINDOW
-    je .rs_next
-    cmp byte [r12 + 28], 0
-    je .rs_next
+    lea rax, [windows + rax]
+    mov ecx, [rax]
+    test ecx, ecx
+    jz .rs_find_next
+    cmp ecx, X_ROOT_WINDOW
+    je .rs_find_next
+    cmp byte [rax + 28], 0                    ; mapped?
+    je .rs_find_next
+    mov ecx, [rax + 48]                       ; stk
+    cmp ecx, [rs_last_stk]
+    jbe .rs_find_next                         ; already drawn this repaint
+    cmp ecx, [rs_min_stk]
+    jae .rs_find_next                         ; not the smallest still pending
+    mov [rs_min_stk], ecx
+    mov r12, rax
+.rs_find_next:
+    inc ebx
+    jmp .rs_find
+.rs_find_done:
+    test r12, r12
+    jz .rs_done_pop                           ; nothing left → flush + flip
+    mov ecx, [rs_min_stk]
+    mov [rs_last_stk], ecx
 
     ; If the window has a backing buffer with real content, blit it.
     cmp byte [r12 + 31], 0
     je .rs_flat
     mov rdi, r12
     call blit_window
-    jmp .rs_next
+    jmp .rs_pass
 
 .rs_flat:
     ; No backing yet — fill the window rect with its back_pixel, or a
@@ -9442,10 +9484,7 @@ recomposite_screen:
     movzx ecx, word [r12 + 14]
     mov edx, r13d
     call draw_rect
-
-.rs_next:
-    inc ebx
-    jmp .rs_loop
+    jmp .rs_pass
 
 .rs_done_pop:
     ; --- clflush the entire framebuffer. The DRM dumb-buffer mmap on
