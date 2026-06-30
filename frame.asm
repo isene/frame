@@ -4604,6 +4604,8 @@ handle_xinput:
     je .xi_empty_reply
     cmp eax, 59                              ; XIGetProperty → empty (type=None)
     je .xi_empty_reply
+    cmp eax, 45                              ; XIGetClientPointer (GTK4 blocks on it)
+    je .xi_get_client_pointer
     ; --- DIAG (temp): log unhandled XI minor opcode ---
     push rax
     mov rsi, log_xi_minor
@@ -4623,6 +4625,14 @@ handle_xinput:
     mov word [rdi + 8], 2                     ; major_version = 2
     mov word [rdi + 10], 0                    ; minor_version = 0
     mov byte [rdi + 12], 1                    ; present = True
+    jmp .xi_write
+
+.xi_get_client_pointer:                       ; reply: a client pointer IS set
+    mov esi, 32
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0
+    mov byte [rdi + 8], 1                     ; set = True
+    mov word [rdi + 10], 2                    ; deviceid = master pointer (2)
     jmp .xi_write
 
 .xi_query_version:
