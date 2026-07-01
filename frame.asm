@@ -6202,6 +6202,12 @@ handle_map_window:
     test rax, rax
     jz .mw_done
     mov r12, rax                              ; window record
+    ; X11: MapWindow on an already-mapped window has NO effect — no MapRequest,
+    ; no MapNotify. Skipping this let GTK re-map generate a duplicate MapNotify;
+    ; GDK thaws the toplevel on each MapNotify but froze it only once, so the
+    ; second thaw aborts with 'freeze_count > 0' (the GIMP-on-frame crash).
+    cmp byte [r12 + 28], 0
+    jne .mw_done
     mov edi, [r12 + 4]                        ; parent xid
     call window_lookup
     test rax, rax
@@ -6471,6 +6477,26 @@ handle_configure_window:
     mov dword [r13 + 40], 0
 .cfgw_recomp:
     mov byte [comp_dirty], 1
+    ; Tell the window's own client its new geometry (StructureNotify). A real
+    ; server sends ConfigureNotify on every reconfigure — including the ones a
+    ; WM drives. GTK freezes its toplevel when it requests a resize and thaws
+    ; on this notify; without it the window stays frozen (renders black) and
+    ; GTK's freeze count drifts into the 'freeze_count > 0' abort. Unsolicited
+    ; notifies are safe: GTK only thaws while its request count is nonzero.
+    ; Owner slot is encoded in the xid: (xid - X_RID_BASE) >> 21 (as at map).
+    mov eax, [r13 + 24]
+    test eax, EM_STRUCTURE_NOTIFY
+    jz .cfgw_done
+    mov eax, [r13]
+    cmp eax, X_RID_BASE
+    jb .cfgw_done
+    sub eax, X_RID_BASE
+    shr eax, 21
+    cmp eax, MAX_CLIENTS
+    jae .cfgw_done
+    mov edi, eax
+    mov rsi, r13
+    call send_configure_notify
 .cfgw_done:
     pop r15
     pop r14
