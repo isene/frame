@@ -6134,23 +6134,45 @@ handle_change_window_attributes:
 handle_destroy_window:
     push rbx
     push r12
+    push r13
     mov ebx, edi
     mov edi, [rsi + 4]
     mov r12d, edi                            ; save xid
     call window_lookup
     test rax, rax
     jz .hd_clear
-    mov ecx, [rax]                           ; if it held the grab, drop it
+    mov r13, rax                             ; window record
+    mov ecx, [r13]                           ; if it held the grab, drop it
     cmp ecx, [ptr_grab_win]
     jne .hd_nograb
     mov dword [ptr_grab_win], 0
 .hd_nograb:
-    mov rdi, rax                             ; Expose the region it was covering
+    ; If the window is still MAPPED, send its own UnmapNotify first — Xorg
+    ; unmaps before destroy, and GTK's map/unmap freeze/thaw needs the pair.
+    cmp byte [r13 + 28], 0
+    je .hd_noumap
+    mov eax, [r13 + 24]
+    test eax, EM_STRUCTURE_NOTIFY
+    jz .hd_noumap
+    mov eax, [r13]                           ; xid -> owner slot
+    cmp eax, X_RID_BASE
+    jb .hd_noumap
+    sub eax, X_RID_BASE
+    shr eax, 21
+    cmp eax, MAX_CLIENTS
+    jae .hd_noumap
+    mov edi, eax
+    mov esi, [r13]
+    mov edx, [r13]
+    call send_unmap_notify
+.hd_noumap:
+    mov rdi, r13                             ; Expose the region it was covering
     call expose_under_window
 .hd_clear:
     mov edi, r12d
     call window_destroy
     mov byte [comp_dirty], 1
+    pop r13
     pop r12
     pop rbx
     ret
@@ -6276,6 +6298,24 @@ handle_unmap_window:
     jne .uw_nograb
     mov dword [ptr_grab_win], 0
 .uw_nograb:
+    ; Send the window its OWN UnmapNotify (StructureNotify) — mirrors the
+    ; MapNotify in handle_map_window. Without it GTK's map/unmap freeze/thaw
+    ; underflows (Gdk-CRITICAL thaw assertion -> GIMP aborts on menu use).
+    mov eax, [r12 + 24]
+    test eax, EM_STRUCTURE_NOTIFY
+    jz .uw_no_self
+    mov eax, [r12]                            ; window xid -> owner slot
+    cmp eax, X_RID_BASE
+    jb .uw_no_self
+    sub eax, X_RID_BASE
+    shr eax, 21
+    cmp eax, MAX_CLIENTS
+    jae .uw_no_self
+    mov edi, eax
+    mov esi, [r12]                            ; event window = the window
+    mov edx, [r12]                            ; window = itself
+    call send_unmap_notify
+.uw_no_self:
     mov rdi, r12                              ; Expose the region it was covering
     call expose_under_window
     mov edi, [r12 + 4]
@@ -12581,7 +12621,14 @@ dump_handler:
     cmp byte [r12 + 31], 0                    ; has_backing?
     je .dh_log
     mov r13, [r12 + 32]                       ; backing ptr
-    ; --- write the raw ARGB backing to /tmp/frame_win.raw (first backed win) ---
+    ; only dump the big window (GIMP's main ~1.9M px); skip glass/strip/dialogs
+    ; so /tmp/frame_win.raw ends up holding the main window's backing.
+    movzx eax, word [r12 + 40]
+    movzx ecx, word [r12 + 42]
+    imul eax, ecx
+    cmp eax, 1000000
+    jb .dh_wf_done
+    ; --- write the raw ARGB backing to /tmp/frame_win.raw (largest window) ---
     mov rax, SYS_OPEN
     lea rdi, [dump_path]
     mov esi, 0x241                            ; O_WRONLY|O_CREAT|O_TRUNC
