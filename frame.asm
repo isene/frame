@@ -6915,33 +6915,24 @@ handle_change_window_attributes:
     ; prober silently STOLE MapRequest routing from tile — every window
     ; mapped after a FortiClient/Electron launch went to the prober and
     ; never showed (the panel's dead Mod4+Return).
+    ; A request that does NOT carry CW_EVENT_MASK cannot change the claim:
+    ; without this gate r8d holds the COMBINED mask (with the WM's redirect
+    ; bit), so an innocent cursor/background CWA on root by any GTK client
+    ; got a spurious BadAccess — GTK2 treats X errors as fatal (dead
+    ; fortitray on the panel).
+    test dword [r12 + 8], 0x800              ; CW_EVENT_MASK in value-mask?
+    jz .cwa_done
     test r8d, EM_SUBSTRUCTURE_REDIRECT
     jz .cwa_clear_redirect
     movsx eax, byte [r13 + 30]
     cmp eax, 0
     jl .cwa_claim                            ; unowned → claim
-    cmp eax, ebx
-    je .cwa_done                             ; already ours
-    ; Owned by someone else → BadAccess (code 10) to the requester.
-    mov eax, ebx
-    call client_meta_addr
-    lea rdi, [reply_buf]
-    xor ecx, ecx
-    mov [rdi], rcx
-    mov [rdi + 8], rcx
-    mov [rdi + 16], rcx
-    mov [rdi + 24], rcx
-    mov byte [rdi + 1], 10                   ; Access
-    mov ecx, [rax + 8]
-    mov [rdi + 2], cx                        ; seq
-    mov ecx, [r13]
-    mov [rdi + 4], ecx                       ; the window
-    mov byte [rdi + 10], 2                   ; major = ChangeWindowAttributes
-    mov edi, [rax]
-    mov rax, SYS_WRITE
-    lea rsi, [reply_buf]
-    mov edx, 32
-    syscall
+    ; Owned (by us or another): leave the claim untouched. The spec says
+    ; BadAccess for a second claimant, but GTK2's default error handling is
+    ; FATAL — fortitray does an untrapped XSelectInput(root, ...Redirect...)
+    ; when no EWMH _NET_SUPPORTING_WM_CHECK is present, and the error killed
+    ; it on the panel. Silently ignoring keeps the WM's MapRequest routing
+    ; intact (the actual v0.0.75 bug) AND keeps error-fatal clients alive.
     jmp .cwa_done
 .cwa_claim:
     mov [r13 + 30], bl                       ; this client claims the redirect
