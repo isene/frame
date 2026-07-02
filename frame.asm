@@ -398,6 +398,11 @@ co_src_color:       resd 1
 co_dst_ptr:         resq 1
 co_dst_stride:      resd 1
 co_dst_h:           resd 1
+tz_dst_ptr:         resq 1               ; render_trapezoids: dst backing
+tz_dst_stride:      resd 1
+tz_dst_h:           resd 1
+tz_dst_drawable:    resd 1
+tz_color:           resd 1               ; resolved opaque ARGB source colour
 ag_log_count:       resd 1               ; debug: limit AddGlyphs dumps
 
 ; ---- Phase 4c property table ----------------------------------------------
@@ -464,8 +469,16 @@ cursor_x:           resd 1               ; pointer position (root coords),
 cursor_y:           resd 1               ; updated by evdev REL motion
 button_state:       resd 1               ; held-button mask for event 'state'
                                          ; (Button1Mask 0x100, 2 0x200, 3 0x400)
+server_time_ms:     resd 1               ; monotonic ms clock from the evdev event
+                                         ; timestamp; stamped into every input event
+                                         ; (X time 0 = CurrentTime, which breaks GTK
+                                         ; menu activation — must be a real time)
 ptr_grab_win:       resd 1               ; active pointer-grab window xid (0 = none)
 ptr_grab_mask:      resd 1               ; the grab's event mask (SETofPOINTEREVENT)
+wapd_abs_x:         resd 1               ; window_at_point_deep: abs origin of the
+wapd_abs_y:         resd 1               ; deepest window under the cursor
+wapd_cur_parent:    resd 1               ; descent cursor: current parent xid
+wapd_best_stk:      resd 1               ; descent cursor: best sibling z-order
 abs_last_x:         resd 1               ; touchpad absolute-position anchor:
 abs_last_y:         resd 1               ; last seen ABS_X/Y; cursor moves by
 abs_have_x:         resd 1               ; the delta. *_have flags clear on each
@@ -6381,6 +6394,15 @@ handle_configure_window:
     jz .cfgw_done
     mov r13, rax                             ; record ptr
 
+    ; Override-redirect windows (menus, tooltips, DND, combo popups) bypass
+    ; SubstructureRedirect — like map, their ConfigureWindow must be applied
+    ; directly, never sent to the WM. Without this a menu popup and its item
+    ; windows never get positioned or sized: they stay at GTK's 1x1/-1,-1
+    ; creation geometry, so the menu renders wrong and no click can land on an
+    ; item (handle_map_window already does this check; handle_configure_window
+    ; was missing it).
+    cmp byte [r13 + 29], 0
+    jne .cfgw_apply
     ; SubstructureRedirect check on parent.
     push rax
     mov edi, [r13 + 4]                       ; parent xid
@@ -7751,6 +7773,20 @@ dispatch_input_event:
     push r12
     push r13
     mov rbx, rdi
+    ; Derive the X server time (ms) from this event's own kernel timestamp —
+    ; input_event = { tv_sec@0 (8), tv_usec@8 (8), type@16, code@18, value@20 }.
+    ; No extra syscall: the timestamp is already in the record. Low 32 bits
+    ; only (X time is CARD32 and wraps ~49 days, which is allowed).
+    mov rax, [rbx]                           ; tv_sec
+    imul rax, rax, 1000
+    push rax
+    mov rax, [rbx + 8]                        ; tv_usec
+    xor edx, edx
+    mov ecx, 1000
+    div rcx                                   ; rax = tv_usec / 1000
+    pop rcx                                    ; tv_sec * 1000
+    add rax, rcx
+    mov [server_time_ms], eax
     movzx eax, word [rbx + 16]               ; type
     cmp eax, EV_REL
     je .die_rel                              ; mouse motion / wheel
@@ -8439,21 +8475,155 @@ window_at_point:
     ret
 
 ; ----------------------------------------------------------------------------
+; window_at_point_deep — the DEEPEST mapped window (input-only included) whose
+; ABSOLUTE rect contains (cursor_x, cursor_y). Descends the tree from root,
+; taking the topmost sibling that contains the point at each level and
+; accumulating the absolute origin. Returns the record ptr in rax (0 if over
+; root only); wapd_abs_x/wapd_abs_y hold that window's absolute origin.
+; A real server delivers pointer events here — GTK menu items are input-only
+; child windows, and the click must carry that window as its event-window or
+; GTK can't tell which item was hit.
+; ----------------------------------------------------------------------------
+window_at_point_deep:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r13d, [cursor_x]
+    mov r14d, [cursor_y]
+    mov dword [wapd_abs_x], 0                  ; origin starts at root (0,0)
+    mov dword [wapd_abs_y], 0
+    mov eax, X_ROOT_WINDOW
+    mov [wapd_cur_parent], eax
+    xor r15, r15                              ; result = none
+.wapd_descend:
+    xor ebx, ebx
+    xor r12, r12                              ; best child this level
+    mov dword [wapd_best_stk], 0
+.wapd_scan:
+    cmp ebx, MAX_WINDOWS
+    jge .wapd_level_done
+    mov rax, rbx
+    imul rax, WINDOW_REC_SIZE
+    lea rax, [windows + rax]                  ; candidate C
+    mov ecx, [rax]
+    test ecx, ecx
+    jz .wapd_scan_next
+    cmp ecx, X_ROOT_WINDOW
+    je .wapd_scan_next
+    mov ecx, [rax + 4]                        ; parent
+    cmp ecx, [wapd_cur_parent]
+    jne .wapd_scan_next
+    cmp byte [rax + 28], 0                    ; mapped?
+    je .wapd_scan_next
+    movsx ecx, word [rax + 8]
+    add ecx, [wapd_abs_x]                     ; child abs x
+    cmp r13d, ecx
+    jl .wapd_scan_next
+    movzx edx, word [rax + 12]
+    add edx, ecx
+    cmp r13d, edx
+    jge .wapd_scan_next
+    movsx ecx, word [rax + 10]
+    add ecx, [wapd_abs_y]                     ; child abs y
+    cmp r14d, ecx
+    jl .wapd_scan_next
+    movzx edx, word [rax + 14]
+    add edx, ecx
+    cmp r14d, edx
+    jge .wapd_scan_next
+    mov ecx, [rax + 48]                       ; contains point — topmost wins
+    cmp ecx, [wapd_best_stk]
+    jb .wapd_scan_next
+    mov [wapd_best_stk], ecx
+    mov r12, rax
+.wapd_scan_next:
+    inc ebx
+    jmp .wapd_scan
+.wapd_level_done:
+    test r12, r12
+    jz .wapd_done                             ; no child holds the point → stop
+    mov r15, r12                              ; descend
+    movsx eax, word [r12 + 8]
+    add [wapd_abs_x], eax
+    movsx eax, word [r12 + 10]
+    add [wapd_abs_y], eax
+    mov eax, [r12]
+    mov [wapd_cur_parent], eax
+    jmp .wapd_descend
+.wapd_done:
+    mov rax, r15
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; grab_pointer_target — with a pointer grab active, choose the delivery target
+; the owner_events way: the deepest window under the cursor if it belongs to
+; the grab's client, otherwise the grab window itself. Returns the record ptr
+; in rax; wapd_abs_x/wapd_abs_y hold the target's absolute origin either way.
+; ----------------------------------------------------------------------------
+grab_pointer_target:
+    push rbx
+    call window_at_point_deep                 ; rax = deepest record (or 0)
+    test rax, rax
+    jz .gpt_grab
+    mov ecx, [rax]                            ; deepest xid → slot
+    sub ecx, X_RID_BASE
+    shr ecx, 21
+    mov edx, [ptr_grab_win]                   ; grab xid → slot
+    sub edx, X_RID_BASE
+    shr edx, 21
+    cmp ecx, edx                              ; same client?
+    jne .gpt_grab
+    pop rbx
+    ret                                       ; rax = deepest (owner-events)
+.gpt_grab:
+    mov edi, [ptr_grab_win]
+    call window_lookup
+    test rax, rax
+    jz .gpt_done
+    push rax
+    mov edi, [ptr_grab_win]
+    call window_abs_xy                        ; r10d/r11d = grab window origin
+    mov [wapd_abs_x], r10d
+    mov [wapd_abs_y], r11d
+    pop rax
+.gpt_done:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
 ; deliver_pointer_motion — send MotionNotify to the window under the cursor
 ; if it selected PointerMotionMask (0x40). No-op otherwise.
 ; ----------------------------------------------------------------------------
 deliver_pointer_motion:
     push rbx
-    cmp dword [ptr_grab_win], 0              ; pointer grabbed? route to grab window
+    cmp dword [ptr_grab_win], 0              ; pointer grabbed?
     je .dpm_point
-    mov edi, [ptr_grab_win]
-    call window_lookup
+    call grab_pointer_target                 ; deepest client window, else grab win
     test rax, rax
     jz .dpm_done
     mov rbx, rax
-    test dword [ptr_grab_mask], 0x40         ; grab's mask wants motion?
+    ; owner_events: motion over a client window is reported per THAT window's
+    ; mask, not the grab's. GTK grabs the toplevel with a mask that may omit
+    ; PointerMotion, but the menu window selects it — without honouring the
+    ; target's mask, motion is dropped, so menu items never highlight/select
+    ; and a click has no selected item to activate.
+    test dword [rbx + 24], 0x40             ; target window wants motion?
+    jnz .dpm_gdeliver
+    test dword [ptr_grab_mask], 0x40        ; else the grab itself wants motion?
     jz .dpm_done
-    jmp .dpm_send
+.dpm_gdeliver:
+    mov r8d, [cursor_x]
+    sub r8d, [wapd_abs_x]                    ; event-x (absolute-aware)
+    mov r9d, [cursor_y]
+    sub r9d, [wapd_abs_y]                    ; event-y
+    jmp .dpm_emit
 .dpm_point:
     call window_at_point
     test rax, rax
@@ -8461,7 +8631,13 @@ deliver_pointer_motion:
     mov rbx, rax
     test dword [rbx + 24], 0x40              ; PointerMotionMask
     jz .dpm_done
-.dpm_send:
+    mov r8d, [cursor_x]
+    movsx eax, word [rbx + 8]
+    sub r8d, eax                             ; event-x
+    mov r9d, [cursor_y]
+    movsx eax, word [rbx + 10]
+    sub r9d, eax                             ; event-y
+.dpm_emit:
     mov eax, [rbx]                           ; xid → owner slot
     cmp eax, X_RID_BASE
     jb .dpm_done
@@ -8469,16 +8645,14 @@ deliver_pointer_motion:
     shr eax, 21
     cmp eax, MAX_CLIENTS
     jae .dpm_done
+    push r8
+    push r9
     mov edi, eax                             ; slot
     mov esi, 6                               ; MotionNotify
     xor edx, edx                             ; detail 0
     mov ecx, [rbx]                           ; window
-    mov r8d, [cursor_x]
-    movsx r9d, word [rbx + 8]
-    sub r8d, r9d                             ; event-x
-    mov r9d, [cursor_y]
-    movsx eax, word [rbx + 10]
-    sub r9d, eax                             ; event-y
+    pop r9
+    pop r8
     call send_pointer_event
 .dpm_done:
     pop rbx
@@ -8497,19 +8671,25 @@ deliver_pointer_button:
     mov r13d, esi                            ; button
     cmp dword [ptr_grab_win], 0              ; pointer grabbed? (open menu, DND...)
     je .dpb_point
-    mov edi, [ptr_grab_win]                  ; yes → deliver to the grab window
-    call window_lookup
+    call grab_pointer_target                 ; deepest client window, else grab win
     test rax, rax
     jz .dpb_done
     mov rbx, rax
-    mov ecx, 0x04
+    mov ecx, 0x04                            ; press vs release mask bit
     cmp r12d, 4
     je .dpb_gmask
     mov ecx, 0x08
 .dpb_gmask:
-    test [ptr_grab_mask], ecx                ; grab's mask wants this button event?
+    test [rbx + 24], ecx                     ; owner_events: target window wants it?
+    jnz .dpb_gdeliver
+    test [ptr_grab_mask], ecx                ; else the grab itself wants it?
     jz .dpb_done
-    jmp .dpb_send
+.dpb_gdeliver:
+    mov r8d, [cursor_x]
+    sub r8d, [wapd_abs_x]                    ; event-x (absolute-aware)
+    mov r9d, [cursor_y]
+    sub r9d, [wapd_abs_y]                    ; event-y
+    jmp .dpb_emit
 .dpb_point:
     call window_at_point
     test rax, rax
@@ -8522,7 +8702,13 @@ deliver_pointer_button:
 .dpb_mask:
     test [rbx + 24], ecx
     jz .dpb_done
-.dpb_send:
+    mov r8d, [cursor_x]
+    movsx eax, word [rbx + 8]
+    sub r8d, eax                             ; event-x
+    mov r9d, [cursor_y]
+    movsx eax, word [rbx + 10]
+    sub r9d, eax                             ; event-y
+.dpb_emit:
     mov eax, [rbx]
     cmp eax, X_RID_BASE
     jb .dpb_done
@@ -8530,16 +8716,14 @@ deliver_pointer_button:
     shr eax, 21
     cmp eax, MAX_CLIENTS
     jae .dpb_done
+    push r8
+    push r9
     mov edi, eax                             ; slot
     mov esi, r12d                            ; code
     mov edx, r13d                            ; detail = button
     mov ecx, [rbx]                           ; window
-    mov r8d, [cursor_x]
-    movsx r9d, word [rbx + 8]
-    sub r8d, r9d
-    mov r9d, [cursor_y]
-    movsx eax, word [rbx + 10]
-    sub r9d, eax
+    pop r9
+    pop r8
     call send_pointer_event
 .dpb_done:
     pop r13
@@ -8572,7 +8756,8 @@ send_pointer_event:
     mov [rsi + 1], r13b                      ; detail
     mov eax, [rdi + 8]
     mov [rsi + 2], ax                        ; seq
-    mov dword [rsi + 4], 0                   ; time
+    mov eax, [server_time_ms]
+    mov [rsi + 4], eax                       ; time (real ms, not CurrentTime)
     mov dword [rsi + 8], X_ROOT_WINDOW
     mov [rsi + 12], r14d                     ; event window
     mov dword [rsi + 16], 0                  ; child
@@ -8754,7 +8939,8 @@ send_key_press:
     mov [rsi + 1], r12b                       ; detail (keycode)
     mov eax, [rdi + 8]
     mov [rsi + 2], ax                         ; seq (client's last)
-    mov dword [rsi + 4], 0                    ; time
+    mov eax, [server_time_ms]
+    mov [rsi + 4], eax                        ; time (real ms, not CurrentTime)
     mov dword [rsi + 8], X_ROOT_WINDOW        ; root
     mov [rsi + 12], r13d                      ; event window
     mov dword [rsi + 16], 0                   ; child
@@ -11350,7 +11536,14 @@ handle_render:
     je .hr_composite_glyphs
     cmp eax, 25
     je .hr_composite_glyphs
+    cmp eax, 10
+    je .hr_trapezoids
     ; Unhandled minor — leave it (logged by the generic request logger).
+    jmp .hr_done
+
+.hr_trapezoids:
+    mov rdi, r12
+    call render_trapezoids
     jmp .hr_done
 
 .hr_create_picture:
@@ -11675,6 +11868,282 @@ render_fill_rectangles:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; render_trapezoids — rdi = req ptr (RENDER minor 10, CompositeTrapezoids).
+;   +4 op   +8 src(PICTURE)   +12 dst(PICTURE)   +16 maskFormat
+;   +20 xSrc s16  +22 ySrc s16  +24 trapezoid list (40 bytes each):
+;     +0 top FIXED(16.16)   +4 bottom FIXED
+;     +8 left LINEFIX (p1.x, p1.y, p2.x, p2.y — 4×FIXED)   +24 right LINEFIX
+; cairo-xlib paints GTK widget backgrounds (menu bodies, hover highlights,
+; rounded rects) with this request. Dropping it left the backing transparent
+; black behind the glyph text — the "GIMP menus render black" bug.
+; Simplification: opaque pixel-centre scanline fill, no edge anti-aliasing;
+; op and maskFormat ignored. Menus use a solid opaque source, where this is
+; exact except at 1-px rounded corners. No reply.
+;
+;   rbx = req ptr   rbp = trapezoid cursor   r12d = remaining traps
+;   r13d = y (row)  r14d = y_end (excl)      r15d = x_start (pixel)
+; ----------------------------------------------------------------------------
+render_trapezoids:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov rbx, rdi
+
+    ; --- resolve dst Picture → drawable → backing (allocates if needed) ---
+    mov edi, [rbx + 12]
+    call picture_lookup
+    test rax, rax
+    jz .tz_done
+    mov edi, [rax + 4]
+    mov [tz_dst_drawable], edi
+    call drawable_get_backing
+    test rax, rax
+    jz .tz_done
+    mov [tz_dst_ptr], rax
+    mov [tz_dst_stride], edx
+    mov [tz_dst_h], ecx
+
+    ; --- resolve src colour: solid fill, or sample the src image top-left
+    ;     (cairo's non-solid src here is a 1×1 repeat pattern) ---
+    mov edi, [rbx + 8]
+    call picture_lookup
+    test rax, rax
+    jz .tz_done
+    cmp dword [rax + 4], PICTURE_SOLID
+    jne .tz_src_image
+    mov ecx, [rax + 8]                        ; stored 8-bit ARGB
+    jmp .tz_have_color
+.tz_src_image:
+    mov edi, [rax + 4]
+    call drawable_get_backing
+    test rax, rax
+    jz .tz_done
+    mov ecx, [rax]
+.tz_have_color:
+    ; op Src (1) replaces → force opaque (mirrors render_composite). Any other
+    ; op blends Over by the source alpha: keep it; fully transparent = no-op.
+    cmp byte [rbx + 4], 1
+    jne .tz_op_over
+    or ecx, 0xFF000000
+    jmp .tz_color_ready
+.tz_op_over:
+    test ecx, 0xFF000000
+    jz .tz_done                               ; alpha 0 → nothing to draw
+.tz_color_ready:
+    mov [tz_color], ecx
+
+    ; --- trapezoid count = (length*4 - 24) / 40 ---
+    movzx eax, word [rbx + 2]
+    shl eax, 2
+    sub eax, 24
+    jle .tz_done
+    xor edx, edx
+    mov ecx, 40
+    div ecx
+    test eax, eax
+    jz .tz_done
+    mov r12d, eax
+    lea rbp, [rbx + 24]
+
+.tz_trap:
+    ; y_start = (top + 0x7FFF) >> 16, clamped ≥ 0 (pixel-centre in/out rule)
+    mov eax, [rbp + 0]
+    add eax, 0x7FFF
+    sar eax, 16
+    test eax, eax
+    jns .tz_ys_ok
+    xor eax, eax
+.tz_ys_ok:
+    mov r13d, eax
+    ; y_end (exclusive) = (bottom + 0x7FFF) >> 16, clamped ≤ dst_h
+    mov eax, [rbp + 4]
+    add eax, 0x7FFF
+    sar eax, 16
+    cmp eax, [tz_dst_h]
+    jle .tz_ye_ok
+    mov eax, [tz_dst_h]
+.tz_ye_ok:
+    mov r14d, eax
+
+.tz_row:
+    cmp r13d, r14d
+    jge .tz_next_trap
+    mov r11d, r13d
+    shl r11d, 16
+    add r11d, 0x8000                          ; yc = row centre in 16.16
+    lea rsi, [rbp + 8]                        ; left edge line
+    call .tz_line_x
+    add eax, 0x7FFF
+    sar eax, 16
+    test eax, eax
+    jns .tz_xl_ok
+    xor eax, eax
+.tz_xl_ok:
+    mov r15d, eax                             ; x_start (clamped ≥ 0)
+    lea rsi, [rbp + 24]                       ; right edge line (r11 preserved)
+    call .tz_line_x
+    add eax, 0x7FFF
+    sar eax, 16
+    cmp eax, [tz_dst_stride]
+    jle .tz_xr_ok
+    mov eax, [tz_dst_stride]
+.tz_xr_ok:
+    sub eax, r15d                             ; span width
+    jle .tz_row_next
+    mov ecx, eax                              ; pixel count
+    mov eax, r13d
+    imul eax, [tz_dst_stride]
+    add eax, r15d
+    mov rdi, [tz_dst_ptr]
+    lea rdi, [rdi + rax*4]
+    mov eax, [tz_color]
+    cmp eax, 0xFF000000                       ; alpha 255? (unsigned: opaque ≥)
+    jb .tz_span_blend
+    rep stosd                                 ; opaque fast path
+    jmp .tz_row_next
+.tz_span_blend:
+    ; translucent Over: out = (src*a + dst*(255-a)) / 255, per channel,
+    ; /255 via (v*257+257)>>16 — same formula as render_composite .rc_blend.
+    mov esi, eax                              ; src ARGB (constant for the span)
+    mov r8d, eax
+    shr r8d, 24                               ; a (1..254)
+    mov r9d, 255
+    sub r9d, r8d                              ; 255 - a
+.tz_blend_px:
+    mov edx, [rdi]                            ; dst pixel
+    ; blue
+    mov eax, esi
+    and eax, 0xFF
+    imul eax, r8d
+    mov r10d, edx
+    and r10d, 0xFF
+    imul r10d, r9d
+    add eax, r10d
+    imul eax, 257
+    add eax, 257
+    shr eax, 16
+    mov r11d, eax
+    ; green
+    mov eax, esi
+    shr eax, 8
+    and eax, 0xFF
+    imul eax, r8d
+    mov r10d, edx
+    shr r10d, 8
+    and r10d, 0xFF
+    imul r10d, r9d
+    add eax, r10d
+    imul eax, 257
+    add eax, 257
+    shr eax, 16
+    shl eax, 8
+    or r11d, eax
+    ; red
+    mov eax, esi
+    shr eax, 16
+    and eax, 0xFF
+    imul eax, r8d
+    mov r10d, edx
+    shr r10d, 16
+    and r10d, 0xFF
+    imul r10d, r9d
+    add eax, r10d
+    imul eax, 257
+    add eax, 257
+    shr eax, 16
+    shl eax, 16
+    or r11d, eax
+    or r11d, 0xFF000000
+    mov [rdi], r11d
+    add rdi, 4
+    dec ecx
+    jnz .tz_blend_px
+.tz_row_next:
+    inc r13d
+    jmp .tz_row
+
+.tz_next_trap:
+    add rbp, 40
+    dec r12d
+    jnz .tz_trap
+
+    ; recomposite if the dst drawable is a window
+    mov edi, [tz_dst_drawable]
+    call window_lookup
+    test rax, rax
+    jz .tz_done
+    mov byte [comp_dirty], 1
+.tz_done:
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; .tz_line_x — rsi = LINEFIX ptr (p1x,p1y,p2x,p2y FIXED), r11d = y (FIXED).
+; Returns eax = the line's x at that y (FIXED), 64-bit linear interpolation:
+; x = p1x + (p2x-p1x)*(y-p1y)/(p2y-p1y). Horizontal degenerate → p1x.
+; Deltas are saturated to ±(2^31-1) before the multiply (product then provably
+; fits signed 64-bit) and the result to ±0x7FFF0000, so the caller's 32-bit
+; consumption plus its +0x7FFF rounding can never wrap a huge off-screen x
+; into an in-range span. Extreme (>32k px) inputs degrade to a clamped
+; approximation; cairo never emits them.
+; Clobbers rax, rcx, rdx, r8, r9, r10; preserves r11 and callee-saved regs.
+.tz_line_x:
+    movsxd r8, dword [rsi + 4]                ; p1y
+    movsxd r9, dword [rsi + 12]               ; p2y
+    sub r9, r8                                ; dy (flags for jz below)
+    movsxd rcx, dword [rsi + 0]               ; p1x (movsxd leaves flags alone)
+    jz .tz_lx_flat
+    movsxd rax, dword [rsi + 8]               ; p2x
+    sub rax, rcx                              ; dx (fits 33 bits)
+    movsxd r10, r11d                          ; y
+    sub r10, r8                               ; y - p1y (fits 33 bits)
+    mov rdx, 0x7FFFFFFF                       ; saturate dx
+    cmp rax, rdx
+    jle .tz_lx_dx1
+    mov rax, rdx
+.tz_lx_dx1:
+    neg rdx
+    cmp rax, rdx
+    jge .tz_lx_dx2
+    mov rax, rdx
+.tz_lx_dx2:
+    neg rdx                                   ; saturate y - p1y
+    cmp r10, rdx
+    jle .tz_lx_dy1
+    mov r10, rdx
+.tz_lx_dy1:
+    neg rdx
+    cmp r10, rdx
+    jge .tz_lx_dy2
+    mov r10, rdx
+.tz_lx_dy2:
+    imul rax, r10                             ; ≤ (2^31-1)^2 < 2^62, no wrap
+    cqo
+    idiv r9
+    add rax, rcx
+    mov rdx, 0x7FFF0000                       ; saturate result for 32-bit caller
+    cmp rax, rdx
+    jle .tz_lx_r1
+    mov rax, rdx
+.tz_lx_r1:
+    neg rdx
+    cmp rax, rdx
+    jge .tz_lx_r2
+    mov rax, rdx
+.tz_lx_r2:
+    ret
+.tz_lx_flat:
+    mov rax, rcx
     ret
 
 ; ============================================================================
