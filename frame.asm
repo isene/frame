@@ -693,6 +693,13 @@ log_rr_minor:       db "  RANDR minor=", 0
 ; ListExtensions STR list: length byte + name, 39 bytes total (matches the
 ; QueryExtension set exactly — advertising one obligates serving it).
 ext_names:          db 6, "RENDER", 5, "RANDR", 9, "XKEYBOARD", 15, "XInputExtension"
+; XI1 ListInputDevices payload: 2 DeviceInfo (type Atom=None, id, nclasses=0,
+; use IsXPointer/IsXKeyboard, pad) + 2 STR names + 1 pad byte = 60 bytes.
+xi1_core_devs:      db 0,0,0,0, 2, 0, 0, 0
+                    db 0,0,0,0, 3, 0, 1, 0
+                    db 20, "Virtual core pointer"
+                    db 21, "Virtual core keyboard"
+                    db 0
 dbg_pxfull:         db "PXFULL", 10        ; DIAG: CreatePixmap dropped — table full
 dbg_cli_tag:        db "c"                 ; DIAG: client slot prefix
 dbg_picfull:        db "PICFULL", 10       ; DIAG: CreatePicture dropped — table full
@@ -5087,6 +5094,8 @@ handle_xinput:
     movzx eax, byte [rsi + 1]                ; XI minor opcode
     cmp eax, 1                               ; X_GetExtensionVersion (XI1 probe)
     je .xi_get_ext_version
+    cmp eax, 2                               ; XI1 ListInputDevices
+    je .xi_list_devices
     cmp eax, 47                              ; XIQueryVersion (XI2)
     je .xi_query_version
     cmp eax, 48                              ; XIQueryDevice
@@ -5120,6 +5129,27 @@ handle_xinput:
     mov word [rdi + 8], 2                     ; major_version = 2
     mov word [rdi + 10], 0                    ; minor_version = 0
     mov byte [rdi + 12], 1                    ; present = True
+    jmp .xi_write
+
+.xi_list_devices:
+    ; GTK2 calls XListInputDevices in gdk_input_init and BLOCKS on the reply
+    ; (fortitray's invisible hang). The reply must carry the TWO core devices:
+    ; ndevices=0 + length=0 CHECK-crashes Chromium (its parser has a fixed
+    ; 1-byte pad + align-4 after the lists, so it demands length >= 1), while
+    ; ndevices=0 + length=1 aborts libXi (it skips the payload read when
+    ; ndevices==0, and xcb asserts on the 4 leftover bytes). With ndevices=2
+    ; both walk the same 60-byte payload: 2 DeviceInfo (no classes) + 2 STR
+    ; names + pad. GTK2 skips core devices, so behavior is unchanged there.
+    mov esi, 92                               ; 32 + 60 → length = 15
+    call xkb_reply_zero
+    mov byte [rdi + 1], 2                     ; xi_reply_type = ListInputDevices
+    mov byte [rdi + 8], 2                     ; ndevices
+    push rsi
+    lea rsi, [xi1_core_devs]
+    lea rdi, [reply_buf + 32]
+    mov ecx, 60
+    rep movsb
+    pop rsi
     jmp .xi_write
 
 .xi_get_client_pointer:                       ; reply: a client pointer IS set
