@@ -476,7 +476,9 @@ keysym_table:       resb KEYCODE_RANGE * 24
 ;   +9  pad (1)
 ;   +10 modifiers (u16)
 ;   +12 pad (4)
-%define MAX_KEY_GRABS        256
+%define MAX_KEY_GRABS        512            ; tile's real .tilerc registers 300+
+                                            ; (each bind x8 modifier variants);
+                                            ; overflow silently dropped binds
 %define KEY_GRAB_SIZE        16
 key_grabs:          resb MAX_KEY_GRABS * KEY_GRAB_SIZE
 
@@ -650,6 +652,7 @@ flip_pending:       resb 1               ; PAGE_FLIP in flight; don't composite
                                          ; until its completion event arrives
 drm_poll_dead:      resb 1               ; drm fd hit POLLERR/POLLHUP: stop
                                          ; polling it, flips fire-and-forget
+testinput_path:     resq 1               ; --testinput PATH (0 = off)
 fbtest_mode:        resb 1               ; --fbtest: composite into plain
                                          ; memory, no DRM (headless testing)
 comp_px_blit:       resq 1               ; PERF counters (SIGUSR1 report):
@@ -1169,6 +1172,20 @@ _start:
     mov byte [fbtest_mode], 1
     jmp .flag_scan_next
 .flag_not_fbtest:
+    cmp dword [rdi], '--te'                  ; --testinput PATH: extra input fd
+    jne .flag_not_testinput                  ; (FIFO) feeding synthetic evdev
+    cmp dword [rdi + 4], 'stin'              ; records into the normal input
+    jne .flag_not_testinput                  ; path — headless key/ptr testing
+    cmp dword [rdi + 8], 'put'
+    jne .flag_not_testinput
+    lea rdx, [rcx + 1]
+    cmp rdx, rax
+    jge .flag_scan_next                      ; no path argument → ignore
+    mov rdx, [rsp + 8 + rdx*8]
+    mov [testinput_path], rdx
+    inc rcx                                  ; consume the path argument
+    jmp .flag_scan_next
+.flag_not_testinput:
     cmp dword [rdi], '--di'
     jne .flag_scan_next
     cmp dword [rdi + 4], 'spla'
@@ -1202,6 +1219,25 @@ _start:
     call read_framerc                        ; ~/.framerc → keymap_is_no
     call init_keysyms
     call init_input
+    ; --testinput PATH: append the FIFO to the input fd set. Opened O_RDWR
+    ; so an idle FIFO never reads EOF (the server itself counts as a
+    ; writer); records written to it flow through dispatch_input_event
+    ; exactly like hardware evdev. Cold unless the flag was given.
+    mov rdi, [testinput_path]
+    test rdi, rdi
+    jz .skip_testinput
+    mov rax, SYS_OPEN
+    mov esi, 0x802                           ; O_RDWR | O_NONBLOCK
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .skip_testinput
+    mov ecx, [input_fd_count]
+    cmp ecx, MAX_INPUTS
+    jge .skip_testinput
+    mov [input_fds + rcx*4], eax
+    inc dword [input_fd_count]
+.skip_testinput:
     cmp byte [compositor_requested], 0
     je .skip_compositor
     call init_compositor
@@ -7871,6 +7907,18 @@ handle_list_properties:
 %define XK_Up           0xFF52
 %define XK_Right        0xFF53
 %define XK_Down         0xFF54
+%define XK_Prior        0xFF55              ; Page_Up
+%define XK_Next         0xFF56              ; Page_Down
+%define XK_Home         0xFF50
+%define XK_End          0xFF57
+%define XK_Insert       0xFF63
+%define XK_Delete       0xFFFF
+%define XK_Print        0xFF61
+%define XF86_AudioMute          0x1008FF12
+%define XF86_AudioLowerVolume   0x1008FF11
+%define XF86_AudioRaiseVolume   0x1008FF13
+%define XF86_MonBrightnessDown  0x1008FF03
+%define XF86_MonBrightnessUp    0x1008FF02
 
 ; ----------------------------------------------------------------------------
 ; read_framerc — read ~/.framerc and set keymap_is_no from a `keymap = no`
@@ -8212,6 +8260,22 @@ init_keysyms:
     KS 116, XK_Down, XK_Down
     KS 133, XK_Super_L, XK_Super_L
     KS 134, XK_Super_R, XK_Super_R
+    ; Navigation cluster + Print — tile binds Mod4+Shift+Page_Up/Down;
+    ; missing syms meant tile could not resolve those binds on frame.
+    KS 107, XK_Print, XK_Print
+    KS 110, XK_Home, XK_Home
+    KS 112, XK_Prior, XK_Prior
+    KS 115, XK_End, XK_End
+    KS 117, XK_Next, XK_Next
+    KS 118, XK_Insert, XK_Insert
+    KS 119, XK_Delete, XK_Delete
+    ; XF86 media keys (laptop function row) — tile's volume/brightness
+    ; binds resolve against these via GetKeyboardMapping.
+    KS 121, XF86_AudioMute, XF86_AudioMute
+    KS 122, XF86_AudioLowerVolume, XF86_AudioLowerVolume
+    KS 123, XF86_AudioRaiseVolume, XF86_AudioRaiseVolume
+    KS 232, XF86_MonBrightnessDown, XF86_MonBrightnessDown
+    KS 233, XF86_MonBrightnessUp, XF86_MonBrightnessUp
 
     ; --- Number row + punctuation: layout-dependent.
     cmp byte [keymap_is_no], 0
