@@ -3842,8 +3842,12 @@ dispatch_request:
     je .dr_query_extension
     cmp eax, 99
     je .dr_list_extensions
+    cmp eax, 100
+    je .dr_change_keyboard_mapping
     cmp eax, 101
     je .dr_get_keyboard_mapping
+    cmp eax, 118
+    je .dr_set_modifier_mapping
     cmp eax, 103
     je .dr_get_keyboard_control
     cmp eax, 106
@@ -4080,6 +4084,16 @@ dispatch_request:
     mov edi, ebx
     mov rsi, r12                             ; request ptr
     call handle_get_keyboard_mapping
+    jmp .dr_done
+
+.dr_change_keyboard_mapping:
+    mov rsi, r12
+    call handle_change_keyboard_mapping
+    jmp .dr_done
+
+.dr_set_modifier_mapping:
+    mov edi, ebx
+    call handle_set_modifier_mapping
     jmp .dr_done
 
 .dr_get_window_attributes:
@@ -8224,6 +8238,146 @@ pf_parse_hex:
 .pph_done:
     ret
 
+; handle_change_keyboard_mapping — rsi = req. ChangeKeyboardMapping (100,
+; void). xmodmap's workhorse: Geir's ~/.Xmodmap remaps physical Esc→F12
+; (rofi) and CapsLock→Escape. Writes the request's keysyms into
+; keysym_table (m per keycode, table holds 6 — extra columns zeroed), then
+; broadcasts MappingNotify so clients re-read the map.
+;   +1 keycode-count n   +4 first-keycode   +5 keysyms-per-keycode m
+;   +8 n*m CARD32 keysyms
+; ----------------------------------------------------------------------------
+handle_change_keyboard_mapping:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rsi
+    movzx r12d, byte [rbx + 1]               ; n keycodes
+    movzx r13d, byte [rbx + 4]               ; first keycode
+    movzx r14d, byte [rbx + 5]               ; m syms per keycode
+    test r12d, r12d
+    jz .ckm_done
+    test r14d, r14d
+    jz .ckm_done
+    cmp r13d, X_MIN_KEYCODE
+    jb .ckm_done
+    lea eax, [r13 + r12]
+    cmp eax, 256
+    ja .ckm_done
+    lea r15, [rbx + 8]                       ; keysym cursor
+    xor ecx, ecx                             ; keycode index
+.ckm_kc:
+    cmp ecx, r12d
+    jge .ckm_notify
+    lea eax, [r13 + rcx]
+    sub eax, X_MIN_KEYCODE
+    imul eax, eax, 24
+    lea rdi, [keysym_table + rax]
+    xor edx, edx
+.ckm_col:
+    cmp edx, 6
+    jge .ckm_next
+    xor eax, eax                             ; columns past m → NoSymbol
+    cmp edx, r14d
+    jge .ckm_store
+    mov eax, [r15 + rdx*4]
+.ckm_store:
+    mov [rdi + rdx*4], eax
+    inc edx
+    jmp .ckm_col
+.ckm_next:
+    lea r15, [r15 + r14*4]
+    inc ecx
+    jmp .ckm_kc
+.ckm_notify:
+    mov edi, 1                               ; request = Keyboard
+    mov esi, r13d
+    mov edx, r12d
+    call send_mapping_notify
+.ckm_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; handle_set_modifier_mapping — edi = slot. SetModifierMapping (118).
+; xmodmap's `clear Lock` sends this and BLOCKS on the reply. frame's
+; modifier tracking is evdev-hardcoded (Ctrl/Shift/Alt/Mod4 by scan code),
+; so the map itself is accepted and ignored; reply Success + notify.
+; ----------------------------------------------------------------------------
+handle_set_modifier_mapping:
+    push rbx
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr
+    push rax
+    lea rdi, [reply_buf]
+    xor ecx, ecx
+    mov [rdi], rcx
+    mov [rdi + 8], rcx
+    mov [rdi + 16], rcx
+    mov [rdi + 24], rcx
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 0                    ; status = Success
+    pop rax
+    mov ecx, [rax + 8]
+    mov [rdi + 2], cx
+    mov edi, [rax]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov edx, 32
+    syscall
+    xor edi, edi                             ; request = Modifier
+    xor esi, esi
+    xor edx, edx
+    call send_mapping_notify
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; send_mapping_notify — edi = request (0 Modifier / 1 Keyboard / 2 Pointer),
+; esi = first keycode, edx = count. MappingNotify (34) is delivered to ALL
+; fully-connected clients regardless of event masks (X11 core semantics).
+; ----------------------------------------------------------------------------
+send_mapping_notify:
+    push rbx
+    push r12
+    lea rax, [pn_buf]
+    xor ecx, ecx
+    mov [rax], rcx
+    mov [rax + 8], rcx
+    mov [rax + 16], rcx
+    mov [rax + 24], rcx
+    mov byte [rax + 0], 34
+    mov [rax + 4], dil                       ; request
+    mov [rax + 5], sil                       ; first keycode
+    mov [rax + 6], dl                        ; count
+    xor ebx, ebx
+.smn_loop:
+    cmp ebx, MAX_CLIENTS
+    jge .smn_done
+    mov eax, ebx
+    call client_meta_addr
+    cmp dword [rax], -1
+    je .smn_next
+    cmp byte [rax + 4], CSTATE_RUNNING
+    jne .smn_next
+    mov edi, ebx
+    lea rsi, [pn_buf]
+    call send_event_to_slot
+.smn_next:
+    inc ebx
+    jmp .smn_loop
+.smn_done:
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
 ; init_keysyms — populate keysym_table. Keys shared across layouts are set
 ; unconditionally; the number row + punctuation branch on keymap_is_no
 ; (US default, or Norwegian when ~/.framerc has keymap=no).
