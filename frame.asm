@@ -6895,8 +6895,41 @@ handle_change_window_attributes:
 .cwa_redirect:
     ; SubstructureRedirect ownership keys on what THIS request selected (r8d),
     ; not the combined mask — else every later CWA would re-claim redirect.
+    ; EXCLUSIVE, like real X: if another client owns it, reply BadAccess and
+    ; leave the claim alone. Chromium/GTK probe for a running WM by selecting
+    ; SubstructureRedirect on root and expecting BadAccess; without it the
+    ; prober silently STOLE MapRequest routing from tile — every window
+    ; mapped after a FortiClient/Electron launch went to the prober and
+    ; never showed (the panel's dead Mod4+Return).
     test r8d, EM_SUBSTRUCTURE_REDIRECT
     jz .cwa_clear_redirect
+    movsx eax, byte [r13 + 30]
+    cmp eax, 0
+    jl .cwa_claim                            ; unowned → claim
+    cmp eax, ebx
+    je .cwa_done                             ; already ours
+    ; Owned by someone else → BadAccess (code 10) to the requester.
+    mov eax, ebx
+    call client_meta_addr
+    lea rdi, [reply_buf]
+    xor ecx, ecx
+    mov [rdi], rcx
+    mov [rdi + 8], rcx
+    mov [rdi + 16], rcx
+    mov [rdi + 24], rcx
+    mov byte [rdi + 1], 10                   ; Access
+    mov ecx, [rax + 8]
+    mov [rdi + 2], cx                        ; seq
+    mov ecx, [r13]
+    mov [rdi + 4], ecx                       ; the window
+    mov byte [rdi + 10], 2                   ; major = ChangeWindowAttributes
+    mov edi, [rax]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov edx, 32
+    syscall
+    jmp .cwa_done
+.cwa_claim:
     mov [r13 + 30], bl                       ; this client claims the redirect
     jmp .cwa_done
 .cwa_clear_redirect:
