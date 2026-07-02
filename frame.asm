@@ -323,6 +323,7 @@ xkb_getmap_present: resd 1               ; GetMap reply present mask (echoes req
 windows:            resb MAX_WINDOWS * WINDOW_REC_SIZE
 win_stk_next:       resd 1               ; monotonic z-order; ++ on each map/raise
 rs_last_stk:        resd 1               ; recomposite: stk of last window drawn
+rs_counter:         resd 1               ; DIAG: recomposite invocation count
 rs_min_stk:         resd 1               ; recomposite: min stk found this pass
 
 ; ---- Phase 4g graphics-context table --------------------------------------
@@ -335,6 +336,28 @@ rs_min_stk:         resd 1               ; recomposite: min stk found this pass
 %define MAX_GCS          256
 %define GC_REC_SIZE      16
 gcs:                resb MAX_GCS * GC_REC_SIZE
+
+; ---- clip rectangles ---------------------------------------------------
+; GTK partial repaints paint only the damaged rects of a buffer pixmap and
+; blit its whole bounds with a clip set to the damage region. Ignoring the
+; clip splashes the buffer's unpainted (zero = black) gaps over neighbours
+; — the "GIMP goes black on every interaction" bug. One clip entry per GC
+; (core SetClipRectangles, op 59) and per Picture (RENDER minors 5/6).
+; Entry: +0 count (s32: 0 = no clip, -1 = empty clip = draw nothing,
+; else n) then n rects of x1,y1,x2,y2 (s32, absolute drawable coords,
+; x2/y2 exclusive, clip origin already added). Lists longer than
+; CLIP_MAX_RECTS keep the first CLIP_MAX_RECTS rects (never bbox —
+; bbox over-copies the paint buffer's zero gaps → black splash).
+%define CLIP_MAX_RECTS   64
+%define CLIP_ENTRY_SIZE  1028                ; 4 + CLIP_MAX_RECTS*16
+gc_clips:           resb MAX_GCS * CLIP_ENTRY_SIZE
+cur_clip:           resq 1               ; active clip entry for the op in
+                                         ; flight (0 = unclipped); set by each
+                                         ; consumer right before drawing
+last_enter_win:     resd 1               ; window the pointer was last inside —
+                                         ; drives EnterNotify/LeaveNotify. GTK
+                                         ; menu items prelight + activate on
+                                         ; crossings, not motion.
 
 ; ---- Phase 4h pixmap table ------------------------------------------------
 ; pixmaps[MAX_PIXMAPS] — offscreen drawables. Like a window's backing
@@ -361,6 +384,14 @@ pixmaps:            resb MAX_PIXMAPS * PIXMAP_REC_SIZE
 %define MAX_PICTURES     256
 %define PICTURE_REC_SIZE 16
 pictures:           resb MAX_PICTURES * PICTURE_REC_SIZE
+pic_clips:          resb MAX_PICTURES * CLIP_ENTRY_SIZE  ; see gc_clips
+; Per-picture affine transform (RENDER SetPictureTransform, minor 28).
+; +0 flag (0 identity/none), +4 m11 m12 m13 m21 m22 m23 (FIXED 16.16).
+; The projective row is ignored (cairo emits affine only). GIMP renders
+; its zoomed canvas via a transformed Composite; dropping the transform
+; made the sampling miss the source entirely → black canvas.
+pic_xforms:         resb MAX_PICTURES * 28
+co_src_xform:       resq 1               ; active src transform for composite
 ; A Picture with drawable == PICTURE_SOLID is a CreateSolidFill source;
 ; its ARGB colour is stored in the format field.
 %define PICTURE_SOLID    0xFFFFFFFF
@@ -512,6 +543,7 @@ setup_req:          resb 4096
 
 ; Log scratch (decimal formatting etc.).
 log_scratch:        resb 64
+dump_path_buf:      resb 64
 
 ; Per-client read buffer for incoming requests. 64 KB matches the upper
 ; bound of the legacy length field (CARD16 in 4-byte units = 256 KB) for
@@ -616,6 +648,11 @@ log_setup_ok:       db "setup reply sent (", 0
 log_setup_ok_2:     db " bytes)", 10
 log_setup_ok_2_len equ $ - log_setup_ok_2
 qext_nl:            db 10
+log_render_min:     db "RENDER minor=", 0
+dbg_pxfull:         db "PXFULL", 10        ; DIAG: CreatePixmap dropped — table full
+dbg_cli_tag:        db "c"                 ; DIAG: client slot prefix
+dbg_picfull:        db "PICFULL", 10       ; DIAG: CreatePicture dropped — table full
+dbg_gcfull:         db "GCFULL", 10        ; DIAG: CreateGC dropped — table full
 log_request_pre:    db "  req opcode=", 0
 log_request_mid:    db " len=", 0
 log_request_nl:     db 10
@@ -708,6 +745,12 @@ dbg_sp:             db " "
 dbg_dump_tag:       db "DUMP xid/w/h/nonbg: "
 dbg_dump_tag_len    equ $ - dbg_dump_tag
 dump_path:          db "/tmp/frame_win.raw", 0
+dump_prefix:        db "/tmp/frame_dump_", 0
+dump_fb0_path:      db "/tmp/frame_fb0.raw", 0
+dump_fb1_path:      db "/tmp/frame_fb1.raw", 0
+dbg_fbstate:        db "FBSTATE back=", 0
+dbg_spX:            db " "
+dump_suffix:        db ".raw", 0
 log_atom_new:       db "  intern-atom new id=", 0
 log_atom_new_len   equ $ - log_atom_new - 1
 log_atom_known:     db "  intern-atom known id=", 0
@@ -1401,6 +1444,12 @@ log_request:
     push r12
     mov rbx, rdi
     mov r12, rsi
+    push rdx                                 ; slot
+    lea rsi, [dbg_cli_tag]                   ; "c<slot>" client prefix
+    mov edx, 1
+    call write_stderr
+    pop rax
+    call write_u64_stderr
     mov rsi, log_request_pre
     mov rdx, 13
     call write_stderr
@@ -3324,6 +3373,7 @@ dispatch_request:
     push rdx
     mov rdi, rax
     mov rsi, rdx
+    mov edx, ebx                             ; client slot for attribution
     call log_request
     pop rdx
     pop rax
@@ -3358,6 +3408,8 @@ dispatch_request:
     je .dr_free_pixmap
     cmp eax, 56
     je .dr_change_gc
+    cmp eax, 59
+    je .dr_set_clip_rectangles
     cmp eax, 60
     je .dr_free_gc
     cmp eax, 61
@@ -3526,6 +3578,12 @@ dispatch_request:
 .dr_free_gc:
     mov rsi, r12
     call handle_free_gc
+    jmp .dr_done
+
+.dr_set_clip_rectangles:
+    mov rsi, r12
+    mov edx, r13d
+    call handle_set_clip_rectangles
     jmp .dr_done
 
 .dr_poly_fill_rectangle:
@@ -8598,6 +8656,181 @@ grab_pointer_target:
     ret
 
 ; ----------------------------------------------------------------------------
+; send_crossing — edi = event code (7 EnterNotify / 8 LeaveNotify),
+; rsi = window record ptr. Sent to the window's own client when its event
+; mask selects it (Enter 0x10 / Leave 0x20). detail Nonlinear, mode Normal,
+; same-screen flag set. GTK menu items prelight and activate on these.
+; ----------------------------------------------------------------------------
+send_crossing:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12d, edi                            ; code
+    mov r13, rsi                             ; record
+    mov r14d, edx                            ; detail (0 Ancestor / 2 Inferior / 3 Nonlinear)
+    mov ecx, 0x10
+    cmp r12d, 7
+    je .sx_mask
+    mov ecx, 0x20
+.sx_mask:
+    test [r13 + 24], ecx                     ; target window wants it?
+    jnz .sx_deliver
+    cmp dword [ptr_grab_win], 0              ; else the grab wants it?
+    je .sx_done                              ; (mirrors motion/button fallback)
+    test [ptr_grab_mask], ecx
+    jz .sx_done
+.sx_deliver:
+    mov eax, [r13]                           ; xid → owner slot
+    cmp eax, X_RID_BASE
+    jb .sx_done
+    sub eax, X_RID_BASE
+    shr eax, 21
+    cmp eax, MAX_CLIENTS
+    jae .sx_done
+    mov ebx, eax                             ; slot
+    mov edi, [r13]
+    call window_abs_xy                       ; r10d/r11d = abs origin
+    lea rdi, [reply_buf]
+    mov [rdi + 0], r12b                      ; code 7/8
+    mov [rdi + 1], r14b                      ; detail
+    mov word [rdi + 2], 0                    ; seq (patched by sender)
+    mov eax, [server_time_ms]
+    mov [rdi + 4], eax                       ; time
+    mov dword [rdi + 8], X_ROOT_WINDOW       ; root
+    mov eax, [r13]
+    mov [rdi + 12], eax                      ; event window
+    mov dword [rdi + 16], 0                  ; child None
+    mov eax, [cursor_x]
+    mov [rdi + 20], ax                       ; root-x
+    mov ecx, eax
+    sub ecx, r10d
+    mov eax, [cursor_y]
+    mov [rdi + 22], ax                       ; root-y
+    sub eax, r11d
+    mov [rdi + 24], cx                       ; event-x
+    mov [rdi + 26], ax                       ; event-y
+    mov eax, [button_state]
+    movzx ecx, byte [mod_state]
+    or eax, ecx
+    mov [rdi + 28], ax                       ; state
+    mov byte [rdi + 30], 0                   ; mode Normal
+    mov byte [rdi + 31], 2                   ; flags: same-screen
+    mov edi, ebx
+    lea rsi, [reply_buf]
+    call send_event_to_slot
+.sx_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; window_is_inferior — edi = candidate xid, esi = ancestor xid.
+; al = 1 iff edi is a strict descendant of esi (parent-chain walk).
+; ----------------------------------------------------------------------------
+window_is_inferior:
+    push rbx
+    mov ebx, esi
+.wii_loop:
+    test edi, edi
+    jz .wii_no
+    cmp edi, X_ROOT_WINDOW
+    je .wii_no
+    call window_lookup
+    test rax, rax
+    jz .wii_no
+    mov edi, [rax + 4]                        ; parent
+    cmp edi, ebx
+    je .wii_yes
+    jmp .wii_loop
+.wii_yes:
+    mov eax, 1
+    pop rbx
+    ret
+.wii_no:
+    xor eax, eax
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; pointer_crossings — rbx = record of the window now under the pointer.
+; When it changed since last motion: LeaveNotify to the old window,
+; EnterNotify to the new, with X-correct details: entering an inferior →
+; Leave(old, Inferior) + Enter(new, Ancestor); the reverse mirrored; else
+; Nonlinear. GTK keeps a widget's prelight on Leave(detail=Inferior) —
+; without this every deep-window hop mass-unhighlights the whole widget
+; chain and floods repaints. Runs BEFORE any motion-mask gating — menu
+; item windows select Enter/Leave without PointerMotion. Preserves regs.
+; ----------------------------------------------------------------------------
+pointer_crossings:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    mov eax, [rbx]
+    cmp eax, [last_enter_win]
+    je .pc_done
+    mov r8d, 3                               ; leave detail = Nonlinear
+    mov r9d, 3                               ; enter detail = Nonlinear
+    mov edi, [last_enter_win]
+    test edi, edi
+    jz .pc_details_done
+    mov edi, [rbx]                           ; new inferior of old?
+    mov esi, [last_enter_win]
+    call window_is_inferior
+    test al, al
+    jz .pc_chk_up
+    mov r8d, 2                               ; Leave(old, Inferior)
+    xor r9d, r9d                             ; Enter(new, Ancestor)
+    jmp .pc_details_done
+.pc_chk_up:
+    mov edi, [last_enter_win]                ; old inferior of new?
+    mov esi, [rbx]
+    call window_is_inferior
+    test al, al
+    jz .pc_details_done
+    xor r8d, r8d                             ; Leave(old, Ancestor)
+    mov r9d, 2                               ; Enter(new, Inferior)
+.pc_details_done:
+    mov edi, [last_enter_win]
+    test edi, edi
+    jz .pc_enter
+    call window_lookup
+    test rax, rax
+    jz .pc_enter
+    push r9
+    mov rsi, rax
+    mov edi, 8                               ; LeaveNotify
+    mov edx, r8d
+    call send_crossing
+    pop r9
+.pc_enter:
+    mov eax, [rbx]
+    mov [last_enter_win], eax
+    mov edi, 7                               ; EnterNotify
+    mov rsi, rbx
+    mov edx, r9d
+    call send_crossing
+.pc_done:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; ----------------------------------------------------------------------------
 ; deliver_pointer_motion — send MotionNotify to the window under the cursor
 ; if it selected PointerMotionMask (0x40). No-op otherwise.
 ; ----------------------------------------------------------------------------
@@ -8609,6 +8842,7 @@ deliver_pointer_motion:
     test rax, rax
     jz .dpm_done
     mov rbx, rax
+    call pointer_crossings                   ; Enter/Leave BEFORE motion gating
     ; owner_events: motion over a client window is reported per THAT window's
     ; mask, not the grab's. GTK grabs the toplevel with a mask that may omit
     ; PointerMotion, but the menu window selects it — without honouring the
@@ -8629,6 +8863,7 @@ deliver_pointer_motion:
     test rax, rax
     jz .dpm_done
     mov rbx, rax
+    call pointer_crossings                   ; Enter/Leave BEFORE motion gating
     test dword [rbx + 24], 0x40              ; PointerMotionMask
     jz .dpm_done
     mov r8d, [cursor_x]
@@ -9855,6 +10090,7 @@ cursor_move_hw:
 recomposite_screen:
     cmp byte [compositor_active], 0
     je .rs_done
+    inc dword [rs_counter]                    ; DIAG
     push rbx
     push r12
     push r13
@@ -9912,30 +10148,14 @@ recomposite_screen:
     mov ecx, [rs_min_stk]
     mov [rs_last_stk], ecx
 
-    ; If the window has a backing buffer with real content, blit it.
+    ; Blit only windows that have drawn content. A just-mapped window has
+    ; no backing until its first draw; painting a placeholder (the old
+    ; phase-4f per-xid hash colour) flashed a pastel rect before every
+    ; window/menu appeared. Undefined contents = leave what's beneath.
     cmp byte [r12 + 31], 0
-    je .rs_flat
+    je .rs_pass
     mov rdi, r12
     call blit_window
-    jmp .rs_pass
-
-.rs_flat:
-    ; No backing yet — fill the window rect with its back_pixel, or a
-    ; per-xid hash colour if back_pixel is 0 (so a zero-background
-    ; window is still visible during development).
-    mov r13d, [r12 + 44]                     ; back_pixel
-    test r13d, r13d
-    jnz .rs_flat_draw
-    mov edi, [r12]
-    call window_color
-    mov r13d, eax
-.rs_flat_draw:
-    movsx eax, word [r12 + 8]
-    movsx esi, word [r12 + 10]
-    movzx edi, word [r12 + 12]
-    movzx ecx, word [r12 + 14]
-    mov edx, r13d
-    call draw_rect
     jmp .rs_pass
 
 .rs_done_pop:
@@ -10303,11 +10523,22 @@ gc_alloc:
     mov [rax], r12d
     mov dword [rax + 4], 0x00FFFFFF          ; default fg = white
     mov dword [rax + 8], 0                    ; default bg = black
+    push rax                                  ; clear the slot's clip entry
+    lea rcx, [gcs]
+    sub rax, rcx
+    shr rax, 4
+    imul rax, CLIP_ENTRY_SIZE
+    lea rcx, [gc_clips]
+    mov dword [rcx + rax], 0                  ; count 0 = no clip
+    pop rax
 .ga_done:
     pop r12
     pop rbx
     ret
 .ga_full:
+    lea rsi, [dbg_gcfull]                    ; DIAG: table full, create dropped
+    mov edx, 7
+    call write_stderr
     xor eax, eax
     pop r12
     pop rbx
@@ -10335,12 +10566,30 @@ apply_gc_values:
     je .agv_fg
     cmp r14d, 3
     je .agv_bg
+    cmp r14d, 19
+    je .agv_clipmask
     jmp .agv_adv
 .agv_fg:
     mov [r13 + 4], eax
     jmp .agv_adv
 .agv_bg:
     mov [r13 + 8], eax
+    jmp .agv_adv
+.agv_clipmask:
+    ; clip-mask value: None clears the clip; pixmap masks are unsupported
+    ; and also clear (over-draw beats black-splash). Rect clips come in
+    ; via SetClipRectangles which overwrites the entry afterwards.
+    push rax
+    push rcx
+    mov rax, r13
+    lea rcx, [gcs]
+    sub rax, rcx
+    shr rax, 4
+    imul rax, CLIP_ENTRY_SIZE
+    lea rcx, [gc_clips]
+    mov dword [rcx + rax], 0
+    pop rcx
+    pop rax
 .agv_adv:
     add r12, 4
 .agv_skip:
@@ -10414,6 +10663,39 @@ handle_free_gc:
     jz .fg_done
     mov dword [rax], 0
 .fg_done:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; handle_set_clip_rectangles — rsi = req ptr, edx = req bytes (opcode 59).
+;   +1 ordering (ignored)  +4 gc  +8 clip-x-origin s16  +10 clip-y-origin
+;   +12 rect list (x s16, y s16, w u16, h u16 each).
+; Stores the clip on the GC's clip entry; an empty list clips everything
+; out (X semantics). No reply.
+; ----------------------------------------------------------------------------
+handle_set_clip_rectangles:
+    push rbx
+    push r12
+    mov rbx, rsi
+    mov r12d, edx
+    mov edi, [rbx + 4]
+    call gc_lookup
+    test rax, rax
+    jz .scr_done
+    lea rcx, [gcs]
+    sub rax, rcx
+    shr rax, 4                                ; GC slot (rec size 16)
+    imul rax, CLIP_ENTRY_SIZE
+    lea rdi, [gc_clips]
+    add rdi, rax                              ; clip entry
+    lea rsi, [rbx + 8]                        ; origins + rects
+    mov edx, r12d
+    sub edx, 12
+    js .scr_done
+    shr edx, 3                                ; rect count
+    call clip_store
+.scr_done:
+    pop r12
     pop rbx
     ret
 
@@ -10501,6 +10783,194 @@ window_ensure_backing:
 ; Fills each rect into the drawable window's backing buffer with the GC
 ; foreground colour. No reply.
 ; ----------------------------------------------------------------------------
+; ----------------------------------------------------------------------------
+; clip_store — parse a SetClipRectangles-shaped rect list into a clip entry.
+;   rdi = clip entry ptr, rsi = wire ptr (s16 ox, s16 oy, then rects of
+;   x s16, y s16, w u16, h u16), edx = rect count.
+; Empty list → count -1 (clip everything out, X semantics). More than
+; CLIP_MAX_RECTS → collapse to one bounding box.
+; ----------------------------------------------------------------------------
+clip_store:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi
+    mov r13, rsi
+    mov r14d, edx
+    test r14d, r14d
+    jnz .cs_have
+    mov dword [r12], -1
+    jmp .cs_done
+.cs_have:
+    movsx ebx, word [r13 + 0]                 ; clip-x-origin
+    movsx r15d, word [r13 + 2]                ; clip-y-origin
+    add r13, 4
+    cmp r14d, CLIP_MAX_RECTS
+    jle .cs_exact
+    ; Overflow: keep the first CLIP_MAX_RECTS rects and DROP the rest.
+    ; Never fall back to the bounding box — GTK's end_paint blits a
+    ; buffer whose inter-rect gaps are never-written zeros; a bbox clip
+    ; copies those zeros over live window content (the "GIMP repaints
+    ; black on hover" bug). Under-clipping only leaves a stale sliver.
+    mov r14d, CLIP_MAX_RECTS
+.cs_exact:
+    mov [r12], r14d
+    lea rdi, [r12 + 4]
+.cs_ex_loop:
+    movsx eax, word [r13 + 0]
+    add eax, ebx
+    mov [rdi + 0], eax                        ; x1
+    movsx ecx, word [r13 + 2]
+    add ecx, r15d
+    mov [rdi + 4], ecx                        ; y1
+    movzx edx, word [r13 + 4]
+    add edx, eax
+    mov [rdi + 8], edx                        ; x2
+    movzx edx, word [r13 + 6]
+    add edx, ecx
+    mov [rdi + 12], edx                       ; y2
+    add r13, 8
+    add rdi, 16
+    dec r14d
+    jnz .cs_ex_loop
+.cs_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; clip_test_point — edi = x, esi = y vs the [cur_clip] entry.
+; Returns al = 1 (draw) / 0 (clipped out). Clobbers rax, rcx, rdx.
+; ----------------------------------------------------------------------------
+clip_test_point:
+    push rbx
+    mov rbx, [cur_clip]
+    test rbx, rbx
+    jz .ctp_yes
+    mov ecx, [rbx]
+    test ecx, ecx
+    jz .ctp_yes
+    js .ctp_no
+    lea rdx, [rbx + 4]
+.ctp_loop:
+    cmp edi, [rdx + 0]
+    jl .ctp_next
+    cmp edi, [rdx + 8]
+    jge .ctp_next
+    cmp esi, [rdx + 4]
+    jl .ctp_next
+    cmp esi, [rdx + 12]
+    jge .ctp_next
+.ctp_yes:
+    mov eax, 1
+    pop rbx
+    ret
+.ctp_next:
+    add rdx, 16
+    dec ecx
+    jnz .ctp_loop
+.ctp_no:
+    xor eax, eax
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; clipped_fb_fill — fb_fill honoring [cur_clip]: no clip → plain fb_fill;
+; empty clip → nothing; else one fb_fill per rect intersection.
+; Args identical to fb_fill (rdi buf, esi stride, edx bufh, eax x, r8d y,
+; r9d w, r10d h, r11d colour).
+; ----------------------------------------------------------------------------
+clipped_fb_fill:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 48
+    mov r12, [cur_clip]
+    test r12, r12
+    jz .cff_plain
+    mov ebx, [r12]
+    test ebx, ebx
+    jz .cff_plain
+    js .cff_ret
+    mov [rsp + 0], rdi                        ; buf
+    mov [rsp + 8], esi                        ; stride
+    mov [rsp + 12], edx                       ; bufh
+    mov [rsp + 16], eax                       ; x
+    mov [rsp + 20], r8d                       ; y
+    add eax, r9d
+    mov [rsp + 24], eax                       ; x2
+    mov eax, [rsp + 20]
+    add eax, r10d
+    mov [rsp + 28], eax                       ; y2
+    mov [rsp + 32], r11d                      ; colour
+    lea r13, [r12 + 4]
+.cff_loop:
+    mov eax, [rsp + 16]
+    cmp eax, [r13 + 0]
+    jge .cff_x1
+    mov eax, [r13 + 0]
+.cff_x1:
+    mov r14d, eax                             ; ix1
+    mov eax, [rsp + 24]
+    cmp eax, [r13 + 8]
+    jle .cff_x2
+    mov eax, [r13 + 8]
+.cff_x2:
+    sub eax, r14d
+    jle .cff_next
+    mov r9d, eax                              ; iw
+    mov eax, [rsp + 20]
+    cmp eax, [r13 + 4]
+    jge .cff_y1
+    mov eax, [r13 + 4]
+.cff_y1:
+    mov r15d, eax                             ; iy1
+    mov eax, [rsp + 28]
+    cmp eax, [r13 + 12]
+    jle .cff_y2
+    mov eax, [r13 + 12]
+.cff_y2:
+    sub eax, r15d
+    jle .cff_next
+    mov r10d, eax                             ; ih
+    mov rdi, [rsp + 0]
+    mov esi, [rsp + 8]
+    mov edx, [rsp + 12]
+    mov eax, r14d
+    mov r8d, r15d
+    mov r11d, [rsp + 32]
+    call fb_fill
+.cff_next:
+    add r13, 16
+    dec ebx
+    jnz .cff_loop
+.cff_ret:
+    add rsp, 48
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.cff_plain:
+    add rsp, 48
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    jmp fb_fill
+
 handle_poly_fill_rectangle:
     push rbx
     push r12
@@ -10512,12 +10982,20 @@ handle_poly_fill_rectangle:
     mov rbx, rsi                             ; req ptr
     mov r12d, edx                            ; req bytes
 
-    ; GC foreground.
+    ; GC foreground + clip.
+    mov qword [cur_clip], 0
     mov edi, [rbx + 8]
     call gc_lookup
     test rax, rax
     jz .pfr_done
     mov r15d, [rax + 4]                      ; foreground colour
+    lea rcx, [gcs]
+    sub rax, rcx                              ; GC slot offset
+    shr rax, 4                                ; slot index (GC_REC_SIZE 16)
+    imul rax, CLIP_ENTRY_SIZE
+    lea rcx, [gc_clips]
+    add rax, rcx
+    mov [cur_clip], rax                      ; clipped_fb_fill honours it
 
     ; Resolve drawable backing — window OR pixmap (glass fills its
     ; double-buffer pixmap with cells via PolyFillRectangle).
@@ -10547,11 +11025,12 @@ handle_poly_fill_rectangle:
     movzx r9d, word [r14 + 4]                ; rect w
     movzx r10d, word [r14 + 6]               ; rect h
     mov r11d, r15d                           ; colour
-    call fb_fill
+    call clipped_fb_fill
     add r14, 8
     dec ebp
     jmp .pfr_loop
 .pfr_done:
+    mov qword [cur_clip], 0
     ; Recomposite only if the dst is a window (pixmap fills don't show
     ; until CopyArea'd to a window).
     mov edi, [rbx + 4]
@@ -10676,7 +11155,7 @@ handle_put_image:
     push r14
     push r15
     push rbp
-    sub rsp, 64
+    sub rsp, 80
     mov r13, rsi                             ; req ptr
 
     cmp byte [r13 + 1], 2                     ; ZPixmap?
@@ -10694,6 +11173,27 @@ handle_put_image:
     mov rbx, rax                            ; backing ptr (dst base)
     mov [rsp + 16], edx                     ; backing_w (stride)
     mov [rsp + 24], ecx                     ; backing_h
+
+    ; GC clip: GDK's client-buffer uploads cover the paint BOUNDS with the
+    ; clip set to the damage region; unpainted buffer areas are zeros, so
+    ; an unclipped PutImage blacks out the neighbours (menubar bug).
+    mov qword [rsp + 64], 0
+    mov edi, [r13 + 8]                       ; gc id
+    call gc_lookup
+    test rax, rax
+    jz .pi_noclipgc
+    lea rcx, [gcs]
+    sub rax, rcx
+    shr rax, 4
+    imul rax, CLIP_ENTRY_SIZE
+    lea rcx, [gc_clips]
+    add rax, rcx
+    mov ecx, [rax]
+    test ecx, ecx
+    jz .pi_noclipgc                          ; no clip
+    js .pi_done                              ; empty clip → draw nothing
+    mov [rsp + 64], rax                      ; active clip entry
+.pi_noclipgc:
 
     lea rbp, [r13 + 24]                      ; src data ptr
     movzx eax, word [r13 + 12]              ; imgw
@@ -10739,8 +11239,11 @@ handle_put_image:
     js .pi_row_next
     cmp eax, [rsp + 24]                      ; backing_h
     jge .pi_done
+    mov r10d, eax                            ; dy (keep across segment math)
+    cmp qword [rsp + 64], 0                  ; clip active?
+    jne .pi_row_clipped
     ; dst = backing + (dy*backing_w + dst_x0)*4
-    mov ecx, eax
+    mov ecx, r10d
     imul ecx, [rsp + 16]
     add ecx, [rsp + 40]
     lea rdi, [rbx + rcx*4]
@@ -10751,6 +11254,48 @@ handle_put_image:
     lea rsi, [rbp + rax*4]
     mov ecx, [rsp + 56]                      ; copy_w
     rep movsd
+    jmp .pi_row_next
+.pi_row_clipped:
+    ; one sub-copy per clip rect ∩ this row's dst segment
+    mov r14, [rsp + 64]
+    mov r15d, [r14]                          ; rect count (>0)
+    add r14, 4
+.pi_seg_loop:
+    cmp r10d, [r14 + 4]                      ; dy ≥ rect.y1?
+    jl .pi_seg_next
+    cmp r10d, [r14 + 12]                     ; dy < rect.y2?
+    jge .pi_seg_next
+    mov ecx, [rsp + 40]                      ; seg_x0 = max(dst_x0, rect.x1)
+    cmp ecx, [r14 + 0]
+    jge .pi_sx
+    mov ecx, [r14 + 0]
+.pi_sx:
+    mov edx, [rsp + 40]                      ; seg_x1 = min(dst_x0+copy_w, rect.x2)
+    add edx, [rsp + 56]
+    cmp edx, [r14 + 8]
+    jle .pi_sx2
+    mov edx, [r14 + 8]
+.pi_sx2:
+    sub edx, ecx                             ; seg_w
+    jle .pi_seg_next
+    ; dst = backing + (dy*stride + seg_x0)*4
+    mov eax, r10d
+    imul eax, [rsp + 16]
+    add eax, ecx
+    lea rdi, [rbx + rax*4]
+    ; src = data + (row*imgw + src_x0 + (seg_x0 - dst_x0))*4
+    mov eax, r12d
+    imul eax, [rsp + 0]
+    add eax, [rsp + 48]
+    add eax, ecx
+    sub eax, [rsp + 40]
+    lea rsi, [rbp + rax*4]
+    mov ecx, edx
+    rep movsd
+.pi_seg_next:
+    add r14, 16
+    dec r15d
+    jnz .pi_seg_loop
 .pi_row_next:
     inc r12d
     jmp .pi_row
@@ -10763,7 +11308,7 @@ handle_put_image:
     jz .pi_ret
     mov byte [comp_dirty], 1
 .pi_ret:
-    add rsp, 64
+    add rsp, 80
     pop rbp
     pop r15
     pop r14
@@ -10982,7 +11527,12 @@ handle_create_pixmap:
     xor ecx, ecx
 .cpx_find:
     cmp ecx, MAX_PIXMAPS
-    jge .cpx_done
+    jl .cpx_scan
+    lea rsi, [dbg_pxfull]                    ; DIAG: table full, create dropped
+    mov edx, 7
+    call write_stderr
+    jmp .cpx_done
+.cpx_scan:
     mov rax, rcx
     imul rax, PIXMAP_REC_SIZE
     lea rax, [pixmaps + rax]
@@ -11119,7 +11669,7 @@ handle_copy_area:
     push r14
     push r15
     push rbp
-    sub rsp, 112
+    sub rsp, 160
     mov rbx, rsi                             ; req ptr
 
     ; Resolve src.
@@ -11209,29 +11759,111 @@ handle_copy_area:
     cmp edx, 0
     jle .cpa_done
 
-    ; --- Copy rows. r12d = row 0..copy_h-1
+    ; --- GC clip stage: honour SetClipRectangles by running the row copy
+    ; once per clip-rect ∩ dst-rect. GTK's end_paint blits a buffer whose
+    ; unpainted regions are zeros, clipped to the damage region — copying
+    ; unclipped splashes black over neighbouring content.
+    mov rbp, rsp                             ; frame base for .cpa_copy
+    mov edi, [rbx + 12]                      ; gc id
+    call gc_lookup
+    test rax, rax
+    jz .cpa_noclip
+    lea rcx, [gcs]
+    sub rax, rcx
+    shr rax, 4                                ; GC slot (rec size 16)
+    imul rax, CLIP_ENTRY_SIZE
+    lea rcx, [gc_clips]
+    add rax, rcx
+    mov ecx, [rax]                            ; clip count
+    test ecx, ecx
+    jz .cpa_noclip
+    js .cpa_blit_done                         ; empty clip → draw nothing
+    lea r13, [rax + 4]                        ; rect cursor
+    mov r14d, ecx
+.cpa_clip_loop:
+    mov eax, [rbp + 64]                       ; dx
+    cmp eax, [r13 + 0]
+    jge .cpa_cx1
+    mov eax, [r13 + 0]
+.cpa_cx1:
+    mov [rbp + 104], eax                      ; dx'
+    mov ecx, [rbp + 64]
+    add ecx, [rbp + 80]                       ; dx + w
+    cmp ecx, [r13 + 8]
+    jle .cpa_cx2
+    mov ecx, [r13 + 8]
+.cpa_cx2:
+    sub ecx, eax
+    jle .cpa_clip_next
+    mov [rbp + 112], ecx                      ; w'
+    mov edx, [rbp + 72]                       ; dy
+    cmp edx, [r13 + 4]
+    jge .cpa_cy1
+    mov edx, [r13 + 4]
+.cpa_cy1:
+    mov [rbp + 108], edx                      ; dy'
+    mov ecx, [rbp + 72]
+    add ecx, [rbp + 88]                       ; dy + h
+    cmp ecx, [r13 + 12]
+    jle .cpa_cy2
+    mov ecx, [r13 + 12]
+.cpa_cy2:
+    sub ecx, edx
+    jle .cpa_clip_next
+    mov [rbp + 116], ecx                      ; h'
+    mov eax, [rbp + 104]                      ; sx' = sx + (dx'-dx)
+    sub eax, [rbp + 64]
+    add eax, [rbp + 48]
+    mov [rbp + 96], eax
+    mov eax, [rbp + 108]                      ; sy' = sy + (dy'-dy)
+    sub eax, [rbp + 72]
+    add eax, [rbp + 56]
+    mov [rbp + 100], eax
+    call .cpa_copy
+.cpa_clip_next:
+    add r13, 16
+    dec r14d
+    jnz .cpa_clip_loop
+    jmp .cpa_blit_done
+.cpa_noclip:
+    mov eax, [rbp + 48]
+    mov [rbp + 96], eax
+    mov eax, [rbp + 56]
+    mov [rbp + 100], eax
+    mov eax, [rbp + 64]
+    mov [rbp + 104], eax
+    mov eax, [rbp + 72]
+    mov [rbp + 108], eax
+    mov eax, [rbp + 80]
+    mov [rbp + 112], eax
+    mov eax, [rbp + 88]
+    mov [rbp + 116], eax
+    call .cpa_copy
+    jmp .cpa_blit_done
+; local: copy rows per the active rect at [rbp+96..116] (sx',sy',dx',dy',w',h')
+.cpa_copy:
     xor r12d, r12d
-.cpa_row:
-    cmp r12d, [rsp + 88]
-    jge .cpa_blit_done
-    ; src row ptr = src_ptr + ((sy+row)*src_stride + sx)*4
-    mov eax, [rsp + 56]
+.cpa_crow:
+    cmp r12d, [rbp + 116]
+    jge .cpa_cdone
+    mov eax, [rbp + 100]                      ; sy'
     add eax, r12d
-    imul eax, [rsp + 16]
-    add eax, [rsp + 48]
-    mov rsi, [rsp + 0]
+    imul eax, [rbp + 16]                      ; src_stride
+    add eax, [rbp + 96]                       ; sx'
+    mov rsi, [rbp + 0]
     lea rsi, [rsi + rax*4]
-    ; dst row ptr = dst_ptr + ((dy+row)*dst_stride + dx)*4
-    mov eax, [rsp + 72]
+    mov eax, [rbp + 108]                      ; dy'
     add eax, r12d
-    imul eax, [rsp + 24]
-    add eax, [rsp + 64]
-    mov rdi, [rsp + 8]
+    imul eax, [rbp + 24]                      ; dst_stride
+    add eax, [rbp + 104]                      ; dx'
+    mov rdi, [rbp + 8]
     lea rdi, [rdi + rax*4]
-    mov ecx, [rsp + 80]                      ; copy_w
+    mov ecx, [rbp + 112]                      ; w'
     rep movsd
     inc r12d
-    jmp .cpa_row
+    jmp .cpa_crow
+.cpa_cdone:
+    ret
 .cpa_blit_done:
     ; If dst is a window, recomposite.
     mov edi, [rbx + 8]
@@ -11240,7 +11872,7 @@ handle_copy_area:
     jz .cpa_done
     mov byte [comp_dirty], 1
 .cpa_done:
-    add rsp, 112
+    add rsp, 160
     pop rbp
     pop r15
     pop r14
@@ -11538,12 +12170,33 @@ handle_render:
     je .hr_composite_glyphs
     cmp eax, 10
     je .hr_trapezoids
+    cmp eax, 5
+    je .hr_change_picture
+    cmp eax, 6
+    je .hr_set_pic_clip
+    cmp eax, 28
+    je .hr_set_pic_transform
     ; Unhandled minor — leave it (logged by the generic request logger).
+    jmp .hr_done
+
+.hr_set_pic_transform:
+    mov rdi, r12
+    call render_set_pic_transform
     jmp .hr_done
 
 .hr_trapezoids:
     mov rdi, r12
     call render_trapezoids
+    jmp .hr_done
+
+.hr_change_picture:
+    mov rdi, r12
+    call render_change_picture
+    jmp .hr_done
+
+.hr_set_pic_clip:
+    mov rdi, r12
+    call render_set_pic_clip
     jmp .hr_done
 
 .hr_create_picture:
@@ -11749,7 +12402,12 @@ render_create_picture:
     xor ebx, ebx
 .rcp_find:
     cmp ebx, MAX_PICTURES
-    jge .rcp_done
+    jl .rcp_scan
+    lea rsi, [dbg_picfull]                   ; DIAG: table full, create dropped
+    mov edx, 8
+    call write_stderr
+    jmp .rcp_done
+.rcp_scan:
     mov rax, rbx
     imul rax, PICTURE_REC_SIZE
     lea rax, [pictures + rax]
@@ -11764,6 +12422,12 @@ render_create_picture:
     mov [rax + 4], ecx                        ; drawable
     mov ecx, [r12 + 12]
     mov [rax + 8], ecx                        ; format
+    push rax
+    call pic_clip_entry                       ; fresh picture → no clip
+    mov dword [rax], 0
+    pop rax
+    call pic_xform_entry                      ; fresh picture → identity
+    mov dword [rax], 0
 .rcp_done:
     pop r12
     pop rbx
@@ -11780,6 +12444,148 @@ render_free_picture:
     jz .rfp_done
     mov dword [rax], 0
 .rfp_done:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; pic_clip_entry — rax = picture record ptr → rax = its clip entry ptr.
+; ----------------------------------------------------------------------------
+pic_clip_entry:
+    lea rcx, [pictures]
+    sub rax, rcx
+    shr rax, 4                                ; slot (rec size 16)
+    imul rax, CLIP_ENTRY_SIZE
+    lea rcx, [pic_clips]
+    add rax, rcx
+    ret
+
+; ----------------------------------------------------------------------------
+; pic_xform_entry — rax = picture record ptr → rax = its transform entry.
+; ----------------------------------------------------------------------------
+pic_xform_entry:
+    lea rcx, [pictures]
+    sub rax, rcx
+    shr rax, 4
+    imul rax, 28
+    lea rcx, [pic_xforms]
+    add rax, rcx
+    ret
+
+; ----------------------------------------------------------------------------
+; render_set_pic_transform — rdi = req ptr (RENDER minor 28).
+;   +4 picture, +8 nine FIXED values row-major (m11 m12 m13 / m21 m22 m23 /
+;   m31 m32 m33). Stores the affine part; flag 0 when identity so the
+;   composite fast path stays untouched. Projective row ignored.
+; ----------------------------------------------------------------------------
+render_set_pic_transform:
+    push rbx
+    push r12
+    mov rbx, rdi
+    mov edi, [rbx + 4]
+    call picture_lookup
+    test rax, rax
+    jz .spt_done
+    call pic_xform_entry
+    mov r12, rax                              ; entry
+    mov eax, [rbx + 8]                        ; m11
+    mov [r12 + 4], eax
+    mov ecx, [rbx + 12]                       ; m12
+    mov [r12 + 8], ecx
+    mov edx, [rbx + 16]                       ; m13
+    mov [r12 + 12], edx
+    ; identity check while loading the second row
+    xor edi, edi                              ; nonzero-diff accumulator
+    sub eax, 0x10000                          ; m11 - 1.0
+    or edi, eax
+    or edi, ecx                               ; m12
+    or edi, edx                               ; m13
+    mov eax, [rbx + 20]                       ; m21
+    mov [r12 + 16], eax
+    or edi, eax
+    mov eax, [rbx + 24]                       ; m22
+    mov [r12 + 20], eax
+    sub eax, 0x10000
+    or edi, eax
+    mov eax, [rbx + 28]                       ; m23
+    mov [r12 + 24], eax
+    or edi, eax
+    xor eax, eax
+    test edi, edi
+    setnz al
+    mov [r12], eax                            ; flag: 1 iff non-identity
+.spt_done:
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; render_set_pic_clip — rdi = req ptr (RENDER minor 6).
+;   +4 picture  +8 clip-x-origin s16  +10 clip-y-origin  +12 rect list.
+; Same storage semantics as core SetClipRectangles. No reply.
+; ----------------------------------------------------------------------------
+render_set_pic_clip:
+    push rbx
+    mov rbx, rdi
+    mov edi, [rbx + 4]
+    call picture_lookup
+    test rax, rax
+    jz .rsc_done
+    call pic_clip_entry
+    mov rdi, rax                              ; clip entry
+    lea rsi, [rbx + 8]                        ; origins + rects
+    movzx edx, word [rbx + 2]
+    shl edx, 2
+    sub edx, 12
+    js .rsc_done
+    shr edx, 3                                ; rect count
+    call clip_store
+.rsc_done:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; render_change_picture — rdi = req ptr (RENDER minor 5).
+;   +4 picture  +8 value-mask  +12 value list (CARD32 per set bit).
+; Only CPClipMask (bit 6) matters here: None clears the picture's clip
+; (pixmap masks unsupported → also clear). Other attributes stay ignored,
+; but the value cursor is advanced per set bit so parsing stays aligned.
+; ----------------------------------------------------------------------------
+render_change_picture:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, rdi
+    mov edi, [rbx + 4]
+    call picture_lookup
+    test rax, rax
+    jz .rcp2_done
+    mov r13, rax                              ; picture rec
+    mov r12d, [rbx + 8]                       ; value-mask
+    lea r14, [rbx + 12]                       ; value cursor
+    xor ecx, ecx                              ; bit index
+.rcp2_loop:
+    test r12d, r12d
+    jz .rcp2_done
+    bt r12d, 0
+    jnc .rcp2_skip
+    cmp ecx, 6                                ; CPClipMask
+    jne .rcp2_adv
+    push rcx
+    mov rax, r13
+    call pic_clip_entry
+    mov dword [rax], 0                        ; clear clip
+    pop rcx
+.rcp2_adv:
+    add r14, 4
+.rcp2_skip:
+    shr r12d, 1
+    inc ecx
+    jmp .rcp2_loop
+.rcp2_done:
+    pop r14
+    pop r13
+    pop r12
     pop rbx
     ret
 
@@ -11804,10 +12610,15 @@ render_fill_rectangles:
     mov rbx, rdi                              ; req ptr
 
     ; Resolve dst Picture → drawable → backing.
+    mov qword [cur_clip], 0
     mov edi, [rbx + 8]                        ; dst picture
     call picture_lookup
     test rax, rax
     jz .rfr_done
+    push rax
+    call pic_clip_entry                       ; honour the dst picture clip
+    mov [cur_clip], rax
+    pop rax
     mov edi, [rax + 4]                        ; drawable
     mov [rsp + 8], edi                        ; stash drawable for recomposite test
     call drawable_get_backing
@@ -11849,11 +12660,12 @@ render_fill_rectangles:
     movzx r9d, word [rbp + 4]                  ; w
     movzx r10d, word [rbp + 6]                 ; h
     mov r11d, r15d                             ; colour
-    call fb_fill
+    call clipped_fb_fill
     add rbp, 8
     dec dword [rsp + 0]
     jmp .rfr_loop
 .rfr_recomp:
+    mov qword [cur_clip], 0
     ; If the dst drawable is a window, recomposite to show it.
     mov edi, [rsp + 8]
     call window_lookup
@@ -11861,6 +12673,7 @@ render_fill_rectangles:
     jz .rfr_done
     mov byte [comp_dirty], 1
 .rfr_done:
+    mov qword [cur_clip], 0
     add rsp, 16
     pop rbp
     pop r15
@@ -12757,10 +13570,18 @@ render_composite:
     movzx r12d, byte [rbx + 4]                  ; op
 
     ; --- resolve dst ---
+    mov qword [cur_clip], 0
     mov edi, [rbx + 16]
     call picture_lookup
     test rax, rax
     jz .rc_done
+    push rax
+    call pic_clip_entry                       ; honour the dst picture clip
+    cmp dword [rax], 0
+    je .rc_noclip_set                         ; count 0 → leave cur_clip 0
+    mov [cur_clip], rax
+.rc_noclip_set:
+    pop rax
     mov edi, [rax + 4]
     mov r13d, edi                               ; dst drawable
     call drawable_get_backing
@@ -12772,6 +13593,7 @@ render_composite:
 
     ; --- resolve src ---
     mov dword [co_src_solid], 0
+    mov qword [co_src_xform], 0
     mov edi, [rbx + 8]
     call picture_lookup
     test rax, rax
@@ -12783,6 +13605,13 @@ render_composite:
     mov dword [co_src_solid], 1
     jmp .rc_src_done
 .rc_src_drawable:
+    push rax
+    call pic_xform_entry                      ; src transform (0 if identity)
+    cmp dword [rax], 0
+    je .rc_no_xform
+    mov [co_src_xform], rax
+.rc_no_xform:
+    pop rax
     mov edi, [rax + 4]
     call drawable_get_backing
     test rax, rax
@@ -12816,6 +13645,17 @@ render_composite:
     js .rc_col_next
     cmp eax, [co_dst_h]
     jge .rc_col_next
+    ; dst picture clip (cur_clip set iff a clip is active)
+    cmp qword [cur_clip], 0
+    je .rc_clip_ok
+    push rax
+    mov edi, ebp                                 ; x
+    mov esi, eax                                 ; y
+    call clip_test_point
+    test al, al
+    pop rax
+    jz .rc_col_next
+.rc_clip_ok:
     ; dst pixel ptr → rdi
     imul eax, [co_dst_stride]
     add eax, ebp
@@ -12824,6 +13664,8 @@ render_composite:
     ; --- fetch src pixel → esi (ARGB) ---
     cmp dword [co_src_solid], 1
     je .rc_src_solid
+    cmp qword [co_src_xform], 0
+    jne .rc_src_xformed
     ; image src: sample at (xSrc+dx, ySrc+dy)
     movsx eax, word [rbx + 20]                  ; xSrc
     add eax, r15d
@@ -12838,6 +13680,46 @@ render_composite:
     jge .rc_col_next
     imul eax, [co_src_stride]
     add eax, ecx
+    mov rsi, [co_src_ptr]
+    mov esi, [rsi + rax*4]                        ; src ARGB
+    jmp .rc_have_src
+.rc_src_xformed:
+    ; transformed src: (sx,sy) = M·(u,v,1), u = xSrc+dx, v = ySrc+dy;
+    ; nearest-neighbour fetch, out-of-bounds → skip the pixel.
+    mov r11, [co_src_xform]
+    movsx rax, word [rbx + 20]
+    movsxd rcx, r15d
+    add rax, rcx                                 ; u
+    movsx rcx, word [rbx + 22]
+    movsxd rdx, r14d
+    add rcx, rdx                                 ; v
+    movsxd r8, dword [r11 + 4]                   ; m11
+    imul r8, rax
+    movsxd r9, dword [r11 + 8]                   ; m12
+    imul r9, rcx
+    add r8, r9
+    movsxd r9, dword [r11 + 12]                  ; m13
+    add r8, r9
+    sar r8, 16                                   ; sx
+    movsxd r10, dword [r11 + 16]                 ; m21
+    imul r10, rax
+    movsxd r9, dword [r11 + 20]                  ; m22
+    imul r9, rcx
+    add r10, r9
+    movsxd r9, dword [r11 + 24]                  ; m23
+    add r10, r9
+    sar r10, 16                                  ; sy
+    test r8, r8
+    js .rc_col_next
+    cmp r8d, [co_src_w]
+    jge .rc_col_next
+    test r10, r10
+    js .rc_col_next
+    cmp r10d, [co_src_h]
+    jge .rc_col_next
+    mov eax, r10d
+    imul eax, [co_src_stride]
+    add eax, r8d
     mov rsi, [co_src_ptr]
     mov esi, [rsi + rax*4]                        ; src ARGB
     jmp .rc_have_src
@@ -12927,6 +13809,7 @@ render_composite:
     jz .rc_done
     mov byte [comp_dirty], 1
 .rc_done:
+    mov qword [cur_clip], 0
     pop rbp
     pop r15
     pop r14
@@ -13116,16 +13999,33 @@ dump_handler:
     cmp byte [r12 + 31], 0                    ; has_backing?
     je .dh_log
     mov r13, [r12 + 32]                       ; backing ptr
-    ; only dump the big window (GIMP's main ~1.9M px); skip glass/strip/dialogs
-    ; so /tmp/frame_win.raw ends up holding the main window's backing.
-    movzx eax, word [r12 + 40]
-    movzx ecx, word [r12 + 42]
-    imul eax, ecx
-    cmp eax, 1000000
-    jb .dh_wf_done
-    ; --- write the raw ARGB backing to /tmp/frame_win.raw (largest window) ---
+    ; dump EVERY backed window to /tmp/frame_dump_<xid>.raw (per-xid, no gate)
+    lea rdi, [dump_path_buf]
+    lea rsi, [dump_prefix]
+.dh_cp_pre:
+    mov al, [rsi]
+    test al, al
+    jz .dh_cp_pre_done
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    jmp .dh_cp_pre
+.dh_cp_pre_done:
+    mov eax, [r12]                            ; xid
+    call u64_to_ascii                         ; digits at rdi, returns rdi past
+    lea rsi, [dump_suffix]                     ; ".raw",0
+.dh_cp_suf:
+    mov al, [rsi]
+    mov [rdi], al
+    test al, al
+    jz .dh_cp_suf_done
+    inc rsi
+    inc rdi
+    jmp .dh_cp_suf
+.dh_cp_suf_done:
+    ; --- write the raw ARGB backing to the per-xid path ---
     mov rax, SYS_OPEN
-    lea rdi, [dump_path]
+    lea rdi, [dump_path_buf]
     mov esi, 0x241                            ; O_WRONLY|O_CREAT|O_TRUNC
     mov edx, 0x1A4                            ; 0644
     syscall
@@ -13201,6 +14101,55 @@ dump_handler:
     inc ebx
     jmp .dh_find
 .dh_done:
+    ; --- DIAG: dump BOTH compositor framebuffers + state line ---
+    cmp byte [compositor_active], 0
+    je .dh_nofb
+    lea rsi, [dbg_fbstate]                    ; "FBSTATE back=N recomp=N"
+    call write_str_stderr
+    mov eax, [comp_back]
+    call write_u64_stderr
+    lea rsi, [dbg_spX]
+    mov edx, 1
+    call write_stderr
+    mov eax, [rs_counter]
+    call write_u64_stderr
+    lea rsi, [probe_conn_nl]
+    mov edx, 1
+    call write_stderr
+    mov rax, SYS_OPEN                         ; fb0
+    lea rdi, [dump_fb0_path]
+    mov esi, 0x241
+    mov edx, 0x1A4
+    syscall
+    test rax, rax
+    js .dh_fb1
+    push rax
+    mov rdi, rax
+    mov rsi, [comp_addr + 0]
+    mov rdx, [drm_dumb_size]
+    mov rax, SYS_WRITE
+    syscall
+    pop rdi
+    mov rax, SYS_CLOSE
+    syscall
+.dh_fb1:
+    mov rax, SYS_OPEN                         ; fb1
+    lea rdi, [dump_fb1_path]
+    mov esi, 0x241
+    mov edx, 0x1A4
+    syscall
+    test rax, rax
+    js .dh_nofb
+    push rax
+    mov rdi, rax
+    mov rsi, [comp_addr + 8]
+    mov rdx, [drm_dumb_size]
+    mov rax, SYS_WRITE
+    syscall
+    pop rdi
+    mov rax, SYS_CLOSE
+    syscall
+.dh_nofb:
     pop r15
     pop r14
     pop r13
