@@ -166,6 +166,7 @@ DEFAULT REL
 ; WM). SubstructureNotifyMask sends MapNotify / ConfigureNotify /
 ; DestroyNotify to the same subscriber.
 %define EM_STRUCTURE_NOTIFY      0x00020000
+%define EM_PROPERTY_CHANGE       0x00400000
 %define EM_SUBSTRUCTURE_NOTIFY    0x00080000
 %define EM_SUBSTRUCTURE_REDIRECT  0x00100000
 
@@ -289,6 +290,7 @@ atom_strings:       resb ATOM_STRINGS_CAP
 ; bytes — at the full keycode range plus 1 keysym/keycode that's ~1 KB;
 ; future reply types like QueryFont return more).
 reply_buf:          resb 16384
+pn_buf:             resb 32                  ; PropertyNotify scratch event
 xkb_getmap_present: resd 1               ; GetMap reply present mask (echoes req)
 
 ; ---- Phase 4b/4g window table ---------------------------------------------
@@ -506,6 +508,10 @@ server_time_ms:     resd 1               ; monotonic ms clock from the evdev eve
                                          ; menu activation — must be a real time)
 ptr_grab_win:       resd 1               ; active pointer-grab window xid (0 = none)
 ptr_grab_mask:      resd 1               ; the grab's event mask (SETofPOINTEREVENT)
+ptr_grab_slot:      resd 1               ; client slot holding the grab — needed to
+                                         ; release grabs on windows OUTSIDE the
+                                         ; grabber's XID band (e.g. root) when the
+                                         ; grabbing client dies
 wapd_abs_x:         resd 1               ; window_at_point_deep: abs origin of the
 wapd_abs_y:         resd 1               ; deepest window under the cursor
 wapd_cur_parent:    resd 1               ; descent cursor: current parent xid
@@ -680,6 +686,10 @@ log_setup_ok_2:     db " bytes)", 10
 log_setup_ok_2_len equ $ - log_setup_ok_2
 qext_nl:            db 10
 log_render_min:     db "RENDER minor=", 0
+log_rr_minor:       db "  RANDR minor=", 0
+; ListExtensions STR list: length byte + name, 39 bytes total (matches the
+; QueryExtension set exactly — advertising one obligates serving it).
+ext_names:          db 6, "RENDER", 5, "RANDR", 9, "XKEYBOARD", 15, "XInputExtension"
 dbg_pxfull:         db "PXFULL", 10        ; DIAG: CreatePixmap dropped — table full
 dbg_cli_tag:        db "c"                 ; DIAG: client slot prefix
 dbg_picfull:        db "PICFULL", 10       ; DIAG: CreatePicture dropped — table full
@@ -1359,7 +1369,7 @@ emit_setup_reply:
     mov word [rdi + 18], 65535           ; max request length in 4-byte units
     ; number-of-screens, number-of-formats
     mov byte [rdi + 20], 1
-    mov byte [rdi + 21], 1
+    mov byte [rdi + 21], 2                   ; depth-24 + depth-32 pixmap formats
     ; image byte order, bitmap bit order
     mov byte [rdi + 22], X_IMAGE_BYTE_ORDER
     mov byte [rdi + 23], X_BITMAP_BIT_ORDER
@@ -1380,10 +1390,18 @@ emit_setup_reply:
     mov word  [rdi + 6], 0
     add rdi, 8
 
-    ; ---- 1 pixmap format (8 bytes): depth 24 in 32 bpp ----
+    ; ---- pixmap formats (8 bytes each): depth 24 and depth 32, both 32 bpp.
+    ; Without the depth-32 entry xcb_image_create_native(depth=32) returns
+    ; NULL and libxcb-cursor (every Qt app) SIGSEGVs at first show().
     mov byte [rdi + 0], 24               ; depth
     mov byte [rdi + 1], X_FMT_BPP        ; bits-per-pixel
     mov byte [rdi + 2], X_SCANLINE_PAD   ; scanline pad
+    mov byte [rdi + 3], 0
+    mov dword [rdi + 4], 0
+    add rdi, 8
+    mov byte [rdi + 0], 32               ; depth (ARGB)
+    mov byte [rdi + 1], X_FMT_BPP
+    mov byte [rdi + 2], X_SCANLINE_PAD
     mov byte [rdi + 3], 0
     mov dword [rdi + 4], 0
     add rdi, 8
@@ -2950,9 +2968,230 @@ client_close:
     syscall
     pop rax
     mov dword [clients_meta + rax], -1
+    mov edi, ebx
+    call client_cleanup_resources
     mov rsi, log_client_gone
     mov rdx, log_client_gone_len
     call write_stderr
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; client_cleanup_resources — edi = slot of a disconnected client. X11
+; semantics: a client's resources die with its connection. Destroys every
+; resource whose XID falls in the client's ID band (X_RID_BASE + slot<<21,
+; 2M wide): windows (WM gets UnmapNotify so tile drops the ghost tab, the
+; screen region is exposed + damaged, backings munmap'd), pixmaps (munmap),
+; GCs + pictures (with their clip entries), selection ownerships, key
+; grabs, the pointer grab, focus, and any redirect claims the client held
+; (a crashed WM must release root so a restarted one can re-claim it).
+; Without this every client exit leaked its whole backing memory and left
+; tile managing dead windows.
+; ----------------------------------------------------------------------------
+client_cleanup_resources:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12d, edi                            ; slot
+    mov r13d, edi
+    shl r13d, 21
+    add r13d, X_RID_BASE                     ; band base
+    mov r14d, r13d
+    add r14d, 0x200000                       ; band end (exclusive)
+
+    ; Pointer grab held by the dying client → release. Checked by grabber
+    ; slot, not window band: a grab on root (drag/DND pattern) lies outside
+    ; every client band and would otherwise wedge input forever.
+    cmp dword [ptr_grab_win], 0
+    je .ccr_grab_ok
+    cmp [ptr_grab_slot], r12d
+    jne .ccr_grab_ok
+    mov dword [ptr_grab_win], 0
+.ccr_grab_ok:
+    ; Focus on a dying window → revert to PointerRoot.
+    mov eax, [focus_window]
+    cmp eax, r13d
+    jb .ccr_focus_ok
+    cmp eax, r14d
+    jae .ccr_focus_ok
+    mov dword [focus_window], 1
+.ccr_focus_ok:
+
+    ; Windows.
+    xor ebx, ebx
+.ccr_win:
+    cmp ebx, MAX_WINDOWS
+    jge .ccr_win_done
+    mov rax, rbx
+    imul rax, WINDOW_REC_SIZE
+    lea r15, [windows + rax]
+    mov eax, [r15]
+    cmp eax, r13d
+    jb .ccr_win_next
+    cmp eax, r14d
+    jae .ccr_win_next
+    ; Live in-band window. If mapped: damage + expose + tell the WM.
+    cmp byte [r15 + 28], 0
+    je .ccr_win_destroy
+    mov byte [r15 + 28], 0
+    mov byte [comp_dirty], 1
+    mov rdi, r15
+    call damage_add_window
+    mov rdi, r15
+    call expose_under_window
+    mov edi, [r15 + 4]                       ; parent
+    call window_lookup
+    test rax, rax
+    jz .ccr_win_destroy
+    test dword [rax + 24], EM_SUBSTRUCTURE_NOTIFY
+    jz .ccr_win_destroy
+    movsx edi, byte [rax + 30]               ; subscriber slot (the WM)
+    cmp edi, 0
+    jl .ccr_win_destroy
+    cmp edi, r12d                            ; the dead client itself
+    je .ccr_win_destroy
+    mov esi, [rax]                           ; event window = parent
+    mov edx, [r15]                           ; window
+    call send_unmap_notify
+.ccr_win_destroy:
+    mov edi, [r15]
+    call window_destroy                      ; munmaps backing, recurses children
+.ccr_win_next:
+    inc ebx
+    jmp .ccr_win
+.ccr_win_done:
+
+    ; Pixmaps.
+    xor ebx, ebx
+.ccr_px:
+    cmp ebx, MAX_PIXMAPS
+    jge .ccr_px_done
+    mov rax, rbx
+    imul rax, PIXMAP_REC_SIZE
+    lea r15, [pixmaps + rax]
+    mov eax, [r15]
+    cmp eax, r13d
+    jb .ccr_px_next
+    cmp eax, r14d
+    jae .ccr_px_next
+    mov rdi, [r15 + 16]
+    test rdi, rdi
+    jz .ccr_px_clear
+    movzx esi, word [r15 + 4]
+    movzx ecx, word [r15 + 6]
+    imul esi, ecx
+    shl esi, 2
+    mov rax, SYS_MUNMAP
+    syscall
+.ccr_px_clear:
+    mov dword [r15], 0
+    mov qword [r15 + 16], 0
+.ccr_px_next:
+    inc ebx
+    jmp .ccr_px
+.ccr_px_done:
+
+    ; GCs (zero the xid AND the clip entry so a reused slot starts clean).
+    xor ebx, ebx
+.ccr_gc:
+    cmp ebx, MAX_GCS
+    jge .ccr_gc_done
+    mov rax, rbx
+    imul rax, GC_REC_SIZE
+    lea r15, [gcs + rax]
+    mov eax, [r15]
+    cmp eax, r13d
+    jb .ccr_gc_next
+    cmp eax, r14d
+    jae .ccr_gc_next
+    mov dword [r15], 0
+    mov rax, rbx
+    imul rax, CLIP_ENTRY_SIZE
+    mov dword [gc_clips + rax], 0
+.ccr_gc_next:
+    inc ebx
+    jmp .ccr_gc
+.ccr_gc_done:
+
+    ; Pictures (same clip-entry hygiene).
+    xor ebx, ebx
+.ccr_pic:
+    cmp ebx, MAX_PICTURES
+    jge .ccr_pic_done
+    mov rax, rbx
+    imul rax, PICTURE_REC_SIZE
+    lea r15, [pictures + rax]
+    mov eax, [r15]
+    cmp eax, r13d
+    jb .ccr_pic_next
+    cmp eax, r14d
+    jae .ccr_pic_next
+    mov dword [r15], 0
+    mov rax, rbx
+    imul rax, CLIP_ENTRY_SIZE
+    mov dword [pic_clips + rax], 0
+.ccr_pic_next:
+    inc ebx
+    jmp .ccr_pic
+.ccr_pic_done:
+
+    ; Selection ownerships → None (the atom stays interned).
+    xor ebx, ebx
+.ccr_sel:
+    cmp ebx, [sel_count]
+    jge .ccr_sel_done
+    mov eax, [sel_owners + rbx*4]
+    cmp eax, r13d
+    jb .ccr_sel_next
+    cmp eax, r14d
+    jae .ccr_sel_next
+    mov dword [sel_owners + rbx*4], 0
+.ccr_sel_next:
+    inc ebx
+    jmp .ccr_sel
+.ccr_sel_done:
+
+    ; Key grabs registered by this client.
+    xor ebx, ebx
+.ccr_kg:
+    cmp ebx, MAX_KEY_GRABS
+    jge .ccr_kg_done
+    mov rax, rbx
+    shl rax, 4                               ; KEY_GRAB_SIZE = 16
+    cmp dword [key_grabs + rax], 0
+    je .ccr_kg_next
+    cmp [key_grabs + rax + 4], r12d          ; client_slot
+    jne .ccr_kg_next
+    mov dword [key_grabs + rax], 0
+.ccr_kg_next:
+    inc ebx
+    jmp .ccr_kg
+.ccr_kg_done:
+
+    ; Redirect claims (WM death): release so a restarted WM can re-claim.
+    xor ebx, ebx
+.ccr_rd:
+    cmp ebx, MAX_WINDOWS
+    jge .ccr_rd_done
+    mov rax, rbx
+    imul rax, WINDOW_REC_SIZE
+    lea r15, [windows + rax]
+    cmp dword [r15], 0
+    je .ccr_rd_next
+    movsx eax, byte [r15 + 30]
+    cmp eax, r12d
+    jne .ccr_rd_next
+    mov byte [r15 + 30], -1
+.ccr_rd_next:
+    inc ebx
+    jmp .ccr_rd
+.ccr_rd_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
     pop rbx
     ret
 
@@ -3475,6 +3714,8 @@ dispatch_request:
     je .dr_set_selection_owner
     cmp eax, 23
     je .dr_get_selection_owner
+    cmp eax, 24
+    je .dr_convert_selection
     cmp eax, 47
     je .dr_query_font
     cmp eax, 4
@@ -3507,6 +3748,10 @@ dispatch_request:
     je .dr_poly_fill_rectangle
     cmp eax, 72
     je .dr_put_image
+    cmp eax, 73
+    je .dr_get_image
+    cmp eax, 83
+    je .dr_list_installed_colormaps
     cmp eax, 26
     je .dr_grab_pointer
     cmp eax, 27
@@ -3573,6 +3818,23 @@ dispatch_request:
     je .dr_randr
     cmp eax, XI_MAJOR
     je .dr_xinput
+    ; Void no-ops — requests with no reply that frame can safely accept and
+    ; ignore. Silences the log noise and, for toolkits that follow them with
+    ; a blocking round-trip, keeps the stream healthy. 36/37 Grab/UngrabServer
+    ; (single-threaded server — always "grabbed"), 45/46 Open/CloseFont (core
+    ; fonts unused; QueryFont replies fixed metrics regardless), 78..82
+    ; colormap ops (TrueColor only — colormaps are decorative), 95 FreeCursor.
+    lea ecx, [rax - 36]
+    cmp ecx, 1
+    jbe .dr_done
+    lea ecx, [rax - 45]
+    cmp ecx, 1
+    jbe .dr_done
+    lea ecx, [rax - 78]
+    cmp ecx, 4
+    jbe .dr_done
+    cmp eax, 95
+    je .dr_done
     ; Unhandled — log it (the only requests still logged; each one is a
     ; protocol gap worth knowing about).
     push rax
@@ -3749,6 +4011,23 @@ dispatch_request:
 .dr_list_extensions:
     mov edi, ebx
     call handle_list_extensions
+    jmp .dr_done
+
+.dr_convert_selection:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_convert_selection
+    jmp .dr_done
+
+.dr_get_image:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_get_image
+    jmp .dr_done
+
+.dr_list_installed_colormaps:
+    mov edi, ebx
+    call handle_list_installed_colormaps
     jmp .dr_done
 
 .dr_get_keyboard_mapping:
@@ -4642,7 +4921,32 @@ handle_randr:
     je .rr_get_monitors                      ; (ignores the advertised version), so it
                                              ; MUST be answered or strip hangs. Qt won't
                                              ; call it: we advertise 1.4 (< 1.5).
-    ret                                      ; RRSelectInput(4): no reply
+    cmp eax, 15                              ; GetOutputProperty — Qt reads EDID and
+    je .rr_get_output_property               ; BLOCKS on the reply (3x per screen)
+    cmp eax, 4                               ; RRSelectInput: void, no reply
+    je .rr_void
+    ; Unhandled RANDR minor — log it (each is a potential client hang).
+    push rax
+    mov rsi, log_rr_minor
+    mov edx, 14                              ; string only, not its NUL
+    call write_stderr
+    pop rax
+    call write_u64_stderr
+    lea rsi, [probe_conn_nl]
+    mov edx, 1
+    call write_stderr
+.rr_void:
+    ret
+
+.rr_get_output_property:
+    ; Property-absent reply: type None, 0 items — Qt accepts and moves on.
+    mov esi, 32
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0                    ; format 0
+    mov dword [rdi + 8], 0                   ; type None
+    mov dword [rdi + 12], 0                  ; bytesAfter
+    mov dword [rdi + 16], 0                  ; nItems
+    jmp .rr_write
 
 .rr_query_version:
     mov esi, 32
@@ -5086,7 +5390,11 @@ handle_get_property:
     ; Delete-on-read?
     cmp byte [r14 + 1], 0
     je .gp_done
+    mov edi, [r13]                           ; window (grab before zeroing)
+    mov esi, [r13 + 4]                       ; atom
     mov dword [r13], 0                       ; xid = 0 → empty
+    mov edx, 1                               ; state = Deleted — same notify
+    call send_property_notify                ; DeleteProperty sends
     jmp .gp_done
 
 .gp_none:
@@ -5301,6 +5609,9 @@ handle_query_tree:
 ;   +8..31 pad
 ; ============================================================================
 handle_list_extensions:
+    ; Names the four extensions QueryExtension actually serves. Qt's xcb
+    ; platform plugin enumerates via ListExtensions (not QueryExtension),
+    ; so the old empty reply made Qt believe frame had NO extensions.
     push rbx
     push r12
     mov ebx, edi
@@ -5310,21 +5621,230 @@ handle_list_extensions:
 
     lea rdi, [reply_buf]
     mov byte [rdi + 0], 1
-    mov byte [rdi + 1], 0                    ; nExtensions
+    mov byte [rdi + 1], 4                    ; nExtensions
     mov ecx, [r12 + 8]
     mov [rdi + 2], cx
-    mov dword [rdi + 4], 0
+    mov dword [rdi + 4], 10                  ; 40 bytes of names (39 + 1 pad)
     mov dword [rdi + 8], 0
     mov dword [rdi + 12], 0
     mov dword [rdi + 16], 0
     mov dword [rdi + 20], 0
     mov dword [rdi + 24], 0
     mov dword [rdi + 28], 0
+    ; STR list: length byte + name, 39 bytes total, from ext_names blob.
+    lea rsi, [ext_names]
+    lea rdi, [reply_buf + 32]
+    mov ecx, 39
+    rep movsb
+    mov byte [rdi], 0                        ; pad to 40
 
     mov edi, [r12]
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
-    mov rdx, 32
+    mov rdx, 72
+    syscall
+
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; handle_get_image — edi = slot, rsi = req. GetImage (opcode 73).
+;   +1 format (2 = ZPixmap; XY formats unsupported)
+;   +4 drawable   +8 x s16   +10 y s16   +12 w u16   +14 h u16   +16 planemask
+; Reply: 32-byte header (depth 24, visual root-24, length = w*h words) then
+; w*h*4 bytes of pixels row-copied from the drawable's BGRA backing. Client
+; fds are blocking, so the row writes drain fully; a short-write loop guards
+; the tail anyway. Out-of-bounds / XY format / no backing → Match error
+; (XGetImage returns NULL instead of hanging).
+; GIMP's color picker and screenshot paths block on this reply.
+; ----------------------------------------------------------------------------
+handle_get_image:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 40
+    mov ebx, edi                             ; slot
+    mov r12, rsi                             ; req
+    mov eax, ebx
+    call client_meta_addr
+    mov [rsp], rax                           ; meta (fd +0, seq +8)
+    cmp byte [r12 + 1], 2                    ; ZPixmap only
+    jne .gi_err
+    mov edi, [r12 + 4]
+    cmp edi, X_ROOT_WINDOW
+    jne .gi_drawable
+    ; Root = the composited screen. Serve pixels from the FRONT buffer
+    ; (GIMP's screen color picker + screenshot tools read root). The DRM
+    ; dumb-buffer pitch may be padded beyond w*4, hence byte pitch below.
+    ; Compositor inactive (network-only mode) → no pixels → Match error.
+    ; Pending damage must be composited FIRST or the read returns pixels
+    ; from before the client's own just-flushed drawing. Skip if a flip
+    ; is in flight (can't touch the buffers) — best-effort then.
+    cmp byte [comp_dirty], 0
+    je .gi_root_fresh
+    cmp byte [flip_pending], 0
+    jne .gi_root_fresh
+    mov byte [comp_dirty], 0
+    call recomposite_screen
+.gi_root_fresh:
+    mov eax, [comp_back]
+    xor eax, 1
+    mov r13, [comp_addr + rax*8]
+    test r13, r13
+    jz .gi_err
+    mov eax, [screen_w]
+    mov [rsp + 8], eax                       ; width (px) for bounds
+    mov eax, [screen_h]
+    mov [rsp + 12], eax                      ; height
+    mov eax, [drm_dumb_pitch]
+    mov [rsp + 24], eax                      ; row pitch (bytes)
+    jmp .gi_have_src
+.gi_drawable:
+    call drawable_get_backing
+    test rax, rax
+    jz .gi_err
+    mov r13, rax                             ; backing ptr
+    mov [rsp + 8], edx                       ; width (px)
+    mov [rsp + 12], ecx                      ; backing height
+    shl edx, 2
+    mov [rsp + 24], edx                      ; row pitch (bytes) = w*4
+.gi_have_src:
+    movsx r14d, word [r12 + 8]               ; x
+    movsx r15d, word [r12 + 10]              ; y
+    movzx ebp, word [r12 + 12]               ; w
+    movzx eax, word [r12 + 14]               ; h
+    mov [rsp + 16], eax
+    test ebp, ebp
+    jz .gi_err
+    test eax, eax
+    jz .gi_err
+    test r14d, r14d
+    js .gi_err
+    test r15d, r15d
+    js .gi_err
+    mov eax, r14d
+    add eax, ebp
+    cmp eax, [rsp + 8]                       ; x+w <= width
+    jg .gi_err
+    mov eax, r15d
+    add eax, [rsp + 16]
+    cmp eax, [rsp + 12]                      ; y+h <= height
+    jg .gi_err
+    ; Header.
+    lea rdi, [reply_buf]
+    xor eax, eax
+    mov [rdi], rax
+    mov [rdi + 8], rax
+    mov [rdi + 16], rax
+    mov [rdi + 24], rax
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 24                   ; depth
+    mov rax, [rsp]
+    mov ecx, [rax + 8]
+    mov [rdi + 2], cx                        ; seq
+    mov eax, ebp
+    imul eax, dword [rsp + 16]               ; w*h → reply length in words
+    mov [rdi + 4], eax
+    mov dword [rdi + 8], X_ROOT_VISUAL_24
+    mov rax, [rsp]
+    mov edi, [rax]                           ; fd
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov edx, 32
+    syscall
+    ; Rows.
+    mov dword [rsp + 20], 0                  ; row counter
+.gi_row:
+    mov eax, [rsp + 20]
+    cmp eax, [rsp + 16]
+    jge .gi_done
+    add eax, r15d                            ; src row = y + i
+    imul eax, dword [rsp + 24]               ; * pitch (bytes)
+    mov ecx, r14d
+    shl ecx, 2
+    add eax, ecx                             ; + x*4
+    lea rsi, [r13 + rax]
+    mov edx, ebp
+    shl edx, 2                               ; row bytes
+.gi_wr:
+    mov rax, [rsp]
+    mov edi, [rax]
+    mov rax, SYS_WRITE
+    syscall
+    cmp rax, -4                              ; EINTR (e.g. the SIGUSR1 dump
+    je .gi_wr                                ; handler) → retry, or the reply
+                                             ; truncates and the stream desyncs
+    test rax, rax
+    jle .gi_done                             ; client gone → abandon
+    add rsi, rax
+    sub edx, eax
+    jnz .gi_wr
+    inc dword [rsp + 20]
+    jmp .gi_row
+.gi_err:
+    ; Match error (code 8): byte0=0, +4 bad resource, +10 major opcode.
+    lea rdi, [reply_buf]
+    xor eax, eax
+    mov [rdi], rax
+    mov [rdi + 8], rax
+    mov [rdi + 16], rax
+    mov [rdi + 24], rax
+    mov byte [rdi + 1], 8                    ; Match
+    mov rax, [rsp]
+    mov ecx, [rax + 8]
+    mov [rdi + 2], cx                        ; seq
+    mov ecx, [r12 + 4]
+    mov [rdi + 4], ecx                       ; bad drawable
+    mov byte [rdi + 10], 73                  ; major
+    mov edi, [rax]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov edx, 32
+    syscall
+.gi_done:
+    add rsp, 40
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; handle_list_installed_colormaps — edi = slot. Opcode 83. TrueColor-only
+; server: exactly one colormap, always installed. Reply n=1 + the default
+; colormap id. Qt queries this during screen setup.
+; ----------------------------------------------------------------------------
+handle_list_installed_colormaps:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+
+    lea rdi, [reply_buf]
+    xor eax, eax
+    mov [rdi], rax
+    mov [rdi + 8], rax
+    mov [rdi + 16], rax
+    mov [rdi + 24], rax
+    mov byte [rdi + 0], 1
+    mov ecx, [r12 + 8]
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 1                   ; 1 word of cmap ids
+    mov word [rdi + 8], 1                    ; n = 1
+    mov dword [rdi + 32], X_DEFAULT_CMAP
+
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 36
     syscall
 
     pop r12
@@ -6026,6 +6546,30 @@ window_alloc:
 ; parent xid matches (cascading). Skips the root (xid = X_ROOT_WINDOW)
 ; defensively so a misbehaving client can't blank our state.
 ; ----------------------------------------------------------------------------
+; ----------------------------------------------------------------------------
+; window_props_clear — edi = window xid. Zeroes every property record
+; belonging to the window. Value-pool bytes are NOT reclaimed (append-only
+; pool by design), but the 1024 records must be, or table churn from app
+; restarts exhausts them and ChangeProperty silently no-ops forever after.
+; ----------------------------------------------------------------------------
+window_props_clear:
+    push rbx
+    xor ebx, ebx
+.wpc_loop:
+    cmp ebx, MAX_PROPERTIES
+    jge .wpc_done
+    mov rax, rbx
+    imul rax, PROPERTY_REC_SIZE
+    cmp [properties + rax], edi
+    jne .wpc_next
+    mov dword [properties + rax], 0
+.wpc_next:
+    inc ebx
+    jmp .wpc_loop
+.wpc_done:
+    pop rbx
+    ret
+
 window_destroy:
     push rbx
     push r12
@@ -6054,6 +6598,8 @@ window_destroy:
     je .wd_kill_free
     mov rdi, r13
     call damage_add_window
+    mov byte [comp_dirty], 1                 ; cascade-killed mapped children
+                                             ; must trigger a composite too
 .wd_kill_free:
     ; Free the backing buffer if one was mmap'd.
     cmp byte [r13 + 31], 0
@@ -6068,6 +6614,12 @@ window_destroy:
     syscall
     pop rbx
 .wd_kill_clear:
+    mov edi, [r13]                           ; free its property records too:
+    call window_props_clear                  ; Xlib XID reuse is deterministic,
+                                             ; so stale records would resurrect
+                                             ; on the next client/window using
+                                             ; this xid (and the 1024-slot
+                                             ; table would exhaust under churn)
     mov dword [r13], 0                       ; mark empty
     mov byte [r13 + 31], 0                   ; has_backing = 0
     mov qword [r13 + 32], 0
@@ -6663,10 +7215,14 @@ handle_configure_window:
     mov dword [r13 + 40], 0
 .cfgw_recomp:
     mov byte [comp_dirty], 1
+    mov edi, [r13 + 4]                        ; parent's abs origin (old x/y are
+    call window_abs_xy                        ; parent-local) → r10d/r11d
     mov rax, [cfgw_old_rect]                  ; damage the OLD rect
     movsx r9d, ax                             ; x
+    add r9d, r10d
     shr rax, 16
     movsx edx, ax                             ; y
+    add edx, r11d
     shr rax, 16
     movzx ecx, ax                             ; w
     shr rax, 16
@@ -6906,7 +7462,7 @@ handle_change_property:
     mov [r14 + 8], ecx                       ; type
     movzx ecx, byte [r12 + 16]
     mov [r14 + 12], cl                       ; format
-    jmp .cp_done
+    jmp .cp_notify
 
 .cp_replace:
     ; Allocate pool space and copy the new data.
@@ -6926,6 +7482,12 @@ handle_change_property:
     movzx ecx, byte [r12 + 16]
     mov [r14 + 12], cl                       ; format
 
+.cp_notify:
+    mov edi, [r12 + 4]                       ; window
+    mov esi, [r12 + 8]                       ; atom
+    xor edx, edx                             ; state = 0 (NewValue)
+    call send_property_notify
+
 .cp_done:
     pop r15
     pop r14
@@ -6943,14 +7505,93 @@ handle_change_property:
 ; ============================================================================
 handle_delete_property:
     push rbx
+    push r12
     mov edi, [rsi + 4]                       ; window
+    mov r12d, edi
     mov ebx, [rsi + 8]                       ; atom
     mov esi, ebx
     call property_find
     test rax, rax
     jz .dp_done
     mov dword [rax], 0                       ; mark empty
+    mov edi, r12d
+    mov esi, ebx
+    mov edx, 1                               ; state = 1 (Deleted)
+    call send_property_notify
 .dp_done:
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; send_property_notify — edi = window xid, esi = atom, edx = state (0/1).
+; PropertyNotify (28): +4 window, +8 atom, +12 time, +16 state.
+; Emits to the window's owner client if PropertyChangeMask is in the
+; window's (combined) event mask. Root properties broadcast to every
+; live client (frame keeps one mask per window; root has many
+; listeners, e.g. strip watching tile's EWMH properties).
+; ----------------------------------------------------------------------------
+send_property_notify:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12d, edi                            ; window
+    mov r13d, esi                            ; atom
+    mov r14d, edx                            ; state
+    call window_lookup
+    test rax, rax
+    jz .spn_done
+    test dword [rax + 24], EM_PROPERTY_CHANGE
+    jz .spn_done
+    lea rdi, [pn_buf]
+    mov dword [rdi], 28                      ; code 28, rest of dword 0
+    mov [rdi + 4], r12d                      ; window
+    mov [rdi + 8], r13d                      ; atom
+    mov eax, [server_time_ms]
+    mov [rdi + 12], eax                      ; time
+    mov [rdi + 16], r14d                     ; state (+3 pad bytes)
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+    cmp r12d, X_ROOT_WINDOW
+    je .spn_root
+    cmp r12d, X_RID_BASE
+    jb .spn_done
+    mov eax, r12d
+    sub eax, X_RID_BASE
+    shr eax, 21                              ; owner slot
+    cmp eax, MAX_CLIENTS
+    jae .spn_done
+    mov ebx, eax
+    call client_meta_addr                    ; eax = slot
+    cmp dword [rax], -1                      ; fd live?
+    je .spn_done
+    mov edi, ebx
+    lea rsi, [pn_buf]
+    call send_event_to_slot
+    jmp .spn_done
+.spn_root:
+    xor ebx, ebx
+.spn_root_loop:
+    cmp ebx, MAX_CLIENTS
+    jge .spn_done
+    mov eax, ebx
+    call client_meta_addr
+    cmp dword [rax], -1
+    je .spn_root_next
+    cmp byte [rax + 4], CSTATE_RUNNING       ; never write events into a
+    jne .spn_root_next                       ; handshake still in progress
+    mov edi, ebx
+    lea rsi, [pn_buf]
+    call send_event_to_slot
+.spn_root_next:
+    inc ebx
+    jmp .spn_root_loop
+.spn_done:
+    pop r14
+    pop r13
+    pop r12
     pop rbx
     ret
 
@@ -7864,6 +8505,7 @@ handle_grab_pointer:
     mov [ptr_grab_win], eax
     movzx eax, word [rsi + 8]                 ; event-mask (SETofPOINTEREVENT)
     mov [ptr_grab_mask], eax
+    mov [ptr_grab_slot], edi                  ; who holds it (death cleanup)
     push rbx
     push r12
     mov ebx, edi
@@ -10361,6 +11003,32 @@ damage_add:
     ret
 
 ; ----------------------------------------------------------------------------
+; damage_add_local — rdi = window record, eax = x, edx = y, ecx = w, r8d = h
+; in WINDOW-LOCAL coords. Converts to screen via the parent-chain walk
+; (children of non-root parents land where the compositor draws them) and
+; calls damage_add. Clobbers rax, rcx, rdx, rdi.
+; ----------------------------------------------------------------------------
+damage_add_local:
+    push r10
+    push r11
+    push rsi
+    mov esi, eax                              ; save x
+    push rdx                                  ; save y
+    push rcx                                  ; save w
+    mov edi, [rdi]
+    call window_abs_xy                        ; r10d/r11d = abs origin
+    pop rcx
+    pop rdx
+    add edx, r11d
+    mov eax, esi
+    add eax, r10d
+    call damage_add
+    pop rsi
+    pop r11
+    pop r10
+    ret
+
+; ----------------------------------------------------------------------------
 ; damage_rect_list — rdi = rect list (x s16, y s16, w u16, h u16 each),
 ; esi = rect count, rdx = window record ptr. Damages the bbox of the list
 ; offset to screen coords. Preserves all registers.
@@ -10412,13 +11080,12 @@ damage_rect_list:
     jle .drl_done
     sub r10d, r8d                             ; h
     jle .drl_done
-    movsx eax, word [rbx + 8]
-    add eax, ecx                              ; screen x
-    movsx edx, word [rbx + 10]
-    add edx, r8d                              ; screen y
-    mov ecx, r9d
-    mov r8d, r10d
-    call damage_add
+    mov eax, ecx                              ; local x
+    mov edx, r8d                              ; local y
+    mov ecx, r9d                              ; w
+    mov r8d, r10d                             ; h
+    mov rdi, rbx                              ; window rec → abs conversion
+    call damage_add_local
 .drl_done:
     pop r10
     pop r9
@@ -10442,8 +11109,14 @@ damage_add_window:
     push rdx
     push r8
     push r9
-    movsx eax, word [rdi + 8]                 ; x
-    movsx edx, word [rdi + 10]                ; y
+    push r10
+    push r11
+    push rdi
+    mov edi, [rdi]
+    call window_abs_xy                        ; r10d/r11d = abs origin
+    pop rdi
+    mov eax, r10d                             ; x (absolute)
+    mov edx, r11d                             ; y
     movzx ecx, word [rdi + 12]                ; configured w
     movzx r8d, word [rdi + 40]                ; backing w
     cmp ecx, r8d
@@ -10457,6 +11130,8 @@ damage_add_window:
     mov r8d, r9d
 .daw_h:
     call damage_add
+    pop r11
+    pop r10
     pop r9
     pop r8
     pop rdx
@@ -11787,16 +12462,12 @@ handle_put_image:
     test rax, rax
     jz .pi_ret
     mov byte [comp_dirty], 1
-    movsx ecx, word [r13 + 16]                ; damage the uploaded rect
+    mov rdi, rax                              ; damage the uploaded rect
+    movsx eax, word [r13 + 16]
     movsx edx, word [r13 + 18]
-    movsx r8d, word [rax + 8]
-    add ecx, r8d
-    movsx r8d, word [rax + 10]
-    add edx, r8d
-    mov eax, ecx
     movzx ecx, word [r13 + 12]                ; imgw
     movzx r8d, word [r13 + 14]                ; imgh
-    call damage_add
+    call damage_add_local
 .pi_ret:
     add rsp, 80
     pop rbp
@@ -11826,8 +12497,10 @@ blit_window:
     sub rsp, 64
     mov r13, rdi                             ; record
 
-    movsx r14d, word [r13 + 8]             ; win x
-    movsx eax, word [r13 + 10]             ; win y
+    mov edi, [r13]                           ; absolute origin (children of
+    call window_abs_xy                       ; non-root parents draw where
+    mov r14d, r10d                           ; they actually live)
+    mov eax, r11d
     mov [rsp + 16], eax
     movzx eax, word [r13 + 40]            ; backing_w (stride)
     mov [rsp + 0], eax
@@ -12160,15 +12833,12 @@ handle_clear_area:
     mov r11d, [r12 + 44]                      ; back_pixel
     call fb_fill
     mov byte [comp_dirty], 1
-    mov eax, [dmg_lat + 0]                    ; damage the cleared rect
-    movsx ecx, word [r12 + 8]
-    add eax, ecx
+    mov rdi, r12                              ; damage the cleared rect
+    mov eax, [dmg_lat + 0]
     mov edx, [dmg_lat + 4]
-    movsx ecx, word [r12 + 10]
-    add edx, ecx
     mov ecx, [dmg_lat + 8]
     mov r8d, [dmg_lat + 12]
-    call damage_add
+    call damage_add_local
 .ca_done:
     pop r13
     pop r12
@@ -12397,16 +13067,12 @@ handle_copy_area:
     test rax, rax
     jz .cpa_done
     mov byte [comp_dirty], 1
-    mov ecx, [rbp + 64]                       ; damage the clipped dst rect
-    movsx edx, word [rax + 8]
-    add ecx, edx
+    mov rdi, rax                              ; damage the clipped dst rect
+    mov eax, [rbp + 64]
     mov edx, [rbp + 72]
-    movsx r8d, word [rax + 10]
-    add edx, r8d
-    mov eax, ecx
     mov ecx, [rbp + 80]                       ; copy_w
     mov r8d, [rbp + 88]                       ; copy_h
-    call damage_add
+    call damage_add_local
 .cpa_done:
     add rsp, 160
     pop rbp
@@ -12611,10 +13277,16 @@ handle_send_event:
     jmp .se_have_slot
 
 .se_maybe_root:
-    ; Destination is root (or pointer/focus, which we don't track). If
-    ; root has a redirect owner (the WM), deliver there; else drop.
+    ; Destination is root (or pointer/focus, which we don't track).
     cmp r12d, X_ROOT_WINDOW
     jne .se_done
+    ; Root events with a nonzero event-mask BROADCAST to every live client:
+    ; the tray MANAGER announcement (strip) targets root with
+    ; StructureNotify so XEmbed clients that started BEFORE the manager
+    ; hear it. Mask 0 keeps the old redirect-owner-only route (MapRequest
+    ; style WM traffic).
+    cmp dword [rbx + 8], 0                   ; event-mask
+    jne .se_root_broadcast
     mov edi, X_ROOT_WINDOW
     call window_lookup
     test rax, rax
@@ -12623,6 +13295,41 @@ handle_send_event:
     cmp eax, 0
     jl .se_done
     mov r13d, eax
+    jmp .se_have_slot
+
+.se_root_broadcast:
+    lea rdi, [reply_buf]                     ; build the event once
+    lea rsi, [rbx + 12]
+    mov ecx, 4
+.se_bc_copy:
+    mov rax, [rsi]
+    mov [rdi], rax
+    add rsi, 8
+    add rdi, 8
+    dec ecx
+    jnz .se_bc_copy
+    or byte [reply_buf], 0x80
+    xor r12d, r12d                           ; slot cursor
+.se_bc_loop:
+    cmp r12d, MAX_CLIENTS
+    jge .se_done
+    mov eax, r12d
+    call client_meta_addr
+    mov r13, rax
+    cmp dword [r13], -1                      ; live fd?
+    je .se_bc_next
+    cmp byte [r13 + 4], CSTATE_RUNNING       ; never write events into a
+    jne .se_bc_next                          ; handshake still in progress
+    mov ecx, [r13 + 8]                       ; per-recipient seq stamp
+    mov [reply_buf + 2], cx
+    mov edi, [r13]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+.se_bc_next:
+    inc r12d
+    jmp .se_bc_loop
 
 .se_have_slot:
     ; Validate the client slot is live (fd != -1).
@@ -13507,13 +14214,12 @@ render_trapezoids:
     jle .tz_done
     sub r10d, r8d                             ; h
     jle .tz_done
-    movsx eax, word [r11 + 8]
-    add eax, ecx                              ; screen x
-    movsx edx, word [r11 + 10]
-    add edx, r8d                              ; screen y
-    mov ecx, r9d
-    mov r8d, r10d
-    call damage_add
+    mov eax, ecx                              ; local x
+    mov edx, r8d                              ; local y
+    mov ecx, r9d                              ; w
+    mov r8d, r10d                             ; h
+    mov rdi, r11                              ; window rec
+    call damage_add_local
 .tz_done:
     pop rbp
     pop r15
@@ -14181,20 +14887,16 @@ render_composite_glyphs:
     jz .cog_done
     mov byte [comp_dirty], 1
     mov ecx, [cg_dmg + 0]                     ; damage the run's bbox
-    mov edx, [cg_dmg + 8]
-    cmp ecx, edx
+    cmp ecx, [cg_dmg + 8]
     jge .cog_done
-    sub edx, ecx
-    mov r9d, edx                              ; w
-    movsx edx, word [rax + 8]
-    add ecx, edx                              ; screen x
+    mov rdi, rax
+    mov eax, ecx                              ; local x
+    mov edx, [cg_dmg + 4]                     ; local y
+    mov ecx, [cg_dmg + 8]
+    sub ecx, eax                              ; w
     mov r8d, [cg_dmg + 12]
-    sub r8d, [cg_dmg + 4]                     ; h
-    movsx edx, word [rax + 10]
-    add edx, [cg_dmg + 4]                     ; screen y
-    mov eax, ecx
-    mov ecx, r9d
-    call damage_add
+    sub r8d, edx                              ; h
+    call damage_add_local
 .cog_done:
     add rsp, 16
     pop rbp
@@ -14467,16 +15169,12 @@ render_composite:
     test rax, rax
     jz .rc_done
     mov byte [comp_dirty], 1
-    movsx ecx, word [rbx + 28]                ; damage the composite dst rect
+    mov rdi, rax                              ; damage the composite dst rect
+    movsx eax, word [rbx + 28]
     movsx edx, word [rbx + 30]
-    movsx r8d, word [rax + 8]
-    add ecx, r8d
-    movsx r8d, word [rax + 10]
-    add edx, r8d
-    mov eax, ecx
     movzx ecx, word [rbx + 32]                ; width
     movzx r8d, word [rbx + 34]                ; height
-    call damage_add
+    call damage_add_local
 .rc_done:
     mov qword [cur_clip], 0
     pop rbp
@@ -14562,6 +15260,90 @@ handle_get_selection_owner:
     mov rdx, 32
     syscall
     pop rax
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; handle_convert_selection — edi = slot, rsi = req. ConvertSelection (24).
+; Request: +4 requestor, +8 selection, +12 target, +16 property, +20 time.
+; Owner tracked → forward a SelectionRequest (30) to the owner's client,
+; which then answers the requestor itself (SendEvent SelectionNotify +
+; property write — both paths frame already serves). No owner → the spec
+; says the SERVER sends SelectionNotify (31) with property None. Dropping
+; this request wedged every XConvertSelection caller (clipboard paste,
+; tray MANAGER handshakes) in a blocked wait.
+; ----------------------------------------------------------------------------
+handle_convert_selection:
+    push rbx
+    push r12
+    mov rbx, rsi
+    ; Find the owner of selection atom [rbx+8].
+    mov ecx, [rbx + 8]
+    xor edx, edx
+.cvs_find:
+    cmp edx, [sel_count]
+    jge .cvs_noowner
+    cmp [sel_atoms + rdx*4], ecx
+    je .cvs_check
+    inc edx
+    jmp .cvs_find
+.cvs_check:
+    mov r12d, [sel_owners + rdx*4]           ; owner window
+    test r12d, r12d
+    jz .cvs_noowner
+    ; SelectionRequest to the owner's client slot.
+    lea rdi, [reply_buf]
+    mov dword [rdi], 30                      ; code 30, detail+seq zeroed
+    mov eax, [rbx + 20]
+    mov [rdi + 4], eax                       ; time
+    mov [rdi + 8], r12d                      ; owner
+    mov eax, [rbx + 4]
+    mov [rdi + 12], eax                      ; requestor
+    mov eax, [rbx + 8]
+    mov [rdi + 16], eax                      ; selection
+    mov eax, [rbx + 12]
+    mov [rdi + 20], eax                      ; target
+    mov eax, [rbx + 16]
+    mov [rdi + 24], eax                      ; property
+    mov dword [rdi + 28], 0
+    mov eax, r12d                            ; owner xid → slot
+    sub eax, X_RID_BASE
+    shr eax, 21
+    cmp eax, MAX_CLIENTS
+    jae .cvs_noowner                         ; stale/bogus owner → None path
+    mov r12d, eax
+    call client_meta_addr
+    cmp dword [rax], -1                      ; owner's fd still live?
+    je .cvs_noowner
+    mov edi, r12d
+    lea rsi, [reply_buf]
+    call send_event_to_slot
+    jmp .cvs_done
+.cvs_noowner:
+    ; SelectionNotify (property None) straight back to the requestor.
+    lea rdi, [reply_buf]
+    mov dword [rdi], 31
+    mov eax, [rbx + 20]
+    mov [rdi + 4], eax                       ; time
+    mov eax, [rbx + 4]
+    mov [rdi + 8], eax                       ; requestor
+    mov eax, [rbx + 8]
+    mov [rdi + 12], eax                      ; selection
+    mov eax, [rbx + 12]
+    mov [rdi + 16], eax                      ; target
+    mov dword [rdi + 20], 0                  ; property = None
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+    mov eax, [rbx + 4]                       ; requestor xid → slot
+    sub eax, X_RID_BASE
+    shr eax, 21
+    cmp eax, MAX_CLIENTS
+    jae .cvs_done
+    mov edi, eax
+    lea rsi, [reply_buf]
+    call send_event_to_slot
+.cvs_done:
     pop r12
     pop rbx
     ret
