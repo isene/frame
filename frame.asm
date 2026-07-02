@@ -523,6 +523,9 @@ abs_have_y:         resd 1               ; new finger contact (BTN_TOUCH).
 finger_count:       resd 1               ; fingers down now (1 move, 2 scroll)
 tap_fingers:        resd 1               ; max fingers during the current touch
 tap_moved:          resd 1               ; summed |ABS delta| during the touch
+clickpad_btn:       resd 1               ; button a clickpad BTN_LEFT press was
+                                         ; mapped to (1 or 3) — release must
+                                         ; emit the SAME button
 scroll_accum:       resd 1               ; two-finger Y accumulator → notches
 tap_sec:            resq 1               ; BTN_TOUCH-down time (for tap timing)
 tap_usec:           resq 1
@@ -9042,7 +9045,12 @@ dispatch_input_event:
     add rax, rcx                              ; elapsed microseconds
     cmp rax, 250000
     jg .die_done
-    cmp dword [tap_moved], 50
+    mov ecx, 50
+    cmp dword [tap_fingers], 2                ; two fingers jitter more —
+    jne .die_tap_thresh                       ; allow ~2.5mm instead of ~1mm
+    mov ecx, 120
+.die_tap_thresh:
+    cmp [tap_moved], ecx
     jae .die_done
     mov esi, 1                                ; 1-finger tap → left button
     cmp dword [tap_fingers], 2
@@ -9057,6 +9065,23 @@ dispatch_input_event:
     call deliver_pointer_button
     jmp .die_done
 .die_btn_left:
+    ; Clickpad "clickfinger": a physical press with 2 fingers resting is a
+    ; right-click (the libinput convention this laptop's pad is used to).
+    ; The mapped button is remembered so the release matches even if a
+    ; finger lifted mid-press (else button 3 would stay stuck down).
+    test r13d, r13d
+    jz .die_btn_left_rel
+    mov esi, 1
+    cmp dword [finger_count], 2
+    jl .die_btn_left_store
+    mov esi, 3
+.die_btn_left_store:
+    mov [clickpad_btn], esi
+    jmp .die_btn_have
+.die_btn_left_rel:
+    mov esi, [clickpad_btn]
+    test esi, esi                            ; release before any press (BSS 0)
+    jnz .die_btn_have
     mov esi, 1
     jmp .die_btn_have
 .die_btn_right:
