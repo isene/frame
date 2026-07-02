@@ -269,7 +269,7 @@ clients_bufs:       resb MAX_CLIENTS * CLIENT_BUF_SIZE
 ; MAX_INPUTS evdev devices. Rebuilt each poll iteration; ~1.2 KB of
 ; writes at full census, sub-microsecond. MAX_INPUTS is defined further
 ; down (16) — total = 1 + 128 + 16 = 145 entries.
-pollfd_buf:         resb (MAX_CLIENTS + 1 + 16) * 8
+pollfd_buf:         resb (MAX_CLIENTS + 1 + 16 + 1) * 8   ; +1: drm_fd (flip events)
 
 ; Atom interning table. Atom 0 = None. Atoms 1..predef_count_max are
 ; X11's predefined set (PRIMARY, ATOM, STRING, WM_NAME, ...).
@@ -616,6 +616,37 @@ comp_back:          resd 1                 ; index of the back buffer (0/1)
 drm_page_flip:      resb 24                ; struct drm_mode_crtc_page_flip
 drm_event_buf:      resb 64                ; drain the flip-complete event
 
+; ---- Damage tracking (dirty rectangles) ------------------------------------
+; Every visual change records a screen-space rect via damage_add; the
+; compositor then repaints ONLY those rects (bg fill, window blits, clflush)
+; instead of the whole 9.2 MB buffer. Because the two flip buffers alternate,
+; each buffer keeps its OWN stale list: damage_add appends to both, and a
+; composite of buffer b repairs+clears only dmg[b]. This also survives flip
+; failures and no-swap paths without extra bookkeeping. count -1 = whole
+; screen (the overflow fallback — over-REPAINTING is always safe, unlike
+; clip over-approximation). Rects are x1,y1,x2,y2 (s32, exclusive).
+%define DMG_MAX 32
+dmg_rects0:         resd 4 * DMG_MAX
+dmg_count0:         resd 1
+dmg_rects1:         resd 4 * DMG_MAX
+dmg_count1:         resd 1
+bw_clip_x1:         resd 1               ; blit/fill clip rect = the damage
+bw_clip_y1:         resd 1               ; rect currently being repainted
+bw_clip_x2:         resd 1
+bw_clip_y2:         resd 1
+cfgw_old_rect:      resq 1               ; configure: pre-change x,y,w,h latch
+dmg_lat:            resd 4               ; per-handler damage rect latch
+cg_dmg:             resd 4               ; glyph-run damage bbox (x1,y1,x2,y2)
+flip_pending:       resb 1               ; PAGE_FLIP in flight; don't composite
+                                         ; until its completion event arrives
+drm_poll_dead:      resb 1               ; drm fd hit POLLERR/POLLHUP: stop
+                                         ; polling it, flips fire-and-forget
+fbtest_mode:        resb 1               ; --fbtest: composite into plain
+                                         ; memory, no DRM (headless testing)
+comp_px_blit:       resq 1               ; PERF counters (SIGUSR1 report):
+comp_px_fill:       resq 1               ; pixels blitted / bg-filled /
+comp_px_flush:      resq 1               ; bytes cache-flushed since start
+
 ; ---- Phase 4f compositor state --------------------------------------------
 compositor_requested: resb 1               ; set by --display argv flag
 compositor_active:    resb 1               ; set to 1 after init_compositor wins
@@ -745,10 +776,15 @@ dbg_sp:             db " "
 dbg_dump_tag:       db "DUMP xid/w/h/nonbg: "
 dbg_dump_tag_len    equ $ - dbg_dump_tag
 dump_path:          db "/tmp/frame_win.raw", 0
-dump_prefix:        db "/tmp/frame_dump_", 0
-dump_fb0_path:      db "/tmp/frame_fb0.raw", 0
-dump_fb1_path:      db "/tmp/frame_fb1.raw", 0
+dump_prefix:        db "/tmp/frame_win_", 0
+dump_fb0_path:      db "/tmp/frame_fbA.raw", 0
+dump_fb1_path:      db "/tmp/frame_fbB.raw", 0
 dbg_fbstate:        db "FBSTATE back=", 0
+dbg_pxblit:         db " blit=", 0
+dbg_pxfill:         db " fill=", 0
+dbg_pxflush:        db " flush=", 0
+log_fbtest:         db "frame: fbtest compositor 1920x1080 (no DRM)", 10
+log_fbtest_len equ $ - log_fbtest
 dbg_spX:            db " "
 dump_suffix:        db ".raw", 0
 log_atom_new:       db "  intern-atom new id=", 0
@@ -1104,6 +1140,15 @@ _start:
     cmp rcx, rax
     jge .main
     mov rdi, [rsp + 8 + rcx*8]
+    cmp dword [rdi], '--fb'                  ; --fbtest: DRM-free compositor
+    jne .flag_not_fbtest
+    cmp dword [rdi + 4], 'test'
+    jne .flag_not_fbtest
+    cmp byte [rdi + 8], 0
+    jne .flag_not_fbtest
+    mov byte [fbtest_mode], 1
+    jmp .flag_scan_next
+.flag_not_fbtest:
     cmp dword [rdi], '--di'
     jne .flag_scan_next
     cmp dword [rdi + 4], 'spla'
@@ -1128,6 +1173,12 @@ _start:
     call init_pictures
     call init_properties
     call install_dump_handler
+    cmp byte [fbtest_mode], 0
+    jne .main_fbtest_init
+    jmp .main_fbtest_done
+.main_fbtest_init:
+    call init_fbtest
+.main_fbtest_done:
     call read_framerc                        ; ~/.framerc → keymap_is_no
     call init_keysyms
     call init_input
@@ -3098,7 +3149,7 @@ serve_loop:
     xor ecx, ecx
 .sl_build_in_loop:
     cmp ecx, MAX_INPUTS
-    jge .sl_poll
+    jge .sl_build_drm
     mov edx, [input_fds + rcx*4]             ; fd (or -1)
     mov eax, MAX_CLIENTS + 1
     add eax, ecx
@@ -3108,10 +3159,27 @@ serve_loop:
     mov word [pollfd_buf + rax + 6], 0
     inc ecx
     jmp .sl_build_in_loop
+.sl_build_drm:
+    ; --- Last slot: the DRM fd, so page-flip completion events wake the
+    ; loop instead of a blocking read stalling the whole server a vblank.
+    mov edx, -1
+    cmp byte [compositor_active], 0
+    je .sl_drm_slot
+    cmp byte [fbtest_mode], 0
+    jne .sl_drm_slot
+    cmp byte [drm_poll_dead], 0              ; errored fd: stop polling it
+    jne .sl_drm_slot
+    mov edx, [drm_fd]
+.sl_drm_slot:
+    mov eax, MAX_CLIENTS + 1 + MAX_INPUTS
+    shl eax, 3
+    mov [pollfd_buf + rax], edx
+    mov word [pollfd_buf + rax + 4], 1       ; POLLIN
+    mov word [pollfd_buf + rax + 6], 0
 .sl_poll:
     mov rax, SYS_POLL
     lea rdi, [pollfd_buf]
-    mov esi, MAX_CLIENTS + 1 + MAX_INPUTS
+    mov esi, MAX_CLIENTS + 1 + MAX_INPUTS + 1
     mov edx, -1                              ; infinite timeout
     syscall
     test rax, rax
@@ -3192,12 +3260,35 @@ serve_loop:
     jmp .sl_iw
 
 .sl_flush:
-    ; Coalesced compositor repaint: at most ONE full repaint + page-flip per
-    ; poll cycle, after every ready client's whole request batch and all input
-    ; are drained. Drawing handlers set comp_dirty rather than repainting per
-    ; request — a client sending N draws/frame now costs 1 repaint, not N.
+    ; Flip completion: the DRM fd's POLLIN means the pending page flip
+    ; landed at vblank — drain the event and clear the gate. POLLERR/POLLHUP
+    ; (GPU reset, device loss) must ALSO be consumed or poll returns
+    ; immediately forever (busy-spin) with flip_pending wedged: drain, clear
+    ; the gate, and stop polling the fd (flips become fire-and-forget).
+    mov eax, MAX_CLIENTS + 1 + MAX_INPUTS
+    shl eax, 3
+    movzx eax, word [pollfd_buf + rax + 6]   ; revents
+    test eax, 0x19                            ; POLLIN|POLLERR|POLLHUP
+    jz .sl_composite
+    test eax, 0x18                            ; error states → fd is dead
+    jz .sl_drm_read
+    mov byte [drm_poll_dead], 1
+.sl_drm_read:
+    mov rax, SYS_READ
+    mov rdi, [drm_fd]
+    lea rsi, [drm_event_buf]
+    mov rdx, 64
+    syscall
+    mov byte [flip_pending], 0
+.sl_composite:
+    ; Coalesced, flip-paced repaint: at most ONE damage repaint + async
+    ; page-flip per poll cycle, and none while a flip is still in flight
+    ; (its completion event re-runs this check). Drawing handlers set
+    ; comp_dirty + damage rects rather than repainting per request.
     cmp byte [comp_dirty], 0
     je .sl_iter
+    cmp byte [flip_pending], 0
+    jne .sl_iter
     mov byte [comp_dirty], 0
     call recomposite_screen
     jmp .sl_iter
@@ -3368,16 +3459,10 @@ dispatch_request:
     movzx eax, byte [r12]                    ; opcode
     movzx edx, word [r12 + 2]                ; length (4-byte units)
 
-    ; Log this request so the user can see what the client asked for.
-    push rax
-    push rdx
-    mov rdi, rax
-    mov rsi, rdx
-    mov edx, ebx                             ; client slot for attribution
-    call log_request
-    pop rdx
-    pop rax
-
+    ; Requests are NOT logged per-request any more — log_request costs ~7
+    ; write() syscalls, which at GIMP-scale traffic (thousands of draw
+    ; requests per second) burned real CPU and battery. Only UNHANDLED
+    ; opcodes are logged now (at the dispatch fall-through).
     cmp eax, 1
     je .dr_create_window
     cmp eax, 2
@@ -3488,7 +3573,15 @@ dispatch_request:
     je .dr_randr
     cmp eax, XI_MAJOR
     je .dr_xinput
-    ; Unhandled — already logged.
+    ; Unhandled — log it (the only requests still logged; each one is a
+    ; protocol gap worth knowing about).
+    push rax
+    movzx edx, word [r12 + 2]
+    mov rdi, rax
+    mov rsi, rdx
+    mov edx, ebx
+    call log_request
+    pop rax
     jmp .dr_done
 
 .dr_render:
@@ -5957,6 +6050,11 @@ window_destroy:
     je .wd_recurse                           ; a child — recurse
     jmp .wd_walk_next
 .wd_kill:
+    cmp byte [r13 + 28], 0                   ; on screen? damage its rect
+    je .wd_kill_free
+    mov rdi, r13
+    call damage_add_window
+.wd_kill_free:
     ; Free the backing buffer if one was mmap'd.
     cmp byte [r13 + 31], 0
     je .wd_kill_clear
@@ -6305,6 +6403,8 @@ handle_map_window:
 .mw_just_map:
     mov byte [r12 + 28], 1
     mov byte [comp_dirty], 1
+    mov rdi, r12
+    call damage_add_window
     inc dword [win_stk_next]                   ; mapping raises to top of z-order
     mov eax, [win_stk_next]
     mov [r12 + 48], eax
@@ -6370,6 +6470,8 @@ handle_unmap_window:
     mov r12, rax
     mov byte [r12 + 28], 0
     mov byte [comp_dirty], 1
+    mov rdi, r12
+    call damage_add_window
     mov eax, [r12]                            ; if this window held the grab, drop it
     cmp eax, [ptr_grab_win]
     jne .uw_nograb
@@ -6483,6 +6585,8 @@ handle_configure_window:
     jmp .cfgw_done
 
 .cfgw_apply:
+    mov rax, [r13 + 8]                        ; latch pre-change x,y,w,h
+    mov [cfgw_old_rect], rax
     movzx ecx, word [r12 + 8]                ; value-mask
     lea r14, [r12 + 12]                      ; cursor in value-list
 .cfgw_loop:
@@ -6532,6 +6636,8 @@ handle_configure_window:
     mov eax, [win_stk_next]
     mov [r13 + 48], eax
     mov byte [comp_dirty], 1
+    mov rdi, r13                              ; raise reveals the whole window
+    call damage_add_window
 .cfgw_apply_done:
     ; If the window resized and has a backing buffer at the old size,
     ; drop it — the client will re-create it at the new size on its
@@ -6557,6 +6663,18 @@ handle_configure_window:
     mov dword [r13 + 40], 0
 .cfgw_recomp:
     mov byte [comp_dirty], 1
+    mov rax, [cfgw_old_rect]                  ; damage the OLD rect
+    movsx r9d, ax                             ; x
+    shr rax, 16
+    movsx edx, ax                             ; y
+    shr rax, 16
+    movzx ecx, ax                             ; w
+    shr rax, 16
+    movzx r8d, ax                             ; h
+    mov eax, r9d                              ; x
+    call damage_add
+    mov rdi, r13                              ; ...and the NEW rect
+    call damage_add_window
     ; Tell the window's own client its new geometry (StructureNotify). A real
     ; server sends ConfigureNotify on every reconfigure — including the ones a
     ; WM drives. GTK freezes its toplevel when it requests a resize and thaws
@@ -9225,12 +9343,18 @@ handle_reparent_window:
     call window_lookup
     test rax, rax
     jz .rp_done
+    mov rdi, rax                              ; damage the OLD position
+    call damage_add_window
     mov ecx, [rsi + 8]
     mov [rax + 4], ecx                        ; new parent
     mov dx, [rsi + 12]
     mov [rax + 8], dx                         ; new x
     mov dx, [rsi + 14]
     mov [rax + 10], dx                        ; new y
+    mov rdi, rax                              ; ...and the NEW one
+    call damage_add_window
+    mov byte [comp_dirty], 1                  ; was missing: screen stayed
+                                              ; stale after every reparent
 .rp_done:
     pop rbx
     ret
@@ -9894,6 +10018,8 @@ init_compositor:
     mov rdx, 1
     call write_stderr
 
+    mov dword [dmg_count0], -1               ; both buffers start fully stale
+    mov dword [dmg_count1], -1
     mov byte [comp_dirty], 1
     xor eax, eax
     pop r13
@@ -10082,6 +10208,263 @@ cursor_move_hw:
     ret
 
 ; ----------------------------------------------------------------------------
+; init_fbtest — DRM-free compositor for headless testing (--fbtest).
+; Two anonymous buffers stand in for the DRM dumb buffers; the full
+; composite path (damage lists, bg fill, blits, clflush, counters) runs;
+; present is a plain buffer swap. Lets the whole pipeline be pixel-
+; verified without a panel or root.
+; ----------------------------------------------------------------------------
+init_fbtest:
+    push rbx
+    mov word [drm_modes_buf + 4], 1920
+    mov word [drm_modes_buf + 14], 1080
+    mov dword [screen_w], 1920
+    mov dword [screen_h], 1080
+    mov dword [drm_dumb_pitch], 1920*4
+    mov qword [drm_dumb_size], 1920*1080*4
+    xor ebx, ebx
+.ft_buf:
+    mov rax, SYS_MMAP
+    xor edi, edi
+    mov rsi, 1920*1080*4
+    mov edx, 3                                ; PROT_READ|PROT_WRITE
+    mov r10d, 0x22                            ; MAP_PRIVATE|MAP_ANONYMOUS
+    mov r8, -1
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    js .ft_fail
+    mov [comp_addr + rbx*8], rax
+    mov rdi, rax
+    mov rcx, 1920*1080
+    mov eax, COMP_BG_COLOR
+    rep stosd
+    inc ebx
+    cmp ebx, 2
+    jl .ft_buf
+    mov dword [comp_back], 1
+    mov dword [dmg_count0], -1
+    mov dword [dmg_count1], -1
+    mov byte [compositor_active], 1
+    mov byte [comp_dirty], 1
+    lea rsi, [log_fbtest]
+    mov rdx, log_fbtest_len
+    call write_stderr
+.ft_fail:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; damage_add — record a screen-space dirty rect for the compositor.
+;   eax = x, edx = y, ecx = w, r8d = h  (s32, screen coords)
+; Clamps to the screen and appends to BOTH buffers' stale lists
+; (containment-deduped; overflow → whole-screen fallback, which is safe:
+; over-repainting is correct, unlike clip over-approximation). No-op when
+; the compositor is off. Preserves all registers.
+; ----------------------------------------------------------------------------
+damage_add:
+    cmp byte [compositor_active], 0
+    je .da_ret0
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    mov r9d, eax                              ; x1
+    mov r10d, edx                             ; y1
+    mov r11d, eax
+    add r11d, ecx                             ; x2
+    mov ebx, edx
+    add ebx, r8d                              ; y2
+    test r9d, r9d
+    jns .da_x1ok
+    xor r9d, r9d
+.da_x1ok:
+    test r10d, r10d
+    jns .da_y1ok
+    xor r10d, r10d
+.da_y1ok:
+    movzx eax, word [drm_modes_buf + 4]       ; screen w
+    cmp r11d, eax
+    jle .da_x2ok
+    mov r11d, eax
+.da_x2ok:
+    movzx eax, word [drm_modes_buf + 14]      ; screen h
+    cmp ebx, eax
+    jle .da_y2ok
+    mov ebx, eax
+.da_y2ok:
+    cmp r9d, r11d
+    jge .da_done
+    cmp r10d, ebx
+    jge .da_done
+    lea rdi, [dmg_rects0]
+    lea rsi, [dmg_count0]
+    call .da_append
+    lea rdi, [dmg_rects1]
+    lea rsi, [dmg_count1]
+    call .da_append
+.da_done:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+.da_ret0:
+    ret
+; local: append rect (r9d,r10d,r11d,ebx) to list rdi / count at rsi
+.da_append:
+    mov ecx, [rsi]
+    test ecx, ecx
+    js .da_ap_ret                             ; already whole-screen
+    jz .da_ap_store
+    mov rax, rdi                              ; containment scan
+    mov edx, ecx
+.da_ap_scan:
+    cmp r9d, [rax + 0]
+    jl .da_ap_next
+    cmp r10d, [rax + 4]
+    jl .da_ap_next
+    cmp r11d, [rax + 8]
+    jg .da_ap_next
+    cmp ebx, [rax + 12]
+    jg .da_ap_next
+    ret                                       ; contained in an existing rect
+.da_ap_next:
+    add rax, 16
+    dec edx
+    jnz .da_ap_scan
+    cmp ecx, DMG_MAX
+    jl .da_ap_store
+    mov dword [rsi], -1                       ; overflow → whole screen
+    ret
+.da_ap_store:
+    mov eax, ecx
+    shl eax, 4
+    add rax, rdi
+    mov [rax + 0], r9d
+    mov [rax + 4], r10d
+    mov [rax + 8], r11d
+    mov [rax + 12], ebx
+    inc dword [rsi]
+.da_ap_ret:
+    ret
+
+; ----------------------------------------------------------------------------
+; damage_rect_list — rdi = rect list (x s16, y s16, w u16, h u16 each),
+; esi = rect count, rdx = window record ptr. Damages the bbox of the list
+; offset to screen coords. Preserves all registers.
+; ----------------------------------------------------------------------------
+damage_rect_list:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    test esi, esi
+    jz .drl_done
+    mov rbx, rdx                              ; window rec
+    mov ecx, 0x7FFFFFFF                       ; x1
+    mov r8d, 0x7FFFFFFF                       ; y1
+    mov r9d, 0x80000000                       ; x2
+    mov r10d, 0x80000000                      ; y2
+.drl_loop:
+    movsx eax, word [rdi + 0]
+    cmp eax, ecx
+    jge .drl_1
+    mov ecx, eax
+.drl_1:
+    movzx edx, word [rdi + 4]
+    add edx, eax
+    cmp edx, r9d
+    jle .drl_2
+    mov r9d, edx
+.drl_2:
+    movsx eax, word [rdi + 2]
+    cmp eax, r8d
+    jge .drl_3
+    mov r8d, eax
+.drl_3:
+    movzx edx, word [rdi + 6]
+    add edx, eax
+    cmp edx, r10d
+    jle .drl_4
+    mov r10d, edx
+.drl_4:
+    add rdi, 8
+    dec esi
+    jnz .drl_loop
+    sub r9d, ecx                              ; w
+    jle .drl_done
+    sub r10d, r8d                             ; h
+    jle .drl_done
+    movsx eax, word [rbx + 8]
+    add eax, ecx                              ; screen x
+    movsx edx, word [rbx + 10]
+    add edx, r8d                              ; screen y
+    mov ecx, r9d
+    mov r8d, r10d
+    call damage_add
+.drl_done:
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ----------------------------------------------------------------------------
+; damage_add_window — rdi = window record ptr. Damages the window's screen
+; rect using the larger of configured (+12/+14) and backing (+40/+42) dims
+; (blit uses backing, configure the former). Preserves all registers.
+; ----------------------------------------------------------------------------
+damage_add_window:
+    push rax
+    push rcx
+    push rdx
+    push r8
+    push r9
+    movsx eax, word [rdi + 8]                 ; x
+    movsx edx, word [rdi + 10]                ; y
+    movzx ecx, word [rdi + 12]                ; configured w
+    movzx r8d, word [rdi + 40]                ; backing w
+    cmp ecx, r8d
+    jge .daw_w
+    mov ecx, r8d
+.daw_w:
+    movzx r8d, word [rdi + 14]                ; configured h
+    movzx r9d, word [rdi + 42]                ; backing h
+    cmp r8d, r9d
+    jge .daw_h
+    mov r8d, r9d
+.daw_h:
+    call damage_add
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; ----------------------------------------------------------------------------
 ; recomposite_screen — paint background (via rep stosd over the whole
 ; dumb buffer — proven to work in do_modeset), then walk every mapped
 ; non-root window and draw its rect in a per-XID colour. No-op if
@@ -10090,30 +10473,197 @@ cursor_move_hw:
 recomposite_screen:
     cmp byte [compositor_active], 0
     je .rs_done
-    inc dword [rs_counter]                    ; DIAG
     push rbx
     push r12
     push r13
+    push r14
+    push r15
 
-    ; Point drm_dumb_addr at the BACK buffer — every draw helper (the bg
-    ; fill, draw_rect, blit_window) renders through drm_dumb_addr, so this
-    ; one assignment redirects the whole repaint into the back buffer.
-    ; We PAGE_FLIP to it at the end (.rs_done_pop).
+    ; Select the back buffer and ITS stale-damage list.
     mov eax, [comp_back]
-    mov rax, [comp_addr + rax*8]
-    mov [drm_dumb_addr], rax
+    mov rcx, [comp_addr + rax*8]
+    mov [drm_dumb_addr], rcx
+    lea r14, [dmg_rects0]
+    lea r15, [dmg_count0]
+    test eax, eax
+    jz .rs_have_list
+    lea r14, [dmg_rects1]
+    lea r15, [dmg_count1]
+.rs_have_list:
+    mov eax, [r15]
+    test eax, eax
+    jz .rs_done_pop                           ; buffer already clean → nothing
+    inc dword [rs_counter]                    ; DIAG (clobbers flags!)
+    cmp eax, 0
+    jl .rs_full                               ; -1 → whole-screen repaint
 
-    ; --- Background fill across the whole (back) buffer.
+    ; --- Damage path: for each stale rect, bg-fill it, then repaint the
+    ; window stack clipped to it (bw_clip). Painter's order holds per rect.
+    mov r13d, eax                             ; remaining rects
+    mov rbx, r14                              ; rect cursor
+.rs_rect_loop:
+    mov eax, [rbx + 0]
+    mov [bw_clip_x1], eax
+    mov edx, [rbx + 4]
+    mov [bw_clip_y1], edx
+    mov ecx, [rbx + 8]
+    mov [bw_clip_x2], ecx
+    mov r8d, [rbx + 12]
+    mov [bw_clip_y2], r8d
+    sub ecx, eax                              ; w
+    sub r8d, edx                              ; h
+    mov esi, ecx
+    imul esi, r8d
+    movsxd rsi, esi
+    add [comp_px_fill], rsi                   ; PERF counter
+    mov esi, edx                              ; y
+    mov edi, ecx                              ; w
+    mov ecx, r8d                              ; h
+    mov edx, COMP_BG_COLOR
+    call draw_rect
+    call .rs_window_walk
+    add rbx, 16
+    dec r13d
+    jnz .rs_rect_loop
+
+    ; --- clflush only the damaged lines (write-back cache → RAM so the
+    ; display engine scans fresh pixels). 64-byte lines per damaged row.
+    mov r13d, [r15]
+    mov rbx, r14
+.rs_fr_rect:
+    mov r8d, [rbx + 4]                        ; y
+.rs_fr_row:
+    cmp r8d, [rbx + 12]
+    jge .rs_fr_next
+    mov eax, r8d
+    imul eax, [drm_dumb_pitch]
+    mov rdi, [drm_dumb_addr]
+    add rdi, rax
+    mov edx, [rbx + 0]
+    shl edx, 2
+    and edx, 0xFFFFFFC0                       ; line-align left edge
+    add rdi, rdx
+    mov ecx, [rbx + 8]
+    shl ecx, 2
+    add ecx, 63
+    and ecx, 0xFFFFFFC0                       ; round right edge up
+    sub ecx, edx
+    jle .rs_fr_rownext
+    add [comp_px_flush], rcx                  ; PERF counter (bytes)
+.rs_fr_line:
+    clflush [rdi]
+    add rdi, 64
+    sub ecx, 64
+    ja .rs_fr_line
+.rs_fr_rownext:
+    inc r8d
+    jmp .rs_fr_row
+.rs_fr_next:
+    add rbx, 16
+    dec r13d
+    jnz .rs_fr_rect
+    sfence
+    jmp .rs_present
+
+.rs_full:
+    ; --- Whole-screen path (overflow fallback / first paint) ---
+    xor eax, eax
+    mov [bw_clip_x1], eax
+    mov [bw_clip_y1], eax
+    movzx eax, word [drm_modes_buf + 4]
+    mov [bw_clip_x2], eax
+    movzx eax, word [drm_modes_buf + 14]
+    mov [bw_clip_y2], eax
     mov rdi, [drm_dumb_addr]
     mov rcx, [drm_dumb_size]
     shr rcx, 2
     mov eax, COMP_BG_COLOR
     rep stosd
+    mov rax, [drm_dumb_size]
+    shr rax, 2
+    add [comp_px_fill], rax                   ; PERF counter
+    call .rs_window_walk
+    mov rdi, [drm_dumb_addr]
+    mov rcx, [drm_dumb_size]
+    add [comp_px_flush], rcx                  ; PERF counter
+.rs_flush_all:
+    clflush [rdi]
+    add rdi, 64
+    sub rcx, 64
+    ja .rs_flush_all
+    sfence
 
-    ; --- Draw mapped non-root windows in ascending z-order (stk) so they
-    ; paint bottom-to-top regardless of slot/creation order. Each pass finds
-    ; the smallest stk strictly above the last drawn; O(n^2) over a handful
-    ; of windows, once per coalesced repaint.
+.rs_present:
+    mov dword [r15], 0                        ; this buffer is now clean
+    cmp byte [fbtest_mode], 0
+    jne .rs_fb_swap                           ; test mode: no DRM, just swap
+
+    ; --- PAGE_FLIP the CRTC to the back buffer, ASYNC: the completion
+    ; event is drained by the serve loop (drm_fd is in its poll set), so
+    ; the server never stalls a vblank here. flip_pending gates the next
+    ; composite until the event arrives.
+    mov ebx, [comp_back]
+    lea rdi, [drm_page_flip]
+    mov eax, [drm_chosen_crtc]
+    mov [rdi + 0], eax                       ; crtc_id
+    mov eax, [comp_fbid + rbx*4]
+    mov [rdi + 4], eax                       ; fb_id
+    mov dword [rdi + 8], DRM_MODE_PAGE_FLIP_EVENT
+    mov dword [rdi + 12], 0                  ; reserved
+    mov qword [rdi + 16], 0                  ; user_data
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_PAGE_FLIP
+    lea rdx, [drm_page_flip]
+    syscall
+
+    cmp byte [dirtyfb_logged], 0             ; log the first flip's rc once
+    jne .rs_flip_logged
+    mov byte [dirtyfb_logged], 1
+    push rax
+    mov rsi, log_pageflip
+    mov rdx, log_pageflip_len
+    call write_stderr
+    pop rax
+    push rax
+    call write_i64_stderr
+    lea rsi, [probe_conn_nl]
+    mov rdx, 1
+    call write_stderr
+    pop rax
+.rs_flip_logged:
+    test rax, rax
+    js .rs_no_swap                           ; flip rejected → stale until damage
+    cmp byte [drm_poll_dead], 0              ; no completion events any more →
+    jne .rs_fb_swap                          ; fire-and-forget, never gate
+    mov byte [flip_pending], 1
+.rs_fb_swap:
+    mov eax, [comp_back]                     ; swap: submitted buffer is the
+    xor eax, 1                               ; new front; render the other next
+    mov [comp_back], eax
+    jmp .rs_done_pop
+.rs_no_swap:
+    ; Flip rejected (VT switch / master contention): the buffer is painted
+    ; but never presented, and its damage list is already cleared. Mark it
+    ; fully stale so the NEXT genuine damage repaints it whole and submits a
+    ; fresh flip. Deliberately NO self-retrigger: with a persistently failing
+    ; flip that would burn a full repaint + clflush per input event.
+    mov dword [r15], -1
+.rs_done_pop:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+.rs_done:
+    ret
+
+; local: stk-ordered walk blitting every mapped backed window, clipped to
+; bw_clip. Preserves the caller's rbx/r12/r13.
+.rs_window_walk:
+    push rbx
+    push r12
+    push r13
     mov dword [rs_last_stk], 0
 .rs_pass:
     xor ebx, ebx                             ; slot
@@ -10144,96 +10694,18 @@ recomposite_screen:
     jmp .rs_find
 .rs_find_done:
     test r12, r12
-    jz .rs_done_pop                           ; nothing left → flush + flip
+    jz .rs_walk_done
     mov ecx, [rs_min_stk]
     mov [rs_last_stk], ecx
-
-    ; Blit only windows that have drawn content. A just-mapped window has
-    ; no backing until its first draw; painting a placeholder (the old
-    ; phase-4f per-xid hash colour) flashed a pastel rect before every
-    ; window/menu appeared. Undefined contents = leave what's beneath.
-    cmp byte [r12 + 31], 0
+    cmp byte [r12 + 31], 0                    ; skip windows with no content
     je .rs_pass
     mov rdi, r12
     call blit_window
     jmp .rs_pass
-
-.rs_done_pop:
-    ; --- clflush the entire framebuffer. The DRM dumb-buffer mmap on
-    ; i915 is write-back cached; our rep stosd + draw_rect writes land
-    ; in CPU L1/L2 and never reach memory (and therefore never reach
-    ; the panel's scan-out) without explicit flushing. clflush is
-    ; per-64-byte cache line; we sweep the whole 9.2 MB buffer with one
-    ; `rep`-flavoured loop. ~144k cache lines, sub-ms total.
-    ; clflush the back buffer (CPU write-back cache → RAM) so the display
-    ; engine reads our fresh pixels, not stale cache.
-    mov rdi, [drm_dumb_addr]
-    mov rcx, [drm_dumb_size]
-.rs_flush:
-    clflush [rdi]
-    add rdi, 64
-    sub rcx, 64
-    ja .rs_flush
-    sfence
-
-    ; --- PAGE_FLIP the CRTC to the back buffer. The flip makes the
-    ; display engine re-scan the new buffer at the next vblank, which
-    ; defeats FBC/PSR staleness (DIRTYFB is unsupported on legacy FBs).
-    ; ebx = back index.
-    mov ebx, [comp_back]
-    lea rdi, [drm_page_flip]
-    mov eax, [drm_chosen_crtc]
-    mov [rdi + 0], eax                       ; crtc_id
-    mov eax, [comp_fbid + rbx*4]
-    mov [rdi + 4], eax                       ; fb_id
-    mov dword [rdi + 8], DRM_MODE_PAGE_FLIP_EVENT
-    mov dword [rdi + 12], 0                  ; reserved
-    mov qword [rdi + 16], 0                  ; user_data
-    mov rax, SYS_IOCTL
-    mov rdi, [drm_fd]
-    mov esi, DRM_IOCTL_MODE_PAGE_FLIP
-    lea rdx, [drm_page_flip]
-    syscall
-
-    ; Log the first flip's return so we can confirm flips are accepted.
-    cmp byte [dirtyfb_logged], 0
-    jne .rs_flip_logged
-    mov byte [dirtyfb_logged], 1
-    push rax
-    mov rsi, log_pageflip
-    mov rdx, log_pageflip_len
-    call write_stderr
-    pop rax
-    push rax
-    call write_i64_stderr
-    lea rsi, [probe_conn_nl]
-    mov rdx, 1
-    call write_stderr
-    pop rax
-.rs_flip_logged:
-    test rax, rax
-    js .rs_no_swap                           ; flip rejected → keep current front
-
-    ; Drain the flip-complete event (blocking read; arrives at vblank,
-    ; ~8 ms). Only one flip may be pending per CRTC, and we drain it
-    ; synchronously here, so the next recomposite's flip never collides.
-    mov rax, SYS_READ
-    mov rdi, [drm_fd]
-    lea rsi, [drm_event_buf]
-    mov rdx, 64
-    syscall
-
-    ; Swap: the back buffer just became the front; render the other one
-    ; next time.
-    mov eax, [comp_back]
-    xor eax, 1
-    mov [comp_back], eax
-.rs_no_swap:
-
+.rs_walk_done:
     pop r13
     pop r12
     pop rbx
-.rs_done:
     ret
 
 ; ----------------------------------------------------------------------------
@@ -10754,6 +11226,8 @@ window_ensure_backing:
     mov [rbx + 40], r12w                     ; backing_w
     mov [rbx + 42], r13w                     ; backing_h
     mov byte [rbx + 31], 1                   ; has_backing
+    mov rdi, rbx                             ; fresh backing = whole window
+    call damage_add_window                   ; changed (back_pixel fill)
     ; Fill with back_pixel.
     mov rdi, rax
     mov ecx, r12d
@@ -11038,6 +11512,12 @@ handle_poly_fill_rectangle:
     test rax, rax
     jz .pfr_ret
     mov byte [comp_dirty], 1
+    mov rdx, rax                              ; damage bbox of the rect list
+    lea rdi, [rbx + 12]
+    mov esi, r12d
+    sub esi, 12
+    shr esi, 3
+    call damage_rect_list
 .pfr_ret:
     add rsp, 16
     pop rbp
@@ -11307,6 +11787,16 @@ handle_put_image:
     test rax, rax
     jz .pi_ret
     mov byte [comp_dirty], 1
+    movsx ecx, word [r13 + 16]                ; damage the uploaded rect
+    movsx edx, word [r13 + 18]
+    movsx r8d, word [rax + 8]
+    add ecx, r8d
+    movsx r8d, word [rax + 10]
+    add edx, r8d
+    mov eax, ecx
+    movzx ecx, word [r13 + 12]                ; imgw
+    movzx r8d, word [r13 + 14]                ; imgh
+    call damage_add
 .pi_ret:
     add rsp, 80
     pop rbp
@@ -11357,13 +11847,28 @@ blit_window:
     neg r8d                                 ; src_x0 = -x
     xor r9d, r9d                            ; dst_x0 = 0
 .bw_dx_ok:
+    ; bw_clip X: shift the left edge into the clip, cap the right edge
+    mov eax, [bw_clip_x1]
+    cmp r9d, eax
+    jge .bw_cx1
+    sub eax, r9d                            ; delta
+    add r9d, eax
+    add r8d, eax
+.bw_cx1:
     mov [rsp + 24], r9d                     ; dst_x0
     mov [rsp + 32], r8d                     ; src_x0
-    ; copy_w = min(backing_w - src_x0, screen_w - dst_x0)
+    ; copy_w = min(backing_w - src_x0, screen_w - dst_x0, clip_x2 - dst_x0)
     mov eax, [rsp + 0]
     sub eax, r8d
     jle .bw_done
     mov edx, r15d
+    sub edx, r9d
+    jle .bw_done
+    cmp eax, edx
+    jle .bw_cw0
+    mov eax, edx
+.bw_cw0:
+    mov edx, [bw_clip_x2]
     sub edx, r9d
     jle .bw_done
     cmp eax, edx
@@ -11372,7 +11877,12 @@ blit_window:
 .bw_cw:
     mov [rsp + 40], eax                     ; copy_w
 
+    ; start at the first backing row inside the clip: ry0 = clip_y1 - win_y
     xor r12d, r12d                          ; ry = 0
+    mov eax, [bw_clip_y1]
+    sub eax, [rsp + 16]
+    jle .bw_row
+    mov r12d, eax
 .bw_row:
     mov eax, [rsp + 8]                      ; backing_h
     cmp r12d, eax
@@ -11382,6 +11892,8 @@ blit_window:
     add eax, r12d
     js .bw_row_next
     cmp eax, [rsp + 48]                     ; screen_h
+    jge .bw_done
+    cmp eax, [bw_clip_y2]                   ; past the clip → done
     jge .bw_done
     ; dst = drm_dumb_addr + dy*pitch + dst_x0*4
     mov ecx, eax
@@ -11396,6 +11908,7 @@ blit_window:
     add eax, [rsp + 32]
     lea rsi, [rbx + rax*4]
     mov ecx, [rsp + 40]                     ; copy_w
+    add [comp_px_blit], rcx                 ; PERF counter
     rep movsd
 .bw_row_next:
     inc r12d
@@ -11637,12 +12150,25 @@ handle_clear_area:
     movzx r10d, word [r12 + 42]
     sub r10d, r8d
 .ca_h_ok:
+    mov [dmg_lat + 0], eax                   ; latch the fill rect for damage
+    mov [dmg_lat + 4], r8d
+    mov [dmg_lat + 8], r9d
+    mov [dmg_lat + 12], r10d
     mov rdi, r13
     movzx esi, word [r12 + 40]               ; backing_w (stride)
     movzx edx, word [r12 + 42]               ; backing_h
     mov r11d, [r12 + 44]                      ; back_pixel
     call fb_fill
     mov byte [comp_dirty], 1
+    mov eax, [dmg_lat + 0]                    ; damage the cleared rect
+    movsx ecx, word [r12 + 8]
+    add eax, ecx
+    mov edx, [dmg_lat + 4]
+    movsx ecx, word [r12 + 10]
+    add edx, ecx
+    mov ecx, [dmg_lat + 8]
+    mov r8d, [dmg_lat + 12]
+    call damage_add
 .ca_done:
     pop r13
     pop r12
@@ -11871,6 +12397,16 @@ handle_copy_area:
     test rax, rax
     jz .cpa_done
     mov byte [comp_dirty], 1
+    mov ecx, [rbp + 64]                       ; damage the clipped dst rect
+    movsx edx, word [rax + 8]
+    add ecx, edx
+    mov edx, [rbp + 72]
+    movsx r8d, word [rax + 10]
+    add edx, r8d
+    mov eax, ecx
+    mov ecx, [rbp + 80]                       ; copy_w
+    mov r8d, [rbp + 88]                       ; copy_h
+    call damage_add
 .cpa_done:
     add rsp, 160
     pop rbp
@@ -12006,7 +12542,19 @@ handle_poly_rectangle:
     dec dword [rsp + 4]
     jmp .prr_loop
 .prr_recomp:
+    ; only windows recomposite (pixmap outlines repainted the screen for
+    ; nothing before — pre-existing waste bug), and damage the rect bbox
+    mov edi, [rbx + 4]
+    call window_lookup
+    test rax, rax
+    jz .prr_done
     mov byte [comp_dirty], 1
+    mov rdx, rax
+    lea rdi, [rbx + 12]
+    mov esi, [rsp + 0]
+    sub esi, 12
+    shr esi, 3
+    call damage_rect_list
 .prr_done:
     add rsp, 16
     pop rbp
@@ -12672,6 +13220,13 @@ render_fill_rectangles:
     test rax, rax
     jz .rfr_done
     mov byte [comp_dirty], 1
+    mov rdx, rax                              ; damage bbox of the rect list
+    lea rdi, [rbx + 20]
+    movzx esi, word [rbx + 2]
+    shl esi, 2
+    sub esi, 20
+    shr esi, 3
+    call damage_rect_list
 .rfr_done:
     mov qword [cur_clip], 0
     add rsp, 16
@@ -12892,6 +13447,73 @@ render_trapezoids:
     test rax, rax
     jz .tz_done
     mov byte [comp_dirty], 1
+    ; damage: bbox over the trapezoid list (fixed-point → pixel, outward)
+    mov r11, rax                              ; window rec
+    movzx esi, word [rbx + 2]
+    shl esi, 2
+    sub esi, 24
+    jle .tz_done
+    xor edx, edx
+    mov eax, esi
+    mov esi, 40
+    div esi
+    mov esi, eax                              ; trap count
+    test esi, esi
+    jz .tz_done
+    lea rdi, [rbx + 24]
+    mov ecx, 0x7FFFFFFF                       ; x1
+    mov r8d, 0x7FFFFFFF                       ; y1
+    mov r9d, 0x80000000                       ; x2
+    mov r10d, 0x80000000                      ; y2
+.tz_dmg_loop:
+    mov eax, [rdi + 0]                        ; top
+    sar eax, 16
+    cmp eax, r8d
+    jge .tzd_1
+    mov r8d, eax
+.tzd_1:
+    mov eax, [rdi + 4]                        ; bottom
+    sar eax, 16
+    inc eax
+    cmp eax, r10d
+    jle .tzd_2
+    mov r10d, eax
+.tzd_2:
+    mov eax, [rdi + 8]                        ; left.p1x
+    cmp eax, [rdi + 16]                       ; left.p2x
+    jle .tzd_3
+    mov eax, [rdi + 16]
+.tzd_3:
+    sar eax, 16
+    cmp eax, ecx
+    jge .tzd_4
+    mov ecx, eax
+.tzd_4:
+    mov eax, [rdi + 24]                       ; right.p1x
+    cmp eax, [rdi + 32]                       ; right.p2x
+    jge .tzd_5
+    mov eax, [rdi + 32]
+.tzd_5:
+    sar eax, 16
+    inc eax
+    cmp eax, r9d
+    jle .tzd_6
+    mov r9d, eax
+.tzd_6:
+    add rdi, 40
+    dec esi
+    jnz .tz_dmg_loop
+    sub r9d, ecx                              ; w
+    jle .tz_done
+    sub r10d, r8d                             ; h
+    jle .tz_done
+    movsx eax, word [r11 + 8]
+    add eax, ecx                              ; screen x
+    movsx edx, word [r11 + 10]
+    add edx, r8d                              ; screen y
+    mov ecx, r9d
+    mov r8d, r10d
+    call damage_add
 .tz_done:
     pop rbp
     pop r15
@@ -13257,6 +13879,24 @@ glyph_blend:
     movzx r10d, word [r9 + 8]                  ; width
     movzx r11d, word [r9 + 10]                 ; height
     movzx r12d, word [r9 + 24]                 ; stride
+    cmp r13d, [cg_dmg + 0]                     ; grow the run's damage bbox
+    jge .gb_d1
+    mov [cg_dmg + 0], r13d
+.gb_d1:
+    cmp r14d, [cg_dmg + 4]
+    jge .gb_d2
+    mov [cg_dmg + 4], r14d
+.gb_d2:
+    lea eax, [r13 + r10]
+    cmp eax, [cg_dmg + 8]
+    jle .gb_d3
+    mov [cg_dmg + 8], eax
+.gb_d3:
+    lea eax, [r14 + r11]
+    cmp eax, [cg_dmg + 12]
+    jle .gb_d4
+    mov [cg_dmg + 12], eax
+.gb_d4:
     movzx eax, word [r9 + 26]                   ; bpp (1=A8, 4=ARGB32)
     mov [gb_bpp], eax
     mov eax, [r9 + 20]                         ; bitmap_off
@@ -13395,6 +14035,10 @@ render_composite_glyphs:
     push rbp
     sub rsp, 16
     mov rbx, rdi
+    mov dword [cg_dmg + 0], 0x7FFFFFFF        ; reset the run's damage bbox
+    mov dword [cg_dmg + 4], 0x7FFFFFFF
+    mov dword [cg_dmg + 8], 0x80000000
+    mov dword [cg_dmg + 12], 0x80000000
 
     ; glyph id size from minor opcode
     movzx eax, byte [rbx + 1]
@@ -13536,6 +14180,21 @@ render_composite_glyphs:
     test rax, rax
     jz .cog_done
     mov byte [comp_dirty], 1
+    mov ecx, [cg_dmg + 0]                     ; damage the run's bbox
+    mov edx, [cg_dmg + 8]
+    cmp ecx, edx
+    jge .cog_done
+    sub edx, ecx
+    mov r9d, edx                              ; w
+    movsx edx, word [rax + 8]
+    add ecx, edx                              ; screen x
+    mov r8d, [cg_dmg + 12]
+    sub r8d, [cg_dmg + 4]                     ; h
+    movsx edx, word [rax + 10]
+    add edx, [cg_dmg + 4]                     ; screen y
+    mov eax, ecx
+    mov ecx, r9d
+    call damage_add
 .cog_done:
     add rsp, 16
     pop rbp
@@ -13808,6 +14467,16 @@ render_composite:
     test rax, rax
     jz .rc_done
     mov byte [comp_dirty], 1
+    movsx ecx, word [rbx + 28]                ; damage the composite dst rect
+    movsx edx, word [rbx + 30]
+    movsx r8d, word [rax + 8]
+    add ecx, r8d
+    movsx r8d, word [rax + 10]
+    add edx, r8d
+    mov eax, ecx
+    movzx ecx, word [rbx + 32]                ; width
+    movzx r8d, word [rbx + 34]                ; height
+    call damage_add
 .rc_done:
     mov qword [cur_clip], 0
     pop rbp
@@ -14091,6 +14760,23 @@ dump_handler:
     mov rsi, dbg_sp
     mov edx, 1
     call write_stderr
+    movsx eax, word [r12 + 8]                 ; x (s16 → may print huge for -1;
+    and eax, 0xFFFF                            ; print raw u16, decode client-side)
+    call write_u64_stderr
+    mov rsi, dbg_sp
+    mov edx, 1
+    call write_stderr
+    movsx eax, word [r12 + 10]                ; y
+    and eax, 0xFFFF
+    call write_u64_stderr
+    mov rsi, dbg_sp
+    mov edx, 1
+    call write_stderr
+    mov eax, [r12 + 48]                       ; stk
+    call write_u64_stderr
+    mov rsi, dbg_sp
+    mov edx, 1
+    call write_stderr
     pop rax                                   ; nonbg count
     call write_u64_stderr
     lea rsi, [probe_conn_nl]
@@ -14112,6 +14798,18 @@ dump_handler:
     mov edx, 1
     call write_stderr
     mov eax, [rs_counter]
+    call write_u64_stderr
+    lea rsi, [dbg_pxblit]
+    call write_str_stderr
+    mov rax, [comp_px_blit]
+    call write_u64_stderr
+    lea rsi, [dbg_pxfill]
+    call write_str_stderr
+    mov rax, [comp_px_fill]
+    call write_u64_stderr
+    lea rsi, [dbg_pxflush]
+    call write_str_stderr
+    mov rax, [comp_px_flush]
     call write_u64_stderr
     lea rsi, [probe_conn_nl]
     mov edx, 1
