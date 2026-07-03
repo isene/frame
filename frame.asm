@@ -227,6 +227,11 @@ DEFAULT REL
 %define XI_MAJOR             131
 %define XI_EVENT_BASE        91
 %define XI_ERROR_BASE        151
+; ---- XFIXES extension — clipboard MANAGERS (copyq) + Qt/Firefox use
+; XFixesSelectSelectionInput to be told when a selection owner changes.
+%define XFIXES_MAJOR         138
+%define XFIXES_EVENT_BASE    93          ; XFixesSelectionNotify = base+0
+%define XFIXES_ERROR_BASE    155
 %define X_RID_MASK           0x001FFFFF
 
 ; ============================================================================
@@ -251,6 +256,13 @@ SEL_MAX             equ 8
 sel_atoms:          resd SEL_MAX
 sel_owners:         resd SEL_MAX
 sel_count:          resd 1
+; XFIXES SelectSelectionInput subscriptions. Each: +0 slot (-1 = empty),
+; +4 selection atom, +8 window. Fires XFixesSelectionNotify to that client
+; when the selection's owner changes (SetSelectionOwner). This is how copyq
+; (Qt) tracks the system clipboard.
+XFIXES_SUB_MAX      equ 16
+xfixes_subs:        resb XFIXES_SUB_MAX * 12
+xfixes_sub_evbuf:   resb 32
 framerc_path:       resb 256               ; "$HOME/.framerc"
 framerc_buf:        resb 2048              ; ~/.framerc contents
 rc_remaps:          resb 16 * 28           ; staged `keycode` lines: keycode
@@ -717,7 +729,8 @@ log_render_min:     db "RENDER minor=", 0
 log_rr_minor:       db "  RANDR minor=", 0
 ; ListExtensions STR list: length byte + name, 39 bytes total (matches the
 ; QueryExtension set exactly — advertising one obligates serving it).
-ext_names:          db 6, "RENDER", 5, "RANDR", 9, "XKEYBOARD", 15, "XInputExtension"
+ext_names:          db 6, "RENDER", 5, "RANDR", 9, "XKEYBOARD", 15, "XInputExtension", 6, "XFIXES"
+ext_names_len       equ $ - ext_names       ; 46 bytes (5 STRs), padded to 48 in reply
 ; Keysym names for ~/.framerc `keycode` lines: db "name",0 + dd keysym;
 ; terminated by a lone 0 byte. Covers the user's ~/.Xmodmap vocabulary +
 ; the common specials; anything else via 0xHEX or a single char.
@@ -835,6 +848,7 @@ str_render:         db "RENDER"
 str_xkb:            db "XKEYBOARD"
 str_randr:          db "RANDR"
 str_xinput:         db "XInputExtension"
+str_xfixes:         db "XFIXES"
 str_xi_pointer:     db "Virtual core pointer"      ; 20 bytes
 str_xi_keyboard:    db "Virtual core keyboard"     ; 21 bytes
 str_rel_x:          db "Rel X"
@@ -3321,6 +3335,22 @@ client_cleanup_resources:
     jmp .ccr_sel
 .ccr_sel_done:
 
+    ; XFIXES selection-notify subscriptions held by this client.
+    lea eax, [r12d + 1]                       ; stored value = slot+1
+    xor ebx, ebx
+.ccr_xf:
+    cmp ebx, XFIXES_SUB_MAX
+    jge .ccr_xf_done
+    mov ecx, ebx
+    imul ecx, ecx, 12
+    cmp [xfixes_subs + rcx], eax
+    jne .ccr_xf_next
+    mov dword [xfixes_subs + rcx], 0
+.ccr_xf_next:
+    inc ebx
+    jmp .ccr_xf
+.ccr_xf_done:
+
     ; Key grabs registered by this client.
     xor ebx, ebx
 .ccr_kg:
@@ -4004,6 +4034,8 @@ dispatch_request:
     je .dr_randr
     cmp eax, XI_MAJOR
     je .dr_xinput
+    cmp eax, XFIXES_MAJOR
+    je .dr_xfixes
     ; Void no-ops — requests with no reply that frame can safely accept and
     ; ignore. Silences the log noise and, for toolkits that follow them with
     ; a blocking round-trip, keeps the stream healthy. 36/37 Grab/UngrabServer
@@ -4061,6 +4093,12 @@ dispatch_request:
     mov edi, ebx
     mov rsi, r12
     call handle_randr
+    jmp .dr_done
+
+.dr_xfixes:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_xfixes
     jmp .dr_done
 
 .dr_xinput:
@@ -4468,6 +4506,146 @@ handle_intern_atom:
 ;   +4 name-length (CARD16)   +8 name (string, padded to 4)
 ; We recognise "RENDER" and report it present with major opcode
 ; RENDER_MAJOR; everything else reports absent (present=0).
+; ============================================================================
+; handle_xfixes — edi = slot, rsi = req. XFIXES extension. Implements the
+; clipboard-manager path: QueryVersion (0) + SelectSelectionInput (2). All
+; other minors (regions, save-set, cursor) are void no-ops. GetCursorImage
+; (4) has a reply, but no clipboard flow uses it; add if something blocks.
+; ============================================================================
+handle_xfixes:
+    movzx eax, byte [rsi + 1]                ; XFIXES minor
+    test eax, eax
+    jz .xf_query_version
+    cmp eax, 2
+    je .xf_select_input
+    ret                                      ; void: regions / save-set / etc.
+
+.xf_query_version:
+    ; XFixesQueryVersion (0): reply major=5 minor=0. Clients accept >= 1.
+    mov esi, 32
+    call xkb_reply_zero                       ; edi=slot; rdi=buf r15d=fd r8d=total
+    mov byte [rdi + 1], 0
+    mov dword [rdi + 8], 5                    ; major_version
+    mov dword [rdi + 12], 0                   ; minor_version
+    mov edi, r15d
+    lea rsi, [reply_buf]
+    mov edx, r8d
+    mov eax, SYS_WRITE
+    syscall
+    ret
+
+.xf_select_input:
+    ; XFixesSelectSelectionInput (2): +4 window, +8 selection, +12 event-mask.
+    ; Record (slot, selection, window). mask == 0 removes the subscription.
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov ebx, edi                             ; slot
+    mov r13d, [rsi + 8]                       ; selection atom
+    mov r14d, [rsi + 4]                       ; window
+    mov r15d, [rsi + 12]                      ; event-mask
+    xor ecx, ecx                             ; index
+    mov r12d, -1                             ; first empty seen
+.xfsi_find:
+    cmp ecx, XFIXES_SUB_MAX
+    jge .xfsi_place
+    mov eax, ecx
+    imul eax, eax, 12
+    mov edx, [xfixes_subs + rax]             ; stored slot+1 (0 = empty)
+    test edx, edx
+    jz .xfsi_empty
+    dec edx
+    cmp edx, ebx
+    jne .xfsi_next
+    cmp [xfixes_subs + rax + 4], r13d        ; same selection?
+    jne .xfsi_next
+    mov r12d, ecx                            ; update existing entry
+    jmp .xfsi_store
+.xfsi_empty:
+    cmp r12d, -1
+    jne .xfsi_next
+    mov r12d, ecx                            ; remember first empty
+.xfsi_next:
+    inc ecx
+    jmp .xfsi_find
+.xfsi_place:
+    cmp r12d, -1
+    je .xfsi_done                            ; table full → drop
+.xfsi_store:
+    mov eax, r12d
+    imul eax, eax, 12
+    test r15d, r15d
+    jz .xfsi_clear                           ; mask 0 → deselect
+    lea edx, [ebx + 1]
+    mov [xfixes_subs + rax], edx             ; slot+1
+    mov [xfixes_subs + rax + 4], r13d        ; selection
+    mov [xfixes_subs + rax + 8], r14d        ; window
+    jmp .xfsi_done
+.xfsi_clear:
+    mov dword [xfixes_subs + rax], 0
+.xfsi_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; xfixes_emit_selection_notify — ecx = selection atom, edx = new owner window.
+; Sends XFixesSelectionNotify (subtype 0 = SetSelectionOwner) to every client
+; subscribed to that selection. This is what lets copyq notice the clipboard
+; changed and grab the new content into its history.
+; ----------------------------------------------------------------------------
+xfixes_emit_selection_notify:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r13d, ecx                            ; selection
+    mov r14d, edx                            ; owner
+    xor ebx, ebx
+.xen_loop:
+    cmp ebx, XFIXES_SUB_MAX
+    jge .xen_done
+    mov eax, ebx
+    imul eax, eax, 12
+    mov r12d, [xfixes_subs + rax]            ; slot+1
+    test r12d, r12d
+    jz .xen_next
+    cmp [xfixes_subs + rax + 4], r13d        ; this selection?
+    jne .xen_next
+    dec r12d                                 ; subscriber slot
+    mov ecx, [xfixes_subs + rax + 8]         ; subscriber window
+    lea rdi, [xfixes_sub_evbuf]
+    xor eax, eax
+    mov [rdi], rax
+    mov [rdi + 8], rax
+    mov [rdi + 16], rax
+    mov [rdi + 24], rax
+    mov byte [rdi], XFIXES_EVENT_BASE        ; type = XFixesSelectionNotify
+    mov byte [rdi + 1], 0                    ; subtype = SetSelectionOwner
+    mov [rdi + 4], ecx                       ; window
+    mov [rdi + 8], r14d                      ; owner
+    mov [rdi + 12], r13d                     ; selection
+    mov eax, [server_time_ms]
+    mov [rdi + 16], eax                      ; timestamp
+    mov [rdi + 20], eax                      ; selection_timestamp
+    mov edi, r12d                            ; slot
+    lea rsi, [xfixes_sub_evbuf]
+    call send_event_to_slot
+.xen_next:
+    inc ebx
+    jmp .xen_loop
+.xen_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 handle_query_extension:
     push rbx
     push r12
@@ -4501,7 +4679,7 @@ handle_query_extension:
 .qe_cmp_r:
     mov dl, [rsi]
     cmp dl, [rdi]
-    jne .qe_send
+    jne .qe_try_xfixes                       ; not RENDER — try XFIXES (also len 6)
     inc rsi
     inc rdi
     dec ecx
@@ -4511,6 +4689,24 @@ handle_query_extension:
     mov byte [rdi + 9], RENDER_MAJOR         ; major-opcode
     mov byte [rdi + 10], 0                   ; first-event
     mov byte [rdi + 11], RENDER_ERROR_BASE   ; first-error
+    jmp .qe_send
+.qe_try_xfixes:
+    lea rsi, [r13 + 8]
+    lea rdi, [str_xfixes]
+    mov ecx, 6
+.qe_cmp_xf:
+    mov dl, [rsi]
+    cmp dl, [rdi]
+    jne .qe_send
+    inc rsi
+    inc rdi
+    dec ecx
+    jnz .qe_cmp_xf
+    lea rdi, [reply_buf]
+    mov byte [rdi + 8], 1                    ; present = True
+    mov byte [rdi + 9], XFIXES_MAJOR
+    mov byte [rdi + 10], XFIXES_EVENT_BASE
+    mov byte [rdi + 11], XFIXES_ERROR_BASE
     jmp .qe_send
 .qe_try_xkb:
     cmp eax, 9
@@ -5993,27 +6189,27 @@ handle_list_extensions:
 
     lea rdi, [reply_buf]
     mov byte [rdi + 0], 1
-    mov byte [rdi + 1], 4                    ; nExtensions
+    mov byte [rdi + 1], 5                    ; nExtensions
     mov ecx, [r12 + 8]
     mov [rdi + 2], cx
-    mov dword [rdi + 4], 10                  ; 40 bytes of names (39 + 1 pad)
+    mov dword [rdi + 4], 12                  ; 48 bytes of names (46 + 2 pad)
     mov dword [rdi + 8], 0
     mov dword [rdi + 12], 0
     mov dword [rdi + 16], 0
     mov dword [rdi + 20], 0
     mov dword [rdi + 24], 0
     mov dword [rdi + 28], 0
-    ; STR list: length byte + name, 39 bytes total, from ext_names blob.
+    ; STR list: length byte + name, ext_names_len bytes, then pad to 48.
     lea rsi, [ext_names]
     lea rdi, [reply_buf + 32]
-    mov ecx, 39
+    mov ecx, ext_names_len
     rep movsb
-    mov byte [rdi], 0                        ; pad to 40
+    mov word [rdi], 0                        ; pad the tail
 
     mov edi, [r12]
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
-    mov rdx, 72
+    mov rdx, 80
     syscall
 
     pop r12
@@ -16266,6 +16462,9 @@ handle_set_selection_owner:
     inc dword [sel_count]
 .sso_set:
     mov [sel_owners + rdx*4], ebx
+    mov edx, ebx                             ; new owner → arg
+                                             ; ecx = selection (still) → arg
+    call xfixes_emit_selection_notify        ; tell XFIXES subscribers (copyq)
 .sso_done:
     pop rbx
     ret
