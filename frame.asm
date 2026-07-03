@@ -28,6 +28,22 @@ DEFAULT REL
 ; ---- Linux x86_64 syscalls -------------------------------------------------
 %define SYS_READ        0
 %define SYS_WRITE       1
+%define SYS_SENDTO      44
+%define MSG_DONTWAIT    0x40
+; EV_SEND — non-blocking event write: sendto(edi=fd, rsi=buf, rdx=len,
+; MSG_DONTWAIT). A client that stops draining its socket (a stalled GTK4
+; app) must NOT block the single-threaded server — its next event write
+; would otherwise hang the WHOLE server (frozen screen + dead input). On
+; would-block the event is simply DROPPED; events are lossy by nature, so
+; a missed motion/crossing is harmless and the client resyncs. Replies
+; stay blocking (request-driven; the client IS waiting on them).
+%macro EV_SEND 0
+    mov rax, SYS_SENDTO
+    mov r10d, MSG_DONTWAIT
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+%endmacro
 %define SYS_OPEN        2
 %define SYS_CLOSE       3
 %define SYS_LSEEK       8
@@ -3552,10 +3568,24 @@ serve_loop:
     mov rax, SYS_POLL
     lea rdi, [pollfd_buf]
     mov esi, MAX_CLIENTS + 1 + MAX_INPUTS + 1
-    mov edx, -1                              ; infinite timeout
-    syscall
-    test rax, rax
+    mov edx, -1                              ; infinite timeout when idle (no
+    cmp byte [flip_pending], 0               ; wakeups → battery). But while a
+    je .sl_poll_go                           ; PAGE_FLIP is in flight, cap at
+    mov edx, 100                             ; 100ms: a DRM completion event
+.sl_poll_go:                                 ; that never arrives (driver quirk
+    syscall                                  ; on a mode/plane change, etc.)
+    test rax, rax                            ; would otherwise wedge flip_pending
+    jz .sl_flip_lost                         ; forever = frozen black screen.
     js .sl_iter                              ; -EINTR or similar — re-poll
+    jmp .sl_poll_done
+.sl_flip_lost:
+    ; poll timed out with a flip still pending → assume the event was lost and
+    ; unstick the compositor. If the flip was merely slow, the next present
+    ; gets -EBUSY and .rs_no_swap handles it. Only reachable while flip_pending
+    ; is set (idle poll is infinite), so no idle cost.
+    mov byte [flip_pending], 0
+    jmp .sl_iter
+.sl_poll_done:
 
     ; --- Listen fd ready: accept all pending connections.
     movzx eax, word [pollfd_buf + 6]
@@ -10537,9 +10567,8 @@ send_pointer_event:
     mov byte [rsi + 30], 1                   ; same-screen
     mov byte [rsi + 31], 0
     mov edi, [rdi]                           ; client fd
-    mov rax, SYS_WRITE
     mov rdx, 32
-    syscall
+    EV_SEND
     pop r15
     pop r14
     pop r13
@@ -10767,9 +10796,8 @@ send_key_press:
     mov byte [rsi + 31], 0
 
     mov edi, [rdi]                            ; client fd
-    mov rax, SYS_WRITE
     mov rdx, 32
-    syscall
+    EV_SEND
     pop r14
     pop r13
     pop r12
@@ -10838,10 +10866,9 @@ send_xi2_to_slot:
     mov ecx, [rax + 8]                       ; seq
     mov [r13 + 2], cx
     pop rdx
-    mov rax, SYS_WRITE
     mov edi, ebx
     mov rsi, r13
-    syscall
+    EV_SEND
     pop r13
     pop r12
     pop rbx
@@ -10993,11 +11020,10 @@ send_event_to_slot:
     mov ebx, [rax]                            ; fd
     mov ecx, [rax + 8]                        ; seq
     mov [r13 + 2], cx                         ; patch into event[2..3]
-    mov rax, SYS_WRITE
     mov edi, ebx
     mov rsi, r13
     mov rdx, 32
-    syscall
+    EV_SEND
     pop r13
     pop r12
     pop rbx
@@ -14298,10 +14324,9 @@ handle_send_event:
     mov ecx, [r13 + 8]                       ; per-recipient seq stamp
     mov [reply_buf + 2], cx
     mov edi, [r13]
-    mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    EV_SEND
 .se_bc_next:
     inc r12d
     jmp .se_bc_loop
