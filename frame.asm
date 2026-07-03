@@ -12368,50 +12368,75 @@ recomposite_screen:
 ; local: stk-ordered walk blitting every mapped backed window, clipped to
 ; bw_clip. Preserves the caller's rbx/r12/r13.
 .rs_window_walk:
-    push rbx
-    push r12
-    push r13
-    mov dword [rs_last_stk], 0
-.rs_pass:
-    xor ebx, ebx                             ; slot
-    xor r12, r12                             ; chosen rec = none
-    mov dword [rs_min_stk], 0xFFFFFFFF
-.rs_find:
-    cmp ebx, MAX_WINDOWS
-    jge .rs_find_done
-    mov rax, rbx
+    ; Composite the window TREE, not a flat stk list: each window is drawn,
+    ; then its children on top, recursively (depth-first, siblings in stk
+    ; order). A flat stk sort drew a nested child UNDER its parent whenever
+    ; the parent's stk was higher (Firefox renders into a full-size child of
+    ; its toplevel; the blank toplevel had the higher stk and hid it).
+    mov edi, X_ROOT_WINDOW
+    call rs_composite_children
+    ret
+
+; ----------------------------------------------------------------------------
+; rs_composite_children — edi = parent xid. Blits every mapped child of
+; `parent` in ascending stk order, recursing into each so children draw on
+; top of parents (correct X stacking, and it honours the current dirty-rect
+; clip via blit_window). Recursion depth = window-tree depth (small). All
+; loop state is stack-local so recursion nests cleanly; blit_window preserves
+; the callee-saved regs used here.
+; ----------------------------------------------------------------------------
+rs_composite_children:
+    push rbx                                  ; parent xid
+    push r13                                  ; last stk drawn at THIS level
+    push r14                                  ; chosen record ptr
+    push r15                                  ; min stk this pass
+    mov ebx, edi
+    xor r13d, r13d                            ; 0 = none yet (real stk >= 1)
+.rcc_pass:
+    xor r14, r14                              ; chosen = none
+    mov r15d, 0xFFFFFFFF                       ; min stk this pass
+    xor ecx, ecx                              ; slot
+.rcc_find:
+    cmp ecx, MAX_WINDOWS
+    jge .rcc_find_done
+    mov rax, rcx
     imul rax, WINDOW_REC_SIZE
     lea rax, [windows + rax]
-    mov ecx, [rax]
-    test ecx, ecx
-    jz .rs_find_next
-    cmp ecx, X_ROOT_WINDOW
-    je .rs_find_next
+    mov edx, [rax]                            ; xid
+    test edx, edx
+    jz .rcc_next
+    cmp edx, X_ROOT_WINDOW
+    je .rcc_next
+    cmp [rax + 4], ebx                        ; child of THIS parent?
+    jne .rcc_next
     cmp byte [rax + 28], 0                    ; mapped?
-    je .rs_find_next
-    mov ecx, [rax + 48]                       ; stk
-    cmp ecx, [rs_last_stk]
-    jbe .rs_find_next                         ; already drawn this repaint
-    cmp ecx, [rs_min_stk]
-    jae .rs_find_next                         ; not the smallest still pending
-    mov [rs_min_stk], ecx
-    mov r12, rax
-.rs_find_next:
-    inc ebx
-    jmp .rs_find
-.rs_find_done:
-    test r12, r12
-    jz .rs_walk_done
-    mov ecx, [rs_min_stk]
-    mov [rs_last_stk], ecx
-    cmp byte [r12 + 31], 0                    ; skip windows with no content
-    je .rs_pass
-    mov rdi, r12
+    je .rcc_next
+    mov edx, [rax + 48]                       ; stk
+    cmp edx, r13d
+    jbe .rcc_next                             ; already drawn at this level
+    cmp edx, r15d
+    jae .rcc_next                             ; not the smallest still pending
+    mov r15d, edx
+    mov r14, rax
+.rcc_next:
+    inc ecx
+    jmp .rcc_find
+.rcc_find_done:
+    test r14, r14
+    jz .rcc_done
+    mov r13d, r15d                            ; advance last-drawn stk
+    cmp byte [r14 + 31], 0                    ; has backing? blit it (a backless
+    je .rcc_recurse                          ; container still needs its kids)
+    mov rdi, r14
     call blit_window
-    jmp .rs_pass
-.rs_walk_done:
+.rcc_recurse:
+    mov edi, [r14]                            ; recurse into this child's subtree
+    call rs_composite_children
+    jmp .rcc_pass
+.rcc_done:
+    pop r15
+    pop r14
     pop r13
-    pop r12
     pop rbx
     ret
 
