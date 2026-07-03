@@ -236,7 +236,10 @@ sel_atoms:          resd SEL_MAX
 sel_owners:         resd SEL_MAX
 sel_count:          resd 1
 framerc_path:       resb 256               ; "$HOME/.framerc"
-framerc_buf:        resb 512               ; ~/.framerc contents
+framerc_buf:        resb 2048              ; ~/.framerc contents
+rc_remaps:          resb 16 * 28           ; staged `keycode` lines: keycode
+                                           ; dword + 6 keysym dwords each
+rc_remap_count:     resd 1
 
 ; ---- Phase 4 multi-client state -------------------------------------------
 ; clients_meta[16] — one 16-byte slot per concurrent client.
@@ -696,6 +699,80 @@ log_rr_minor:       db "  RANDR minor=", 0
 ; ListExtensions STR list: length byte + name, 39 bytes total (matches the
 ; QueryExtension set exactly — advertising one obligates serving it).
 ext_names:          db 6, "RENDER", 5, "RANDR", 9, "XKEYBOARD", 15, "XInputExtension"
+; Keysym names for ~/.framerc `keycode` lines: db "name",0 + dd keysym;
+; terminated by a lone 0 byte. Covers the user's ~/.Xmodmap vocabulary +
+; the common specials; anything else via 0xHEX or a single char.
+ks_names:
+    db "Escape", 0
+    dd 0xFF1B
+    db "F1", 0
+    dd 0xFFBE
+    db "F2", 0
+    dd 0xFFBF
+    db "F3", 0
+    dd 0xFFC0
+    db "F4", 0
+    dd 0xFFC1
+    db "F5", 0
+    dd 0xFFC2
+    db "F6", 0
+    dd 0xFFC3
+    db "F7", 0
+    dd 0xFFC4
+    db "F8", 0
+    dd 0xFFC5
+    db "F9", 0
+    dd 0xFFC6
+    db "F10", 0
+    dd 0xFFC7
+    db "F11", 0
+    dd 0xFFC8
+    db "F12", 0
+    dd 0xFFC9
+    db "Return", 0
+    dd 0xFF0D
+    db "Tab", 0
+    dd 0xFF09
+    db "BackSpace", 0
+    dd 0xFF08
+    db "space", 0
+    dd 0x0020
+    db "Delete", 0
+    dd 0xFFFF
+    db "Insert", 0
+    dd 0xFF63
+    db "Home", 0
+    dd 0xFF50
+    db "End", 0
+    dd 0xFF57
+    db "Prior", 0
+    dd 0xFF55
+    db "Next", 0
+    dd 0xFF56
+    db "Up", 0
+    dd 0xFF52
+    db "Down", 0
+    dd 0xFF54
+    db "Left", 0
+    dd 0xFF51
+    db "Right", 0
+    dd 0xFF53
+    db "Caps_Lock", 0
+    dd 0xFFE5
+    db "asciitilde", 0
+    dd 0x007E
+    db "asciicircum", 0
+    dd 0x005E
+    db "dead_diaeresis", 0
+    dd 0xFE57
+    db "dead_caron", 0
+    dd 0xFE5A
+    db "Pointer_Button2", 0
+    dd 0xFEE9
+    db "Pointer_Button3", 0
+    dd 0xFEEA
+    db 0
+
 ; XI1 ListInputDevices payload: 2 DeviceInfo (type Atom=None, id, nclasses=0,
 ; use IsXPointer/IsXKeyboard, pad) + 2 STR names + 1 pad byte = 60 bytes.
 xi1_core_devs:      db 0,0,0,0, 2, 0, 0, 0
@@ -3056,6 +3133,13 @@ client_cleanup_resources:
     jne .ccr_grab_ok
     mov dword [ptr_grab_win], 0
 .ccr_grab_ok:
+    ; Keyboard grab held by the dying client → release (a crashed rofi
+    ; must not wedge the keyboard).
+    cmp [active_kbd_slot], r12d
+    jne .ccr_kbd_ok
+    mov dword [active_kbd_slot], -1
+    mov dword [active_kbd_window], 0
+.ccr_kbd_ok:
     ; Focus on a dying window → revert to PointerRoot.
     mov eax, [focus_window]
     cmp eax, r13d
@@ -8016,7 +8100,7 @@ read_framerc:
     mov rax, SYS_READ
     mov rdi, rbx
     lea rsi, [framerc_buf]
-    mov edx, 511
+    mov edx, 2047
     syscall
     push rax
     mov rax, SYS_CLOSE
@@ -8103,10 +8187,10 @@ parse_framerc:
     ; keymap = no ?
     mov eax, [rsi]
     cmp eax, 'keym'
-    jne .pf_chk_sens
+    jne .pf_chk_keycode
     mov ax, [rsi + 4]
     cmp ax, 'ap'
-    jne .pf_chk_sens
+    jne .pf_chk_keycode
     call pf_to_value
     cmp byte [rsi], 'n'
     jne .pf_next_line
@@ -8114,6 +8198,87 @@ parse_framerc:
     jne .pf_next_line
     mov byte [keymap_is_no], 1
     jmp .pf_next_line
+.pf_chk_keycode:
+    ; keycode N = SYM [SYM ...]   (xmodmap-mirror syntax, max 16 lines,
+    ; max 6 syms; names, single chars, or 0xHEX)
+    mov eax, [rsi]
+    cmp eax, 'keyc'
+    jne .pf_chk_sens
+    push rbx
+    push r12
+    push r13
+    call pf_to_value                          ; skip "keycode" + ws → digits
+    call pf_parse_dec                         ; eax = X keycode
+    cmp eax, X_MIN_KEYCODE
+    jb .pf_kc_bad
+    cmp eax, 255
+    ja .pf_kc_bad
+    mov ecx, [rc_remap_count]
+    cmp ecx, 16
+    jge .pf_kc_bad
+    imul edx, ecx, 28
+    lea rbx, [rc_remaps + rdx]                ; staging entry
+    mov [rbx], eax
+    xor eax, eax
+    mov [rbx + 4], eax
+    mov [rbx + 8], eax
+    mov [rbx + 12], eax
+    mov [rbx + 16], eax
+    mov [rbx + 20], eax
+    mov [rbx + 24], eax
+    call pf_to_value                          ; skip ws + '=' → first token
+    xor r12d, r12d                            ; sym column
+.pf_kc_tok:
+    cmp r12d, 6
+    jge .pf_kc_commit
+.pf_kc_tok_ws:
+    mov al, [rsi]
+    cmp al, ' '
+    je .pf_kc_tok_adv
+    cmp al, 9
+    je .pf_kc_tok_adv
+    jmp .pf_kc_tok_start
+.pf_kc_tok_adv:
+    inc rsi
+    jmp .pf_kc_tok_ws
+.pf_kc_tok_start:
+    test al, al
+    jz .pf_kc_commit
+    cmp al, 10
+    je .pf_kc_commit
+    cmp al, '#'
+    je .pf_kc_commit
+    mov r13, rsi                              ; token start
+.pf_kc_tok_end:
+    mov al, [rsi]
+    test al, al
+    jz .pf_kc_resolve
+    cmp al, 10
+    je .pf_kc_resolve
+    cmp al, ' '
+    je .pf_kc_resolve
+    cmp al, 9
+    je .pf_kc_resolve
+    inc rsi
+    jmp .pf_kc_tok_end
+.pf_kc_resolve:
+    mov rcx, rsi
+    sub rcx, r13                              ; token length
+    push rsi
+    mov rsi, r13
+    call pf_resolve_keysym                    ; eax = keysym (0 unknown)
+    pop rsi
+    mov [rbx + 4 + r12*4], eax
+    inc r12d
+    jmp .pf_kc_tok
+.pf_kc_commit:
+    inc dword [rc_remap_count]
+.pf_kc_bad:
+    pop r13
+    pop r12
+    pop rbx
+    jmp .pf_next_line
+
 .pf_chk_sens:
     ; sensitivity = N ?
     mov eax, [rsi]
@@ -8184,6 +8349,66 @@ pf_to_value:
 .ptv_adv:
     inc rsi
     jmp .ptv_sep
+
+; pf_resolve_keysym — rsi = token start, rcx = length. Returns eax = keysym,
+; 0 if unrecognized. Accepts: a name from ks_names, a single Latin-1 char
+; (keysym == codepoint), or 0xHEX.
+pf_resolve_keysym:
+    push rbx
+    push r12
+    push r13
+    mov r12, rsi
+    mov r13, rcx
+    cmp rcx, 1
+    jne .prk_hex
+    movzx eax, byte [rsi]                    ; single char → Latin-1 keysym
+    jmp .prk_ret
+.prk_hex:
+    cmp rcx, 2
+    jbe .prk_names
+    cmp word [rsi], '0x'
+    jne .prk_names
+    add rsi, 2
+    call pf_parse_hex
+    jmp .prk_ret
+.prk_names:
+    lea rbx, [ks_names]
+.prk_scan:
+    cmp byte [rbx], 0                        ; table end
+    je .prk_miss
+    ; strlen of table name
+    xor ecx, ecx
+.prk_len:
+    cmp byte [rbx + rcx], 0
+    je .prk_cmp
+    inc ecx
+    jmp .prk_len
+.prk_cmp:
+    cmp rcx, r13
+    jne .prk_skip
+    ; compare bytes
+    xor edx, edx
+.prk_cmpb:
+    cmp edx, ecx
+    je .prk_hit
+    mov al, [rbx + rdx]
+    cmp al, [r12 + rdx]
+    jne .prk_skip
+    inc edx
+    jmp .prk_cmpb
+.prk_hit:
+    mov eax, [rbx + rcx + 1]                 ; keysym after NUL
+    jmp .prk_ret
+.prk_skip:
+    lea rbx, [rbx + rcx + 5]                 ; name + NUL + dd
+    jmp .prk_scan
+.prk_miss:
+    xor eax, eax
+.prk_ret:
+    pop r13
+    pop r12
+    pop rbx
+    ret
 
 ; pf_parse_dec — rsi at first digit; eax = decimal value, rsi advanced past it.
 pf_parse_dec:
@@ -8480,7 +8705,7 @@ init_keysyms:
     KS 59, ',', '<'
     KS 60, '.', '>'
     KS 61, '/', '?'
-    ret
+    jmp .iks_remaps
 .iks_no:
     ; Norwegian (ISO). Latin-1 keysyms equal their codepoints.
     KS 10, '1', '!'
@@ -8517,6 +8742,38 @@ init_keysyms:
     KSA 20, '\', 0             ; AltGr++  = backslash
     KSA 26, 0x20AC, 0          ; AltGr+e  = €
     KSA 35, '~', 0             ; AltGr+¨  = tilde
+.iks_remaps:
+    ; Apply ~/.framerc `keycode N = SYM [SYM...]` remaps (staged by
+    ; parse_framerc, which runs before this table is built). Native
+    ; equivalent of the user's ~/.Xmodmap — e.g. keycode 9 = F12 puts
+    ; rofi on the physical Esc key. Each line replaces the keycode's
+    ; whole 6-column row (unlisted levels become NoSymbol), matching
+    ; xmodmap semantics.
+    xor ecx, ecx
+.iksr_loop:
+    cmp ecx, [rc_remap_count]
+    jge .iksr_done
+    imul eax, ecx, 28
+    lea rsi, [rc_remaps + rax]
+    mov eax, [rsi]                           ; keycode
+    sub eax, X_MIN_KEYCODE
+    imul eax, eax, 24
+    lea rdi, [keysym_table + rax]
+    mov eax, [rsi + 4]
+    mov [rdi + 0], eax
+    mov eax, [rsi + 8]
+    mov [rdi + 4], eax
+    mov eax, [rsi + 12]
+    mov [rdi + 8], eax
+    mov eax, [rsi + 16]
+    mov [rdi + 12], eax
+    mov eax, [rsi + 20]
+    mov [rdi + 16], eax
+    mov eax, [rsi + 24]
+    mov [rdi + 20], eax
+    inc ecx
+    jmp .iksr_loop
+.iksr_done:
     ret
 
 ; ----------------------------------------------------------------------------
@@ -8990,7 +9247,12 @@ dispatch_input_event:
     cmp r13d, 1
     jne .die_focus_press
 
-    ; Fresh press: a matching key-grab wins (WM hotkeys); else focus.
+    ; Fresh press: an ACTIVE keyboard grab overrides passive WM hotkey
+    ; grabs (X semantics) — while rofi holds the keyboard, Mod4 combos go
+    ; to rofi, not tile. deliver_to_focus routes to the grab holder.
+    cmp dword [active_kbd_slot], 0
+    jge .die_focus_press
+    ; ...else a matching passive key-grab wins (WM hotkeys); else focus.
     mov edi, r12d
     movzx esi, byte [mod_state]
     call find_key_grab
@@ -9690,11 +9952,10 @@ grab_pointer_target:
     mov ecx, [rax]                            ; deepest xid → slot
     sub ecx, X_RID_BASE
     shr ecx, 21
-    mov edx, [ptr_grab_win]                   ; grab xid → slot
-    sub edx, X_RID_BASE
-    shr edx, 21
-    cmp ecx, edx                              ; same client?
-    jne .gpt_grab
+    cmp ecx, [ptr_grab_slot]                  ; the GRABBING CLIENT's slot —
+    jne .gpt_grab                             ; NOT the grab window's XID band
+                                              ; (garbage when grabbing on root,
+                                              ; which is what rofi does)
     pop rbx
     ret                                       ; rax = deepest (owner-events)
 .gpt_grab:
@@ -9914,7 +10175,8 @@ deliver_pointer_motion:
     sub r8d, [wapd_abs_x]                    ; event-x (absolute-aware)
     mov r9d, [cursor_y]
     sub r9d, [wapd_abs_y]                    ; event-y
-    jmp .dpm_emit
+    mov eax, [ptr_grab_slot]                 ; grabs deliver to the GRABBING
+    jmp .dpm_emit_slot                       ; client (window may be root)
 .dpm_point:
     call window_at_point
     test rax, rax
@@ -9935,6 +10197,7 @@ deliver_pointer_motion:
     jb .dpm_done
     sub eax, X_RID_BASE
     shr eax, 21
+.dpm_emit_slot:
     cmp eax, MAX_CLIENTS
     jae .dpm_done
     push r8
@@ -9981,7 +10244,8 @@ deliver_pointer_button:
     sub r8d, [wapd_abs_x]                    ; event-x (absolute-aware)
     mov r9d, [cursor_y]
     sub r9d, [wapd_abs_y]                    ; event-y
-    jmp .dpb_emit
+    mov eax, [ptr_grab_slot]                 ; grabs deliver to the GRABBING
+    jmp .dpb_emit_slot                       ; client (window may be root)
 .dpb_point:
     call window_at_point
     test rax, rax
@@ -10006,6 +10270,7 @@ deliver_pointer_button:
     jb .dpb_done
     sub eax, X_RID_BASE
     shr eax, 21
+.dpb_emit_slot:
     cmp eax, MAX_CLIENTS
     jae .dpb_done
     push r8
@@ -10128,6 +10393,20 @@ deliver_to_focus:
     push r13
     mov r12d, esi                            ; keycode
     mov r13d, r8d                            ; event code
+    ; An ACTIVE keyboard grab (XGrabKeyboard — rofi, GTK menus) takes every
+    ; key event, press AND release, overriding focus. Without this route
+    ; rofi showed but no typed key ever reached it.
+    mov eax, [active_kbd_slot]
+    test eax, eax
+    js .dtf_nograb
+    mov edi, eax
+    mov esi, r12d
+    movzx ecx, byte [mod_state]
+    mov edx, [active_kbd_window]
+    mov r8d, r13d
+    call send_key_press
+    jmp .dtf_done
+.dtf_nograb:
     ; Pick the target window.
     mov eax, [focus_window]
     cmp eax, 1                               ; 0=None, 1=PointerRoot
