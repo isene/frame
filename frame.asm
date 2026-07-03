@@ -250,6 +250,12 @@ mouse_sens:         resd 1                 ; pointer sensitivity %, ~/.framerc (
 cursor_rgb:         resd 1                 ; cursor fill colour 0xRRGGBB (def white)
 cursor_transp:      resd 1                 ; cursor % transparent (def 50)
 cursor_argb:        resd 1                 ; computed premultiplied interior pixel
+; ~/.framerc `background = <path>`: a pre-decoded BGRX buffer at panel
+; resolution (screen_w*screen_h*4). frame blits it as the compositor
+; background instead of the solid COMP_BG_COLOR. No image decoder in the
+; server — a helper (frame-bg) resizes any image to raw ONCE, offline.
+wallpaper_ptr:      resq 1                 ; ptr into wallpaper_buf, or 0 = solid bg
+wallpaper_path:     resb 256               ; the raw file path from framerc
 ; Selection ownership (SetSelectionOwner / GetSelectionOwner). Small table;
 ; the system tray needs strip to OWN _NET_SYSTEM_TRAY_S0 and apps to find it.
 SEL_MAX             equ 8
@@ -265,6 +271,8 @@ xfixes_subs:        resb XFIXES_SUB_MAX * 12
 xfixes_sub_evbuf:   resb 32
 framerc_path:       resb 256               ; "$HOME/.framerc"
 framerc_buf:        resb 2048              ; ~/.framerc contents
+WALL_MAX            equ 1920*1200*4        ; max backing for the wallpaper (panel res)
+wallpaper_buf:      resb WALL_MAX          ; the raw BGRX pixels, read from the file once
 rc_remaps:          resb 16 * 28           ; staged `keycode` lines: keycode
                                            ; dword + 6 keysym dwords each
 rc_remap_count:     resd 1
@@ -1346,6 +1354,10 @@ _start:
     call init_fbtest
 .main_fbtest_done:
     call read_framerc                        ; ~/.framerc → keymap_is_no
+    cmp byte [fbtest_mode], 0                 ; fbtest: dims already set by init_fbtest,
+    je .wp_not_fbtest                         ; so load the wallpaper now (--display
+    call load_wallpaper                       ; loads later, after init_compositor)
+.wp_not_fbtest:
     call init_keysyms
     call init_input
     ; --testinput PATH: append the FIFO to the input fd set. Opened O_RDWR
@@ -1370,6 +1382,7 @@ _start:
     cmp byte [compositor_requested], 0
     je .skip_compositor
     call init_compositor
+    call load_wallpaper                       ; ~/.framerc background → wallpaper_ptr
 .skip_compositor:
     jmp serve_loop
 
@@ -8700,7 +8713,7 @@ parse_framerc:
     ; cursor_color = RRGGBB  /  cursor_transparency = N
     mov eax, [rsi]
     cmp eax, 'curs'
-    jne .pf_next_line
+    jne .pf_chk_bg
     mov al, [rsi + 7]                          ; cursor_[c]olor / [t]ransparency
     cmp al, 'c'
     je .pf_cur_color
@@ -8714,6 +8727,46 @@ parse_framerc:
     call pf_to_value
     call pf_parse_hex
     mov [cursor_rgb], eax
+    jmp .pf_next_line
+.pf_chk_bg:
+    ; background = <path to raw BGRX file>
+    mov eax, [rsi]
+    cmp eax, 'back'
+    jne .pf_next_line
+    mov eax, [rsi + 4]
+    cmp eax, 'grou'
+    jne .pf_next_line
+    call pf_to_value                          ; rsi → value (path) start
+    lea rdi, [wallpaper_path]
+    xor ecx, ecx
+.pf_bg_copy:
+    mov al, [rsi]
+    test al, al
+    jz .pf_bg_end
+    cmp al, 10                                ; newline ends the value
+    je .pf_bg_end
+    cmp al, 13
+    je .pf_bg_end
+    mov [rdi + rcx], al
+    inc rsi
+    inc ecx
+    cmp ecx, 255
+    jb .pf_bg_copy
+.pf_bg_end:
+    ; strip trailing spaces/tabs off the path
+.pf_bg_trim:
+    test ecx, ecx
+    jz .pf_bg_term
+    mov al, [rdi + rcx - 1]
+    cmp al, ' '
+    je .pf_bg_dec
+    cmp al, 9
+    jne .pf_bg_term
+.pf_bg_dec:
+    dec ecx
+    jmp .pf_bg_trim
+.pf_bg_term:
+    mov byte [rdi + rcx], 0
     jmp .pf_next_line
 .pf_next_line:
     mov al, [rsi]
@@ -12422,8 +12475,7 @@ recomposite_screen:
     mov esi, edx                              ; y
     mov edi, ecx                              ; w
     mov ecx, r8d                              ; h
-    mov edx, COMP_BG_COLOR
-    call draw_rect
+    call bg_fill_rect                         ; wallpaper (or solid) for this rect
     call .rs_window_walk
     add rbx, 16
     dec r13d
@@ -12477,11 +12529,11 @@ recomposite_screen:
     mov [bw_clip_x2], eax
     movzx eax, word [drm_modes_buf + 14]
     mov [bw_clip_y2], eax
-    mov rdi, [drm_dumb_addr]
-    mov rcx, [drm_dumb_size]
-    shr rcx, 2
-    mov eax, COMP_BG_COLOR
-    rep stosd
+    xor eax, eax                              ; whole-screen bg (wallpaper/solid)
+    xor esi, esi
+    movzx edi, word [drm_modes_buf + 4]
+    movzx ecx, word [drm_modes_buf + 14]
+    call bg_fill_rect
     mov rax, [drm_dumb_size]
     shr rax, 2
     add [comp_px_fill], rax                   ; PERF counter
@@ -12740,6 +12792,164 @@ draw_rect:
     jmp .dr_row
 
 .dr_done:
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; load_wallpaper — if ~/.framerc set `background = <raw>`, read the raw BGRX
+; file (screen_w*screen_h*4 bytes) into wallpaper_buf and point wallpaper_ptr
+; at it. Any failure (no path, can't open, wrong size, too big) leaves
+; wallpaper_ptr = 0 → the compositor falls back to the solid COMP_BG_COLOR.
+; Called once at startup, after init_compositor has set screen_w/screen_h.
+; ----------------------------------------------------------------------------
+load_wallpaper:
+    mov qword [wallpaper_ptr], 0
+    cmp byte [wallpaper_path], 0
+    je .lw_ret                                ; no background configured
+    push rbx
+    push r12
+    push r13
+    ; expected = screen_w * screen_h * 4, and it must fit wallpaper_buf
+    mov eax, [screen_w]
+    imul eax, [screen_h]
+    cmp eax, WALL_MAX / 4
+    ja .lw_close_none                         ; panel bigger than our buffer
+    shl eax, 2
+    mov r12d, eax                             ; r12 = expected bytes
+    mov rax, SYS_OPEN
+    lea rdi, [wallpaper_path]
+    xor esi, esi                              ; O_RDONLY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .lw_none                               ; can't open → solid bg
+    mov r13d, eax                             ; r13 = fd
+    xor ebx, ebx                              ; bytes read so far
+.lw_read:
+    mov edx, r12d
+    sub edx, ebx                              ; remaining
+    jz .lw_full                               ; got the whole image
+    mov rax, SYS_READ
+    mov edi, r13d
+    lea rsi, [wallpaper_buf + rbx]
+    syscall
+    test rax, rax
+    jle .lw_close_none                        ; EOF/short/error → wrong size
+    add ebx, eax
+    jmp .lw_read
+.lw_full:
+    mov rax, SYS_CLOSE
+    mov edi, r13d
+    syscall
+    lea rax, [wallpaper_buf]
+    mov [wallpaper_ptr], rax                  ; success
+    jmp .lw_pop
+.lw_close_none:
+    mov rax, SYS_CLOSE
+    mov edi, r13d
+    syscall
+.lw_none:
+    mov qword [wallpaper_ptr], 0
+.lw_pop:
+    pop r13
+    pop r12
+    pop rbx
+.lw_ret:
+    ret
+
+; ----------------------------------------------------------------------------
+; bg_fill_rect — paint the background of one rect (eax=x, esi=y, edi=w,
+; ecx=h). With no wallpaper it is exactly draw_rect(COMP_BG_COLOR). With a
+; wallpaper loaded it copies the matching sub-region from wallpaper_buf, so a
+; moved/closed window exposes the image (not a solid trail). Same screen
+; clipping as draw_rect. wallpaper stride = screen_w*4 (raw is tightly packed).
+; ----------------------------------------------------------------------------
+bg_fill_rect:
+    cmp qword [wallpaper_ptr], 0
+    jne .bfr_wall
+    mov edx, COMP_BG_COLOR
+    jmp draw_rect                             ; tail-call: solid fill + return
+.bfr_wall:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    movzx r12d, word [drm_modes_buf + 4]      ; screen w
+    movzx r13d, word [drm_modes_buf + 14]     ; screen h
+    ; --- clip x / w ---
+    test eax, eax
+    jns .bfr_x_ok
+    add edi, eax
+    xor eax, eax
+.bfr_x_ok:
+    cmp eax, r12d
+    jge .bfr_done
+    mov edx, eax
+    add edx, edi
+    cmp edx, r12d
+    jbe .bfr_w_ok
+    mov edi, r12d
+    sub edi, eax
+.bfr_w_ok:
+    cmp edi, 0
+    jle .bfr_done
+    ; --- clip y / h ---
+    test esi, esi
+    jns .bfr_y_ok
+    add ecx, esi
+    xor esi, esi
+.bfr_y_ok:
+    cmp esi, r13d
+    jge .bfr_done
+    mov edx, esi
+    add edx, ecx
+    cmp edx, r13d
+    jbe .bfr_h_ok
+    mov ecx, r13d
+    sub ecx, esi
+.bfr_h_ok:
+    cmp ecx, 0
+    jle .bfr_done
+    ; --- latch: rbx=x, r12=y, r13=w, r14=rows, rbp=wall stride ---
+    mov ebx, eax
+    mov r12d, esi
+    mov r13d, edi
+    mov r14d, ecx
+    mov r15, [drm_dumb_addr]
+    mov ebp, [screen_w]
+    shl ebp, 2                                ; wallpaper stride = screen_w*4
+.bfr_row:
+    test r14d, r14d
+    jz .bfr_done
+    ; dest = drm_dumb_addr + y*drm_pitch + x*4
+    mov rdi, r15
+    mov eax, r12d
+    imul eax, [drm_dumb_pitch]
+    add rdi, rax
+    mov eax, ebx
+    shl eax, 2
+    add rdi, rax
+    ; src = wallpaper_ptr + y*stride + x*4
+    mov rsi, [wallpaper_ptr]
+    mov eax, r12d
+    imul eax, ebp
+    add rsi, rax
+    mov eax, ebx
+    shl eax, 2
+    add rsi, rax
+    mov ecx, r13d
+    rep movsd
+    inc r12d
+    dec r14d
+    jmp .bfr_row
+.bfr_done:
     pop rbp
     pop r15
     pop r14
