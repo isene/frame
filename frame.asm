@@ -1306,6 +1306,25 @@ _start:
     call init_pictures
     call init_properties
     call install_dump_handler
+    ; Ignore SIGPIPE ALWAYS (both --display and --fbtest / network-only). A
+    ; client closing its connection means frame's next write to that socket
+    ; raises SIGPIPE, whose DEFAULT action TERMINATES the server — on the
+    ; panel that drops DRM master → black screen + frozen cursor. This was
+    ; THE crash on closing a GTK dialog (frame writes a trailing event/reply
+    ; to the just-closed socket; v0.0.79's XI2 crossings/motion made it near-
+    ; certain). SIG_IGN → the write returns -EPIPE instead; event writes
+    ; ignore it and the dead client is reaped on its next read()=0.
+    lea rdi, [sig_sa_buf]
+    mov qword [rdi + 0], 1                    ; sa_handler = SIG_IGN
+    mov qword [rdi + 8], 0                    ; sa_flags = 0
+    mov qword [rdi + 16], 0                   ; sa_restorer
+    mov qword [rdi + 24], 0                   ; sa_mask
+    mov rax, SYS_RT_SIGACTION
+    mov edi, 13                               ; SIGPIPE
+    lea rsi, [sig_sa_buf]
+    xor edx, edx
+    mov r10, 8
+    syscall
     cmp byte [fbtest_mode], 0
     jne .main_fbtest_init
     jmp .main_fbtest_done
@@ -9873,8 +9892,7 @@ send_expose:
     mov [rsi + 14], ax                        ; height (+16 count stays 0)
     mov edi, [rbx]                            ; fd
     mov edx, 32
-    mov rax, SYS_WRITE
-    syscall
+    EV_SEND                                    ; non-blocking (see EV_SEND macro)
     pop r15
     pop r14
     pop r13
