@@ -517,6 +517,9 @@ ptr_grab_slot:      resd 1               ; client slot holding the grab — need
                                          ; release grabs on windows OUTSIDE the
                                          ; grabber's XID band (e.g. root) when the
                                          ; grabbing client dies
+ptr_grab_xi2:       resb 1               ; grab came from XIGrabDevice → deliver
+kbd_grab_xi2:       resb 1               ; XI2 events to the grabber (GTK menus)
+xi2_buf:            resb 96              ; XI2 GenericEvent build buffer (84 max)
 wapd_abs_x:         resd 1               ; window_at_point_deep: abs origin of the
 wapd_abs_y:         resd 1               ; deepest window under the cursor
 wapd_cur_parent:    resd 1               ; descent cursor: current parent xid
@@ -5234,7 +5237,17 @@ handle_xinput:
     je .xi_query_version
     cmp eax, 48                              ; XIQueryDevice
     je .xi_query_device
-    cmp eax, 46                              ; XISelectEvents (void, no reply)
+    cmp eax, 46                              ; XISelectEvents
+    je .xi_select_events
+    cmp eax, 51                              ; XIGrabDevice (GTK menus)
+    je .xi_grab_device
+    cmp eax, 52                              ; XIUngrabDevice
+    je .xi_ungrab_device
+    cmp eax, 49                              ; XISetFocus (void-ish, no reply)
+    je .xi_noop
+    cmp eax, 50                              ; XIGetFocus
+    je .xi_get_focus
+    cmp eax, 53                              ; XIAllowEvents (no reply)
     je .xi_noop
     cmp eax, 56                              ; XIListProperties → empty
     je .xi_empty_reply
@@ -5263,6 +5276,131 @@ handle_xinput:
     mov word [rdi + 8], 2                     ; major_version = 2
     mov word [rdi + 10], 0                    ; minor_version = 0
     mov byte [rdi + 12], 1                    ; present = True
+    jmp .xi_write
+
+.xi_select_events:
+    ; XISelectEvents (46, void): +4 window, +8 num_masks u16, then per entry
+    ; deviceid(2) mask_len(2) mask words. frame keeps ONE XI mask per window
+    ; (union over devices/calls) in record +52; evtypes 0..31 fit word 0.
+    ; This is how GTK/GDK subscribe to input — delivery checks it first.
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, rsi
+    mov edi, [rbx + 4]
+    call window_lookup
+    test rax, rax
+    jz .xise_done
+    mov r13, rax
+    ; Request end from the length field — the walk MUST NOT trust num_masks /
+    ; mask_len past this (a malformed request could otherwise march rsi off
+    ; the client buffer → SIGSEGV, or OR the next request's bytes into +52).
+    movzx r14d, word [rbx + 2]
+    lea r14, [rbx + r14*4]                    ; reqend
+    ; Replace semantics: this request's union REPLACES the window's XI2 mask
+    ; (so mask_len=0 deselects; X11 is replace-per-window, not accumulate).
+    mov dword [r13 + 52], 0
+    movzx r12d, word [rbx + 8]               ; num_masks
+    lea rsi, [rbx + 12]
+.xise_entry:
+    test r12d, r12d
+    jz .xise_done
+    lea rax, [rsi + 4]
+    cmp rax, r14                              ; header word in bounds?
+    ja .xise_done
+    movzx ecx, word [rsi + 2]                ; mask_len (words)
+    test ecx, ecx
+    jz .xise_next
+    lea rax, [rsi + 4 + rcx*4]
+    cmp rax, r14                              ; mask body in bounds?
+    ja .xise_done
+    mov eax, [rsi + 4]                       ; mask word 0
+    or [r13 + 52], eax
+.xise_next:
+    lea rsi, [rsi + 4 + rcx*4]
+    dec r12d
+    jmp .xise_entry
+.xise_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.xi_grab_device:
+    ; XIGrabDevice (51): +4 window, +8 time, +12 cursor, +16 deviceid u16,
+    ; +18 mode, +19 paired-mode, +20 owner-events, +22 mask_len. Maps onto
+    ; the core grab state; the xi2 flag makes grab deliveries GenericEvents.
+    ; deviceid 2 / 1 (AllMaster) / 0 (All) grabs the pointer; 3 the keyboard.
+    push rbx
+    push r12
+    mov ebx, edi
+    mov r12, rsi
+    movzx eax, word [r12 + 16]               ; deviceid
+    cmp eax, 3
+    je .xgd_kbd
+    mov ecx, [r12 + 4]
+    mov [ptr_grab_win], ecx
+    mov [ptr_grab_slot], ebx
+    mov dword [ptr_grab_mask], 0xFFFF        ; grab wants everything
+    mov byte [ptr_grab_xi2], 1
+    cmp eax, 2
+    jbe .xgd_maybe_both                      ; 0/1 = all devices → kbd too
+    jmp .xgd_reply
+.xgd_maybe_both:
+    cmp eax, 2
+    je .xgd_reply                            ; exactly the pointer → done
+.xgd_kbd:
+    mov ecx, [r12 + 4]
+    mov [active_kbd_window], ecx
+    mov [active_kbd_slot], ebx
+    mov byte [kbd_grab_xi2], 1
+.xgd_reply:
+    mov edi, ebx
+    pop r12                                  ; balance BEFORE the shared tail —
+    pop rbx                                  ; .xi_write rets directly
+    mov esi, 32
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0                    ; status = Success (deviceID slot
+    jmp .xi_write                            ; doubles as status here)
+
+.xi_ungrab_device:
+    ; XIUngrabDevice (52, void): header(4) + time@4 + deviceid u16 @8 + pad@10.
+    ; deviceid is at +8, NOT +12 (that read the next batched request's opcode
+    ; and cleared the wrong grab). Only release a grab this client actually
+    ; holds — a stray ungrab must not free another client's (or a core) grab.
+    movzx eax, word [rsi + 8]
+    cmp eax, 3
+    je .xud_kbd
+    cmp [ptr_grab_slot], edi                 ; we own the pointer grab?
+    jne .xud_chk_kbd
+    mov dword [ptr_grab_win], 0
+    mov byte [ptr_grab_xi2], 0
+.xud_chk_kbd:
+    cmp eax, 2
+    jae .xud_done                            ; 2 = pointer only
+.xud_kbd:
+    cmp [active_kbd_slot], edi               ; we own the keyboard grab?
+    jne .xud_done
+    mov dword [active_kbd_slot], -1
+    mov dword [active_kbd_window], 0
+    mov byte [kbd_grab_xi2], 0
+.xud_done:
+    ret
+
+.xi_get_focus:
+    ; XIGetFocus (50): reply the core focus window.
+    mov esi, 32
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0
+    mov eax, [focus_window]
+    cmp eax, 1
+    jbe .xgf_none
+    mov [rdi + 8], eax
+    jmp .xi_write
+.xgf_none:
+    mov dword [rdi + 8], 0
     jmp .xi_write
 
 .xi_list_devices:
@@ -5341,11 +5479,16 @@ handle_xinput:
     ret
 
 .xi_query_version:
-    mov esi, 32
+    movzx r13d, word [rsi + 6]                ; client minor (req +4 major, +6 minor)
+    mov esi, 32                               ; — read BEFORE this clobbers rsi
     call xkb_reply_zero                       ; rdi=reply_buf, r15d=fd, r8d=total
     mov byte [rdi + 1], 0                     ; RepType (override XKB deviceID)
     mov word [rdi + 8], 2                     ; major_version = 2
-    mov word [rdi + 10], 0                    ; minor_version = 0
+    mov word [rdi + 10], 2                    ; minor: min(client, 2) per spec
+    cmp r13d, 2
+    jae .xqv_minor                            ; client >= 2.2 → cap at 2
+    mov [rdi + 10], r13w                       ; else echo the client's minor
+.xqv_minor:
     jmp .xi_write
 
 .xi_noop:                                     ; void requests (XISelectEvents)
@@ -6791,6 +6934,7 @@ window_destroy:
     mov byte [r13 + 31], 0                   ; has_backing = 0
     mov qword [r13 + 32], 0
     mov dword [r13 + 40], 0                  ; backing_w/h = 0
+    mov dword [r13 + 52], 0                  ; XI2 mask (recycled slots!)
     jmp .wd_walk_next
 .wd_recurse:
     push rbx
@@ -6918,6 +7062,7 @@ handle_create_window:
     mov byte  [r13 + 28], 0                  ; mapped (false)
     mov byte  [r13 + 29], 0                  ; override-redirect (false)
     mov byte  [r13 + 30], -1                 ; redirect_owner (none)
+    mov dword [r13 + 52], 0                  ; XI2 event mask (none)
     mov byte  [r13 + 31], 0                  ; has_backing (false)
     mov qword [r13 + 32], 0                  ; backing_ptr
     mov dword [r13 + 40], 0                  ; backing_cap
@@ -9002,6 +9147,7 @@ handle_grab_keyboard:
     mov eax, [rsi + 4]
     mov [active_kbd_window], eax
     mov [active_kbd_slot], ebx
+    mov byte [kbd_grab_xi2], 0               ; core grab → core events
     mov eax, ebx
     call client_meta_addr
     mov r12, rax
@@ -9038,6 +9184,7 @@ handle_grab_pointer:
     movzx eax, word [rsi + 8]                 ; event-mask (SETofPOINTEREVENT)
     mov [ptr_grab_mask], eax
     mov [ptr_grab_slot], edi                  ; who holds it (death cleanup)
+    mov byte [ptr_grab_xi2], 0                ; core grab → core events
     push rbx
     push r12
     mov ebx, edi
@@ -9992,6 +10139,8 @@ send_crossing:
     je .sx_mask
     mov ecx, 0x20
 .sx_mask:
+    bt dword [r13 + 52], r12d                ; XI2 Enter/Leave selected →
+    jc .sx_deliver                           ; skip the core-mask gate
     test [r13 + 24], ecx                     ; target window wants it?
     jnz .sx_deliver
     cmp dword [ptr_grab_win], 0              ; else the grab wants it?
@@ -10009,6 +10158,19 @@ send_crossing:
     mov ebx, eax                             ; slot
     mov edi, [r13]
     call window_abs_xy                       ; r10d/r11d = abs origin
+    bt dword [r13 + 52], r12d                ; XI2 route (evtype 7/8 = codes)
+    jnc .sx_core
+    mov r8d, [cursor_x]
+    sub r8d, r10d
+    mov r9d, [cursor_y]
+    sub r9d, r11d
+    mov edi, ebx
+    mov esi, r12d
+    mov edx, r14d                            ; detail
+    mov ecx, [r13]
+    call send_xi2_crossing
+    jmp .sx_done
+.sx_core:
     lea rdi, [reply_buf]
     mov [rdi + 0], r12b                      ; code 7/8
     mov [rdi + 1], r14b                      ; detail
@@ -10166,6 +10328,8 @@ deliver_pointer_motion:
     ; PointerMotion, but the menu window selects it — without honouring the
     ; target's mask, motion is dropped, so menu items never highlight/select
     ; and a click has no selected item to activate.
+    test dword [rbx + 52], 0x40             ; XI2 Motion selected → skip core gate
+    jnz .dpm_gdeliver
     test dword [rbx + 24], 0x40             ; target window wants motion?
     jnz .dpm_gdeliver
     test dword [ptr_grab_mask], 0x40        ; else the grab itself wants motion?
@@ -10176,15 +10340,22 @@ deliver_pointer_motion:
     mov r9d, [cursor_y]
     sub r9d, [wapd_abs_y]                    ; event-y
     mov eax, [ptr_grab_slot]                 ; grabs deliver to the GRABBING
-    jmp .dpm_emit_slot                       ; client (window may be root)
+    cmp eax, MAX_CLIENTS                      ; client (window may be root)
+    jae .dpm_done
+    cmp byte [ptr_grab_xi2], 0               ; format keys on the GRAB, not
+    jne .dpm_xi2                             ; a foreign XI2 mask on the target
+    jmp .dpm_core
 .dpm_point:
     call window_at_point
     test rax, rax
     jz .dpm_done
     mov rbx, rax
     call pointer_crossings                   ; Enter/Leave BEFORE motion gating
-    test dword [rbx + 24], 0x40              ; PointerMotionMask
+    test dword [rbx + 52], 0x40              ; XI2 Motion selected?
+    jnz .dpm_calc
+    test dword [rbx + 24], 0x40              ; core PointerMotionMask
     jz .dpm_done
+.dpm_calc:
     mov r8d, [cursor_x]
     movsx eax, word [rbx + 8]
     sub r8d, eax                             ; event-x
@@ -10200,6 +10371,17 @@ deliver_pointer_motion:
 .dpm_emit_slot:
     cmp eax, MAX_CLIENTS
     jae .dpm_done
+    ; Non-grab (point) path: XI2 iff the target window selected XI_Motion.
+    test dword [rbx + 52], 0x40
+    jz .dpm_core
+.dpm_xi2:
+    mov edi, eax                             ; slot
+    mov esi, 6                               ; XI_Motion
+    xor edx, edx
+    mov ecx, [rbx]
+    call send_xi2_device_event
+    jmp .dpm_done
+.dpm_core:
     push r8
     push r9
     mov edi, eax                             ; slot
@@ -10235,6 +10417,8 @@ deliver_pointer_button:
     je .dpb_gmask
     mov ecx, 0x08
 .dpb_gmask:
+    bt dword [rbx + 52], r12d                ; XI2 press/release selected →
+    jc .dpb_gdeliver                         ; skip the core-mask gate
     test [rbx + 24], ecx                     ; owner_events: target window wants it?
     jnz .dpb_gdeliver
     test [ptr_grab_mask], ecx                ; else the grab itself wants it?
@@ -10245,7 +10429,14 @@ deliver_pointer_button:
     mov r9d, [cursor_y]
     sub r9d, [wapd_abs_y]                    ; event-y
     mov eax, [ptr_grab_slot]                 ; grabs deliver to the GRABBING
-    jmp .dpb_emit_slot                       ; client (window may be root)
+    cmp eax, MAX_CLIENTS                      ; client (window may be root)
+    jae .dpb_done
+    ; Grab format keys on HOW the grab was taken (ptr_grab_xi2), NOT the
+    ; target window's XI2 mask — a foreign XI2 selection on root would
+    ; otherwise send a core grabber (rofi) an XI2 event it never asked for.
+    cmp byte [ptr_grab_xi2], 0
+    jne .dpb_xi2
+    jmp .dpb_core
 .dpb_point:
     call window_at_point
     test rax, rax
@@ -10256,8 +10447,11 @@ deliver_pointer_button:
     je .dpb_mask
     mov ecx, 0x08                            ; ButtonReleaseMask
 .dpb_mask:
+    bt dword [rbx + 52], r12d                ; XI2 selected → skip core gate
+    jc .dpb_calc
     test [rbx + 24], ecx
     jz .dpb_done
+.dpb_calc:
     mov r8d, [cursor_x]
     movsx eax, word [rbx + 8]
     sub r8d, eax                             ; event-x
@@ -10273,6 +10467,17 @@ deliver_pointer_button:
 .dpb_emit_slot:
     cmp eax, MAX_CLIENTS
     jae .dpb_done
+    ; Non-grab (focus/point) path: XI2 iff the target window selected it.
+    bt dword [rbx + 52], r12d
+    jnc .dpb_core
+.dpb_xi2:
+    mov edi, eax                             ; slot
+    mov esi, r12d                            ; evtype (4/5 = core codes)
+    mov edx, r13d                            ; detail = button
+    mov ecx, [rbx]                           ; window
+    call send_xi2_device_event
+    jmp .dpb_done
+.dpb_core:
     push r8
     push r9
     mov edi, eax                             ; slot
@@ -10399,6 +10604,21 @@ deliver_to_focus:
     mov eax, [active_kbd_slot]
     test eax, eax
     js .dtf_nograb
+    cmp byte [kbd_grab_xi2], 0               ; XIGrabDevice → XI2 key events
+    je .dtf_grab_core
+    mov edi, [active_kbd_window]
+    call window_abs_xy                       ; r10d/r11d = grab window origin
+    mov r8d, [cursor_x]
+    sub r8d, r10d
+    mov r9d, [cursor_y]
+    sub r9d, r11d
+    mov edi, [active_kbd_slot]
+    mov esi, r13d                            ; evtype (2/3 = core codes)
+    mov edx, r12d                            ; detail = keycode
+    mov ecx, [active_kbd_window]
+    call send_xi2_device_event
+    jmp .dtf_done
+.dtf_grab_core:
     mov edi, eax
     mov esi, r12d
     movzx ecx, byte [mod_state]
@@ -10435,7 +10655,31 @@ deliver_to_focus:
     shr eax, 21
     cmp eax, MAX_CLIENTS
     jae .dtf_done
-    mov edi, eax                              ; client slot
+    push rax
+    mov edi, ebx
+    call window_lookup                        ; XI2 selected on the target?
+    pop rcx
+    test rax, rax
+    jz .dtf_done
+    bt dword [rax + 52], r13d                 ; evtype 2/3 = core key codes
+    jnc .dtf_core
+    mov edi, ebx
+    call window_abs_xy                        ; r10d/r11d = window origin
+    mov r8d, [cursor_x]
+    sub r8d, r10d
+    mov r9d, [cursor_y]
+    sub r9d, r11d
+    mov eax, ebx
+    sub eax, X_RID_BASE
+    shr eax, 21
+    mov edi, eax
+    mov esi, r13d                             ; evtype
+    mov edx, r12d                             ; detail = keycode
+    mov ecx, ebx                              ; window
+    call send_xi2_device_event
+    jmp .dtf_done
+.dtf_core:
+    mov edi, ecx                              ; client slot
     mov esi, r12d                             ; keycode
     movzx ecx, byte [mod_state]
     mov edx, ebx                              ; window
@@ -10574,6 +10818,161 @@ handle_reparent_window:
     mov byte [comp_dirty], 1                  ; was missing: screen stayed
                                               ; stale after every reparent
 .rp_done:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; send_xi2_to_slot — edi = slot, rsi = event buffer, edx = length in bytes.
+; Variable-size sibling of send_event_to_slot for XI2 GenericEvents.
+; ----------------------------------------------------------------------------
+send_xi2_to_slot:
+    push rbx
+    push r12
+    push r13
+    mov r12d, edi
+    mov r13, rsi
+    push rdx
+    mov eax, r12d
+    call client_meta_addr
+    mov ebx, [rax]                           ; fd
+    mov ecx, [rax + 8]                       ; seq
+    mov [r13 + 2], cx
+    pop rdx
+    mov rax, SYS_WRITE
+    mov edi, ebx
+    mov rsi, r13
+    syscall
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; send_xi2_device_event — XI2 Key/Button/Motion as a GenericEvent (35).
+; edi = slot, esi = evtype (2 KeyPress / 3 KeyRelease / 4 ButtonPress /
+; 5 ButtonRelease / 6 Motion — same numbers as the core codes), edx =
+; detail (keycode / button), ecx = event window xid, r8d/r9d = event x/y
+; (window-local). 84 bytes: fixed 80 + one buttons-mask word (GTK reads
+; held buttons from it during drags). Coordinates are FP1616.
+; ----------------------------------------------------------------------------
+send_xi2_device_event:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov ebx, edi
+    mov r12d, esi
+    mov r13d, edx
+    mov r14d, ecx
+    lea rdi, [xi2_buf]
+    xor eax, eax
+    mov ecx, 11
+    push rdi
+    rep stosq
+    pop rdi
+    mov byte [rdi + 0], 35                   ; GenericEvent
+    mov byte [rdi + 1], XI_MAJOR
+    mov dword [rdi + 4], 13                  ; (84-32)/4
+    mov [rdi + 8], r12w                      ; evtype
+    mov eax, 2                               ; deviceid: master pointer...
+    cmp r12d, 3
+    ja .sxd_dev
+    mov eax, 3                               ; ...or master keyboard for keys
+.sxd_dev:
+    mov [rdi + 10], ax
+    mov [rdi + 52], ax                       ; sourceid = deviceid
+    mov eax, [server_time_ms]
+    mov [rdi + 12], eax
+    mov [rdi + 16], r13d                     ; detail
+    mov dword [rdi + 20], X_ROOT_WINDOW
+    mov [rdi + 24], r14d                     ; event window
+    mov eax, [cursor_x]
+    shl eax, 16
+    mov [rdi + 32], eax                      ; root_x FP1616
+    mov eax, [cursor_y]
+    shl eax, 16
+    mov [rdi + 36], eax
+    mov eax, r8d
+    shl eax, 16
+    mov [rdi + 40], eax                      ; event_x
+    mov eax, r9d
+    shl eax, 16
+    mov [rdi + 44], eax
+    mov word [rdi + 48], 1                   ; buttons_len = 1 word
+    movzx eax, byte [mod_state]
+    mov [rdi + 60], eax                      ; mods.base
+    mov [rdi + 72], eax                      ; mods.effective
+    mov eax, [button_state]
+    shr eax, 7                               ; core bits 8+ → XI mask bits 1+
+    mov [rdi + 80], eax                      ; buttons mask
+    mov edi, ebx
+    lea rsi, [xi2_buf]
+    mov edx, 84
+    call send_xi2_to_slot
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; send_xi2_crossing — XI2 Enter/Leave/FocusIn/FocusOut GenericEvent.
+; edi = slot, esi = evtype (7 Enter / 8 Leave / 9 FocusIn / 10 FocusOut),
+; edx = detail (0 Ancestor / 2 Inferior / 3 Nonlinear), ecx = window xid,
+; r8d/r9d = event x/y (window-local). 72 bytes (buttons_len = 0).
+; ----------------------------------------------------------------------------
+send_xi2_crossing:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov ebx, edi
+    mov r12d, esi
+    mov r13d, edx
+    mov r14d, ecx
+    lea rdi, [xi2_buf]
+    xor eax, eax
+    mov ecx, 9
+    push rdi
+    rep stosq
+    pop rdi
+    mov byte [rdi + 0], 35
+    mov byte [rdi + 1], XI_MAJOR
+    mov dword [rdi + 4], 10                  ; (72-32)/4
+    mov [rdi + 8], r12w                      ; evtype
+    mov word [rdi + 10], 2                   ; deviceid = master pointer
+    mov eax, [server_time_ms]
+    mov [rdi + 12], eax
+    mov word [rdi + 16], 2                   ; sourceid
+    mov [rdi + 19], r13b                     ; detail (mode @18 = Normal = 0)
+    mov dword [rdi + 20], X_ROOT_WINDOW
+    mov [rdi + 24], r14d                     ; event window
+    mov eax, [cursor_x]
+    shl eax, 16
+    mov [rdi + 32], eax
+    mov eax, [cursor_y]
+    shl eax, 16
+    mov [rdi + 36], eax
+    mov eax, r8d
+    shl eax, 16
+    mov [rdi + 40], eax
+    mov eax, r9d
+    shl eax, 16
+    mov [rdi + 44], eax
+    mov byte [rdi + 48], 1                   ; same_screen
+    mov eax, [focus_window]                  ; focus = is this the focus window?
+    cmp eax, r14d
+    sete byte [rdi + 49]
+    movzx eax, byte [mod_state]
+    mov [rdi + 52], eax                      ; mods.base
+    mov [rdi + 64], eax                      ; mods.effective
+    mov edi, ebx
+    lea rsi, [xi2_buf]
+    mov edx, 72
+    call send_xi2_to_slot
+    pop r14
+    pop r13
+    pop r12
     pop rbx
     ret
 

@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.78-blue)
+![Version](https://img.shields.io/badge/version-0.0.79-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -55,7 +55,7 @@ keyboard-driven. No libc, no Xlib, no Mesa anywhere in the path.*
 | 10 | Cursor sprite + keyboard layout + clipboard | |
 | 11 | XKB (Firefox-compatible) | |
 | 12 | DAMAGE + COMPOSITE + FIXES | |
-| 13 | RANDR + MIT-SHM + XInput2 | |
+| 13 | RANDR + XInput2 (MIT-SHM pending) | RANDR + XI2 ✓ shipped |
 | 14 | First Firefox launch | |
 
 Phase 4 is the "tile runs on frame" milestone — self-hosting CHasm.
