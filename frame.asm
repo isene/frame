@@ -5121,6 +5121,8 @@ handle_randr:
     je .rr_get_output_property               ; BLOCKS on the reply (3x per screen)
     cmp eax, 4                               ; RRSelectInput: void, no reply
     je .rr_void
+    cmp eax, 32                              ; GetProviders (RandR 1.4) — Firefox
+    je .rr_get_providers                     ; probes GPU providers; empty is fine
     ; Unhandled RANDR minor — log it (each is a potential client hang).
     push rax
     mov rsi, log_rr_minor
@@ -5167,6 +5169,17 @@ handle_randr:
     call xkb_reply_zero
     mov byte [rdi + 1], 0
     mov dword [rdi + 8], RR_OUTPUT_ID         ; output
+    jmp .rr_write
+
+.rr_get_providers:
+    ; RRGetProviders reply: +8 timestamp, +12 nProviders (u16 = 0). frame has
+    ; no GPU-offload providers, so an empty list is correct. Firefox's
+    ; glxtest queries this; it soft-fails to software rendering either way.
+    mov esi, 32
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0
+    mov dword [rdi + 8], 1                    ; timestamp
+    mov word [rdi + 12], 0                    ; nProviders
     jmp .rr_write
 
 .rr_get_resources:
