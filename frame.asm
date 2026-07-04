@@ -99,6 +99,12 @@ DEFAULT REL
 %define SYS_POLL        7
 %define SYS_MMAP        9
 %define SYS_MUNMAP      11
+%define SYS_SHMGET      29
+%define SYS_SHMAT       30
+%define SYS_SHMCTL      31
+%define SYS_SHMDT       67
+%define IPC_STAT        2
+%define SHM_RDONLY      0x1000
 %define SYS_NANOSLEEP   35
 %define PROT_RW         3            ; PROT_READ | PROT_WRITE
 %define MAP_SHARED      1
@@ -232,6 +238,9 @@ DEFAULT REL
 %define XFIXES_MAJOR         138
 %define XFIXES_EVENT_BASE    93          ; XFixesSelectionNotify = base+0
 %define XFIXES_ERROR_BASE    155
+%define SHM_MAJOR            130         ; MIT-SHM (shared-memory image transfer)
+%define SHM_EVENT_BASE       94          ; ShmCompletion = base+0
+%define SHM_ERROR_BASE       156         ; BadShmSeg
 %define X_RID_MASK           0x001FFFFF
 
 ; ============================================================================
@@ -269,6 +278,13 @@ sel_count:          resd 1
 XFIXES_SUB_MAX      equ 16
 xfixes_subs:        resb XFIXES_SUB_MAX * 12
 xfixes_sub_evbuf:   resb 32
+; MIT-SHM attached segments. Each entry (24 bytes): +0 shmseg id (u32, 0=empty),
+; +4 owning client slot (u32), +8 attached address (u64), +16 segment size (u64).
+; ShmPutImage reads the client's rendered image straight out of the mapped
+; segment — no image bytes on the wire. Detached on ShmDetach + client death.
+SHM_SEG_MAX         equ 32
+shm_segs:           resb SHM_SEG_MAX * 24
+shmid_ds_buf:       resb 128               ; shmctl(IPC_STAT) scratch (shm_segsz @ +48)
 framerc_path:       resb 256               ; "$HOME/.framerc"
 framerc_buf:        resb 2048              ; ~/.framerc contents
 WALL_MAX            equ 1920*1200*4        ; max backing for the wallpaper (panel res)
@@ -737,7 +753,7 @@ log_render_min:     db "RENDER minor=", 0
 log_rr_minor:       db "  RANDR minor=", 0
 ; ListExtensions STR list: length byte + name, 39 bytes total (matches the
 ; QueryExtension set exactly — advertising one obligates serving it).
-ext_names:          db 6, "RENDER", 5, "RANDR", 9, "XKEYBOARD", 15, "XInputExtension", 6, "XFIXES"
+ext_names:          db 6, "RENDER", 5, "RANDR", 9, "XKEYBOARD", 15, "XInputExtension", 6, "XFIXES", 7, "MIT-SHM"
 ext_names_len       equ $ - ext_names       ; 46 bytes (5 STRs), padded to 48 in reply
 ; Keysym names for ~/.framerc `keycode` lines: db "name",0 + dd keysym;
 ; terminated by a lone 0 byte. Covers the user's ~/.Xmodmap vocabulary +
@@ -857,6 +873,7 @@ str_xkb:            db "XKEYBOARD"
 str_randr:          db "RANDR"
 str_xinput:         db "XInputExtension"
 str_xfixes:         db "XFIXES"
+str_shm:            db "MIT-SHM"
 str_xi_pointer:     db "Virtual core pointer"      ; 20 bytes
 str_xi_keyboard:    db "Virtual core keyboard"     ; 21 bytes
 str_rel_x:          db "Rel X"
@@ -3364,6 +3381,27 @@ client_cleanup_resources:
     jmp .ccr_xf
 .ccr_xf_done:
 
+    ; MIT-SHM segments this client attached → shmdt + free the table entry.
+    xor ebx, ebx
+.ccr_shm:
+    cmp ebx, SHM_SEG_MAX
+    jge .ccr_shm_done
+    imul ecx, ebx, 24
+    cmp dword [shm_segs + rcx], 0            ; occupied?
+    je .ccr_shm_next
+    cmp [shm_segs + rcx + 4], r12d           ; owned by the dying client?
+    jne .ccr_shm_next
+    push rcx
+    mov rdi, [shm_segs + rcx + 8]
+    mov eax, SYS_SHMDT
+    syscall
+    pop rcx
+    mov dword [shm_segs + rcx], 0
+.ccr_shm_next:
+    inc ebx
+    jmp .ccr_shm
+.ccr_shm_done:
+
     ; Key grabs registered by this client.
     xor ebx, ebx
 .ccr_kg:
@@ -4049,6 +4087,8 @@ dispatch_request:
     je .dr_xinput
     cmp eax, XFIXES_MAJOR
     je .dr_xfixes
+    cmp eax, SHM_MAJOR
+    je .dr_shm
     ; Void no-ops — requests with no reply that frame can safely accept and
     ; ignore. Silences the log noise and, for toolkits that follow them with
     ; a blocking round-trip, keeps the stream healthy. 36/37 Grab/UngrabServer
@@ -4112,6 +4152,13 @@ dispatch_request:
     mov edi, ebx
     mov rsi, r12
     call handle_xfixes
+    jmp .dr_done
+
+.dr_shm:
+    mov edi, ebx
+    mov rsi, r12
+    mov edx, r13d
+    call handle_shm
     jmp .dr_done
 
 .dr_xinput:
@@ -4525,6 +4572,140 @@ handle_intern_atom:
 ; other minors (regions, save-set, cursor) are void no-ops. GetCursorImage
 ; (4) has a reply, but no clipboard flow uses it; add if something blocks.
 ; ============================================================================
+; ----------------------------------------------------------------------------
+; handle_shm — MIT-SHM. edi = slot, rsi = req ptr, edx = req byte length.
+;   minor 0 ShmQueryVersion  1 ShmAttach  2 ShmDetach  3 ShmPutImage
+; Attach shmat()s the client's SysV segment read-only; PutImage blits the
+; client's rendered image straight out of it (no image bytes on the wire).
+; ----------------------------------------------------------------------------
+handle_shm:
+    movzx eax, byte [rsi + 1]                ; minor
+    test eax, eax
+    jz .shm_query_version
+    cmp eax, 1
+    je .shm_attach
+    cmp eax, 2
+    je .shm_detach
+    cmp eax, 3
+    je .shm_put_image
+    ret                                      ; other minors: ignore
+
+.shm_query_version:
+    mov esi, 32
+    call xkb_reply_zero                      ; edi=slot; rdi=buf r15d=fd r8d=total
+    mov byte [rdi + 1], 0                    ; sharedPixmaps = False (PutImage only)
+    mov word [rdi + 8], 1                    ; majorVersion = 1
+    mov word [rdi + 10], 1                   ; minorVersion = 1 → classic SysV attach
+    mov byte [rdi + 16], 2                   ; pixmapFormat = ZPixmap
+    mov edi, r15d
+    lea rsi, [reply_buf]
+    mov edx, r8d
+    mov eax, SYS_WRITE
+    syscall
+    ret
+
+.shm_attach:
+    ; +4 shmseg id   +8 SysV shmid   +12 readOnly
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12d, [rsi + 4]                      ; shmseg id
+    mov r14d, edi                            ; client slot
+    mov r13d, [rsi + 8]                      ; SysV shmid
+    mov eax, SYS_SHMAT                       ; shmat(shmid, NULL, SHM_RDONLY)
+    mov edi, r13d
+    xor esi, esi
+    mov edx, SHM_RDONLY
+    syscall
+    cmp rax, -1
+    je .shm_attach_done                      ; attach failed → drop silently
+    test rax, rax
+    js .shm_attach_done
+    mov rbx, rax                             ; attached address
+    mov eax, SYS_SHMCTL                      ; size = shm_segsz (IPC_STAT @ +48)
+    mov edi, r13d
+    mov esi, IPC_STAT
+    lea rdx, [shmid_ds_buf]
+    syscall
+    test rax, rax
+    js .shm_attach_detach                    ; can't size it → safest to detach
+    mov r13, [shmid_ds_buf + 48]             ; shm_segsz
+    xor ecx, ecx
+.shm_att_find:
+    cmp ecx, SHM_SEG_MAX
+    jge .shm_attach_detach                   ; table full → detach, drop
+    imul eax, ecx, 24
+    mov edx, [shm_segs + rax]                ; shmseg (0 = empty)
+    test edx, edx
+    jz .shm_att_store
+    cmp edx, r12d                            ; reuse a same-id entry
+    je .shm_att_store
+    inc ecx
+    jmp .shm_att_find
+.shm_att_store:
+    mov [shm_segs + rax + 0], r12d           ; shmseg id
+    mov [shm_segs + rax + 4], r14d           ; owning client slot
+    mov [shm_segs + rax + 8], rbx            ; attached address
+    mov [shm_segs + rax + 16], r13           ; segment size
+    jmp .shm_attach_done
+.shm_attach_detach:
+    mov eax, SYS_SHMDT
+    mov rdi, rbx
+    syscall
+.shm_attach_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.shm_detach:
+    ; +4 shmseg id — shmdt() and free the table entry.
+    mov r9d, [rsi + 4]
+    xor ecx, ecx
+.shm_det_find:
+    cmp ecx, SHM_SEG_MAX
+    jge .shm_detach_done
+    imul eax, ecx, 24
+    cmp [shm_segs + rax], r9d
+    je .shm_det_hit
+    inc ecx
+    jmp .shm_det_find
+.shm_det_hit:
+    push rax
+    mov rdi, [shm_segs + rax + 8]
+    mov eax, SYS_SHMDT
+    syscall
+    pop rax
+    mov dword [shm_segs + rax], 0
+.shm_detach_done:
+    ret
+
+.shm_put_image:
+    jmp handle_shm_put_image                  ; edi=slot, rsi=req still set
+
+; shm_seg_lookup — edi = shmseg id. Returns rax = attached address (0 if not
+; found), rdx = segment size. Clobbers rcx.
+shm_seg_lookup:
+    xor ecx, ecx
+.ssl_find:
+    cmp ecx, SHM_SEG_MAX
+    jge .ssl_none
+    imul eax, ecx, 24
+    cmp [shm_segs + rax], edi
+    je .ssl_hit
+    inc ecx
+    jmp .ssl_find
+.ssl_hit:
+    mov rdx, [shm_segs + rax + 16]
+    mov rax, [shm_segs + rax + 8]
+    ret
+.ssl_none:
+    xor eax, eax
+    xor edx, edx
+    ret
+
 handle_xfixes:
     movzx eax, byte [rsi + 1]                ; XFIXES minor
     test eax, eax
@@ -4763,7 +4944,7 @@ handle_query_extension:
     jmp .qe_send
 .qe_try_xinput:
     cmp eax, 15
-    jne .qe_send
+    jne .qe_try_shm
     lea rsi, [r13 + 8]
     lea rdi, [str_xinput]
     mov ecx, 15
@@ -4780,6 +4961,26 @@ handle_query_extension:
     mov byte [rdi + 9], XI_MAJOR
     mov byte [rdi + 10], XI_EVENT_BASE
     mov byte [rdi + 11], XI_ERROR_BASE
+    jmp .qe_send
+.qe_try_shm:
+    cmp eax, 7
+    jne .qe_send
+    lea rsi, [r13 + 8]
+    lea rdi, [str_shm]
+    mov ecx, 7
+.qe_cmp_shm:
+    mov dl, [rsi]
+    cmp dl, [rdi]
+    jne .qe_send
+    inc rsi
+    inc rdi
+    dec ecx
+    jnz .qe_cmp_shm
+    lea rdi, [reply_buf]
+    mov byte [rdi + 8], 1                    ; present = True
+    mov byte [rdi + 9], SHM_MAJOR
+    mov byte [rdi + 10], SHM_EVENT_BASE
+    mov byte [rdi + 11], SHM_ERROR_BASE
 
 .qe_send:
     mov edi, [r12]
@@ -6202,10 +6403,10 @@ handle_list_extensions:
 
     lea rdi, [reply_buf]
     mov byte [rdi + 0], 1
-    mov byte [rdi + 1], 5                    ; nExtensions
+    mov byte [rdi + 1], 6                    ; nExtensions
     mov ecx, [r12 + 8]
     mov [rdi + 2], cx
-    mov dword [rdi + 4], 12                  ; 48 bytes of names (46 + 2 pad)
+    mov dword [rdi + 4], 14                  ; 56 bytes of names (54 + 2 pad)
     mov dword [rdi + 8], 0
     mov dword [rdi + 12], 0
     mov dword [rdi + 16], 0
@@ -6222,7 +6423,7 @@ handle_list_extensions:
     mov edi, [r12]
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
-    mov rdx, 80
+    mov rdx, 88                              ; 32 header + 56 names
     syscall
 
     pop r12
@@ -13971,6 +14172,212 @@ handle_put_image:
     movzx r8d, word [r13 + 14]                ; imgh
     call damage_add_local
 .pi_ret:
+    add rsp, 80
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; handle_shm_put_image — ShmPutImage (MIT-SHM minor 3). rsi = req ptr.
+;   +4 drawable +8 gc +12 totalWidth +14 totalHeight +16 srcX +18 srcY
+;   +20 srcWidth +22 srcHeight +24 dstX s16 +26 dstY s16 +28 depth +29 format
+;   +32 shmseg +36 offset
+; Blits the (srcX,srcY,srcWidth,srcHeight) sub-rect of the totalWidth-strided
+; ZPixmap image in the attached segment to the drawable at (dstX,dstY). Same
+; backing + GC clipping as handle_put_image; the source is shared memory
+; (no image bytes on the wire), bounds-checked against the segment size.
+;   stack: +0 stride  +8 rows  +16 backing_w  +24 backing_h  +32 dsty
+;          +40 dst_x0 +48 src_x0 +56 copy_w  +64 clip_entry  +72 srcWidth
+;   rbx = backing ptr  rbp = src base ptr  r12d = row
+; ----------------------------------------------------------------------------
+handle_shm_put_image:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 80
+    mov r13, rsi                             ; req ptr
+
+    cmp byte [r13 + 29], 2                    ; format ZPixmap?
+    jne .spi_ret
+    movzx eax, byte [r13 + 28]               ; depth 24/32
+    cmp eax, 24
+    je .spi_depth_ok
+    cmp eax, 32
+    jne .spi_ret
+.spi_depth_ok:
+    mov edi, [r13 + 4]                        ; drawable
+    call drawable_get_backing
+    test rax, rax
+    jz .spi_ret
+    mov rbx, rax                            ; backing ptr
+    mov [rsp + 16], edx                     ; backing_w (stride, px)
+    mov [rsp + 24], ecx                     ; backing_h
+
+    mov edi, [r13 + 32]                      ; shmseg
+    call shm_seg_lookup                     ; rax=addr rdx=size
+    test rax, rax
+    jz .spi_ret
+    mov r14, rax                            ; seg addr
+    mov r15, rdx                            ; seg size
+
+    ; bounds: offset + totalWidth*totalHeight*4 must fit the segment (64-bit)
+    movzx eax, word [r13 + 12]              ; totalWidth → stride
+    mov [rsp + 0], eax
+    movzx ecx, word [r13 + 14]              ; totalHeight
+    mov r8, rax
+    imul r8, rcx
+    shl r8, 2
+    mov eax, [r13 + 36]                      ; offset (u32)
+    add r8, rax
+    cmp r8, r15
+    ja .spi_ret                             ; would read past the segment
+
+    ; src base = addr + offset + (srcY*stride + srcX)*4
+    mov rbp, r14
+    mov eax, [r13 + 36]
+    add rbp, rax
+    movzx eax, word [r13 + 18]              ; srcY
+    imul eax, [rsp + 0]
+    movzx ecx, word [r13 + 16]             ; srcX
+    add eax, ecx
+    lea rbp, [rbp + rax*4]
+
+    movzx eax, word [r13 + 22]              ; srcHeight → rows
+    mov [rsp + 8], eax
+    movzx eax, word [r13 + 20]              ; srcWidth
+    mov [rsp + 72], eax
+    movsx eax, word [r13 + 26]             ; dstY
+    mov [rsp + 32], eax
+
+    ; GC clip (identical to handle_put_image)
+    mov qword [rsp + 64], 0
+    mov edi, [r13 + 8]
+    call gc_lookup
+    test rax, rax
+    jz .spi_noclip
+    lea rcx, [gcs]
+    sub rax, rcx
+    shr rax, 4
+    imul rax, CLIP_ENTRY_SIZE
+    lea rcx, [gc_clips]
+    add rax, rcx
+    mov ecx, [rax]
+    test ecx, ecx
+    jz .spi_noclip
+    js .spi_ret
+    mov [rsp + 64], rax
+.spi_noclip:
+
+    ; x-clip: dstX → dst_x0, src_x0
+    movsx ecx, word [r13 + 24]             ; dstX
+    xor r8d, r8d
+    mov r9d, ecx
+    test ecx, ecx
+    jns .spi_dx_ok
+    mov r8d, ecx
+    neg r8d
+    xor r9d, r9d
+.spi_dx_ok:
+    mov [rsp + 40], r9d                      ; dst_x0
+    mov [rsp + 48], r8d                      ; src_x0
+    mov eax, [rsp + 72]                      ; copy_w = min(srcWidth-src_x0, bw-dst_x0)
+    sub eax, r8d
+    jle .spi_recomp
+    mov edx, [rsp + 16]
+    sub edx, r9d
+    jle .spi_recomp
+    cmp eax, edx
+    jle .spi_cw
+    mov eax, edx
+.spi_cw:
+    mov [rsp + 56], eax
+
+    xor r12d, r12d
+.spi_row:
+    mov eax, [rsp + 8]                       ; rows
+    cmp r12d, eax
+    jge .spi_recomp
+    mov eax, [rsp + 32]                      ; dsty + row
+    add eax, r12d
+    js .spi_row_next
+    cmp eax, [rsp + 24]                      ; backing_h
+    jge .spi_recomp
+    mov r10d, eax                            ; dy
+    cmp qword [rsp + 64], 0
+    jne .spi_row_clipped
+    mov ecx, r10d                            ; dst = backing + (dy*bw + dst_x0)*4
+    imul ecx, [rsp + 16]
+    add ecx, [rsp + 40]
+    lea rdi, [rbx + rcx*4]
+    mov eax, r12d                            ; src = base + (row*stride + src_x0)*4
+    imul eax, [rsp + 0]
+    add eax, [rsp + 48]
+    lea rsi, [rbp + rax*4]
+    mov ecx, [rsp + 56]
+    rep movsd
+    jmp .spi_row_next
+.spi_row_clipped:
+    mov r14, [rsp + 64]
+    mov r15d, [r14]
+    add r14, 4
+.spi_seg_loop:
+    cmp r10d, [r14 + 4]
+    jl .spi_seg_next
+    cmp r10d, [r14 + 12]
+    jge .spi_seg_next
+    mov ecx, [rsp + 40]
+    cmp ecx, [r14 + 0]
+    jge .spi_sx
+    mov ecx, [r14 + 0]
+.spi_sx:
+    mov edx, [rsp + 40]
+    add edx, [rsp + 56]
+    cmp edx, [r14 + 8]
+    jle .spi_sx2
+    mov edx, [r14 + 8]
+.spi_sx2:
+    sub edx, ecx
+    jle .spi_seg_next
+    mov eax, r10d
+    imul eax, [rsp + 16]
+    add eax, ecx
+    lea rdi, [rbx + rax*4]
+    mov eax, r12d
+    imul eax, [rsp + 0]
+    add eax, [rsp + 48]
+    add eax, ecx
+    sub eax, [rsp + 40]
+    lea rsi, [rbp + rax*4]
+    mov ecx, edx
+    rep movsd
+.spi_seg_next:
+    add r14, 16
+    dec r15d
+    jnz .spi_seg_loop
+.spi_row_next:
+    inc r12d
+    jmp .spi_row
+
+.spi_recomp:
+    mov edi, [r13 + 4]                        ; recomposite iff drawable is a window
+    call window_lookup
+    test rax, rax
+    jz .spi_ret
+    mov byte [comp_dirty], 1
+    mov rdi, rax
+    movsx eax, word [r13 + 24]             ; dstX
+    movsx edx, word [r13 + 26]             ; dstY
+    movzx ecx, word [r13 + 20]             ; srcWidth
+    movzx r8d, word [r13 + 22]             ; srcHeight
+    call damage_add_local
+.spi_ret:
     add rsp, 80
     pop rbp
     pop r15
