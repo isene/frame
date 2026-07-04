@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.92-blue)
+![Version](https://img.shields.io/badge/version-0.0.93-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -228,6 +228,7 @@ cursor_color = ffffff      # cursor fill colour, RRGGBB hex (default ffffff)
 cursor_transparency = 50   # cursor % transparent: 0 solid .. 100 invisible (default 50)
 background = ~/.framebg    # desktop wallpaper: a raw BGRX file at panel res
 blank_timeout = 600        # idle seconds before the panel powers off (0 = never)
+blank_key = Mod4+Escape    # hotkey that powers the panel off NOW (none = off)
 ```
 
 `keymap`: `us` (the default, or no file) is the standard US layout. `no`
@@ -252,6 +253,14 @@ wakes it back up with a full repaint. Battery-tight by design: frame wakes
 exactly once at the deadline (the idle poll timeout IS the deadline), and
 while dark it sleeps indefinitely, swallowing client redraws. Default 600
 (10 minutes); `0` disables.
+
+`blank_key`: blank the panel immediately, without waiting for the timeout.
+Modifiers (`Shift`, `Ctrl`, `Alt`/`Mod1`, `Super`/`Mod4`, `Mod5`) joined
+with `+`, ending in a keysym name (same names as the `keycode` remap
+lines). Handled server-side like the Ctrl+Alt+Fn VT switch, so it works
+regardless of focus or grabs and the combo never reaches clients. Any
+key press or pointer motion re-lights the panel. Default `Mod4+Escape`;
+`none` disables.
 
 `background`: a desktop wallpaper, drawn natively by the compositor (no feh,
 no root-pixmap). frame carries no image decoder, so the value points at a

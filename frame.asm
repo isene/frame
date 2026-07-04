@@ -312,6 +312,9 @@ blank_state:        resb 1                 ; 1 = panel currently off
 last_input_mono:    resq 1                 ; CLOCK_MONOTONIC ms of last input
 mono_ts:            resq 2                 ; clock_gettime scratch
 blank_crtc_cmd:     resb 104               ; zeroed SETCRTC = CRTC off
+cfg_blankkey_sym:   resd 1                 ; blank_key keysym (0 = none)
+cfg_blankkey_mods:  resb 1                 ; blank_key required mod_state
+blank_kc:           resd 1                 ; blank_key resolved X keycode
 bws_clip_save:      resd 4                 ; blit_window_shaped clip save
 bws_abs_x:          resd 1
 bws_abs_y:          resd 1
@@ -1414,6 +1417,8 @@ _start:
     call init_fbtest
 .main_fbtest_done:
     mov dword [cfg_blank_ms], -1             ; sentinel: blank_timeout default
+    mov dword [cfg_blankkey_sym], 0xFF1B     ; blank_key default: Mod4+Escape
+    mov byte [cfg_blankkey_mods], 0x40       ; (0x40 = MOD_MOD4)
     call read_framerc                        ; ~/.framerc → keymap_is_no
     cmp byte [fbtest_mode], 0                 ; fbtest: dims already set by init_fbtest,
     je .wp_not_fbtest                         ; so load the wallpaper now (--display
@@ -9621,14 +9626,94 @@ parse_framerc:
     jmp .pf_next_line
 .pf_chk_blank:
     ; blank_timeout = N (seconds of idle before the panel powers off;
-    ; 0 disables). Default 600.
+    ; 0 disables, default 600), or
+    ; blank_key = [Mod+...]SYM (hotkey that blanks the panel NOW;
+    ; default Mod4+Escape, `none` disables)
     mov eax, [rsi]
     cmp eax, 'blan'
     jne .pf_chk_bg
+    cmp byte [rsi + 6], 'k'                   ; blank_[t]imeout / blank_[k]ey
+    je .pf_blank_key
     call pf_to_value
     call pf_parse_dec
     imul eax, eax, 1000                       ; s → ms (0 stays 0 = never)
     mov [cfg_blank_ms], eax
+    jmp .pf_next_line
+.pf_blank_key:
+    call pf_to_value                          ; rsi → "Mod4+F12" / "none"
+    mov dword [cfg_blankkey_sym], 0           ; nothing until a sym resolves
+    mov byte [cfg_blankkey_mods], 0           ; (so `none` fully disables)
+.pf_bk_tok:
+    ; token = [rsi, rsi+rcx); ends at '+' (modifier) or ws/EOL (keysym)
+    xor ecx, ecx
+.pf_bk_len:
+    mov al, [rsi + rcx]
+    cmp al, '+'
+    je .pf_bk_end
+    cmp al, ' '
+    jbe .pf_bk_end                            ; space, tab, CR, LF, NUL
+    inc ecx
+    jmp .pf_bk_len
+.pf_bk_end:
+    test ecx, ecx
+    jz .pf_next_line                          ; empty token (trailing '+')
+    cmp al, '+'
+    jne .pf_bk_sym                            ; last token = the keysym
+    ; modifier token: Shift / Ctrl|Control / Alt|Mod1 / Super|Mod4 / Mod5
+    mov edx, [rsi]                            ; ≥4 bytes readable ('+' follows)
+    cmp ecx, 4
+    jne .pf_bk_m5
+    cmp edx, 'Mod4'
+    je .pf_bk_mod4
+    cmp edx, 'Mod1'
+    je .pf_bk_mod1
+    cmp edx, 'Mod5'
+    je .pf_bk_mod5
+    cmp edx, 'Ctrl'
+    je .pf_bk_ctrl
+    jmp .pf_bk_next                           ; unknown modifier: ignore
+.pf_bk_m5:
+    cmp ecx, 5
+    jne .pf_bk_m3
+    cmp edx, 'Shif'
+    je .pf_bk_shift
+    cmp edx, 'Supe'
+    je .pf_bk_mod4
+    jmp .pf_bk_next
+.pf_bk_m3:
+    cmp ecx, 3
+    jne .pf_bk_m7
+    cmp word [rsi], 'Al'
+    jne .pf_bk_next
+    cmp byte [rsi + 2], 't'
+    je .pf_bk_mod1
+    jmp .pf_bk_next
+.pf_bk_m7:
+    cmp ecx, 7
+    jne .pf_bk_next
+    cmp edx, 'Cont'
+    je .pf_bk_ctrl
+    jmp .pf_bk_next
+.pf_bk_mod4:
+    or byte [cfg_blankkey_mods], 0x40         ; MOD_MOD4
+    jmp .pf_bk_next
+.pf_bk_mod1:
+    or byte [cfg_blankkey_mods], 0x08         ; MOD_MOD1
+    jmp .pf_bk_next
+.pf_bk_mod5:
+    or byte [cfg_blankkey_mods], 0x80         ; MOD_MOD5
+    jmp .pf_bk_next
+.pf_bk_ctrl:
+    or byte [cfg_blankkey_mods], 0x04         ; MOD_CONTROL
+    jmp .pf_bk_next
+.pf_bk_shift:
+    or byte [cfg_blankkey_mods], 0x01         ; MOD_SHIFT
+.pf_bk_next:
+    lea rsi, [rsi + rcx + 1]                  ; past the '+'
+    jmp .pf_bk_tok
+.pf_bk_sym:
+    call pf_resolve_keysym                    ; (rsi,rcx) → eax, 0 if unknown
+    mov [cfg_blankkey_sym], eax               ; "none" resolves to 0 = off
     jmp .pf_next_line
 
 .pf_chk_bg:
@@ -10133,6 +10218,26 @@ init_keysyms:
     inc ecx
     jmp .iksr_loop
 .iksr_done:
+    ; Resolve blank_key's keysym to an X keycode (level-0 scan, AFTER the
+    ; remaps so e.g. F12-on-physical-Esc resolves to keycode 9). No match
+    ; (or `none`) leaves blank_kc = 0 = hotkey off.
+    mov dword [blank_kc], 0
+    mov eax, [cfg_blankkey_sym]
+    test eax, eax
+    jz .iks_bk_done
+    xor ecx, ecx
+.iks_bk_scan:
+    cmp ecx, KEYCODE_RANGE
+    jge .iks_bk_done
+    imul edx, ecx, 24
+    cmp [keysym_table + rdx], eax
+    je .iks_bk_hit
+    inc ecx
+    jmp .iks_bk_scan
+.iks_bk_hit:
+    lea edx, [ecx + X_MIN_KEYCODE]
+    mov [blank_kc], edx
+.iks_bk_done:
     ret
 
 ; ----------------------------------------------------------------------------
@@ -10467,6 +10572,26 @@ process_input:
     mov [last_input_mono], rax
     cmp byte [blank_state], 1
     jne .pi_awake
+    ; Dark: wake only on a key/button PRESS or pointer motion. A bare key
+    ; RELEASE stays dark — else letting go of the blank_key combo (or of
+    ; the key whose hold outlived the timeout) would instantly re-light.
+    xor ecx, ecx
+.pi_wake_scan:
+    cmp rcx, r13
+    jge .pi_awake
+    movzx eax, word [input_event_batch + rcx + 16]   ; type
+    cmp eax, EV_REL
+    je .pi_wake
+    cmp eax, EV_ABS
+    je .pi_wake
+    cmp eax, EV_KEY
+    jne .pi_wake_next
+    cmp dword [input_event_batch + rcx + 20], 1      ; press only
+    je .pi_wake
+.pi_wake_next:
+    add rcx, INPUT_EVENT_SIZE
+    jmp .pi_wake_scan
+.pi_wake:
     call comp_unblank
 .pi_awake:
     pop rax
@@ -10610,6 +10735,23 @@ dispatch_input_event:
 .die_nozap:
     ; x11_keycode = evdev_code + 8 (kept in r12d from here on).
     add r12d, 8
+
+    ; framerc blank_key: exact modifier match on the resolved keycode →
+    ; panel off NOW. Server-level like the zap/VT combos: the combo never
+    ; reaches clients (press blanks; its repeats + release are swallowed).
+    mov eax, [blank_kc]
+    test eax, eax
+    jz .die_no_blankkey
+    cmp eax, r12d
+    jne .die_no_blankkey
+    movzx eax, byte [mod_state]
+    cmp al, [cfg_blankkey_mods]
+    jne .die_no_blankkey
+    cmp r13d, 1
+    jne .die_done                            ; swallow repeat/release too
+    call comp_blank
+    jmp .die_done
+.die_no_blankkey:
 
     ; Release (value 0) → KeyRelease to the focused window.
     cmp r13d, 0
@@ -13984,6 +14126,8 @@ now_mono_ms:
 comp_blank:
     cmp byte [compositor_active], 0
     je .cb_out
+    cmp byte [fbtest_mode], 0                ; no panel, no CRTC — and a set
+    jne .cb_out                              ; blank_state would eat composites
     cmp byte [blank_state], 0
     jne .cb_out
     lea rdi, [blank_crtc_cmd]
