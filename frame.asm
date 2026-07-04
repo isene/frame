@@ -723,6 +723,12 @@ compositor_active:    resb 1               ; set to 1 after init_compositor wins
 comp_dirty:           resb 1               ; a draw happened; repaint once per
                                            ; serve-loop cycle (coalesced) instead
                                            ; of a full repaint + page-flip per req
+defer_bg_composite:   resb 1               ; a WM-managed toplevel was just
+                                           ; removed: hold the next composite ONE
+                                           ; cycle so the WM's replacement map
+                                           ; lands in the same paint (no bg
+                                           ; flash between tabbed apps). 16ms
+                                           ; poll fallback if nothing replaces it.
 dirtyfb_logged:       resb 1               ; log DIRTYFB return code only once
 sig_sa_buf:           resb 32              ; kernel struct sigaction
 
@@ -3249,6 +3255,9 @@ client_cleanup_resources:
     je .ccr_win_destroy
     mov byte [r15 + 28], 0
     mov byte [comp_dirty], 1
+    mov byte [defer_bg_composite], 1         ; app closed → hold one cycle so the
+                                             ; WM's next-tab map paints in the
+                                             ; same frame (no wallpaper flash)
     mov rdi, r15
     call damage_add_window
     mov rdi, r15
@@ -3670,21 +3679,24 @@ serve_loop:
     mov esi, MAX_CLIENTS + 1 + MAX_INPUTS + 1
     mov edx, -1                              ; infinite timeout when idle (no
     cmp byte [flip_pending], 0               ; wakeups → battery). But while a
-    je .sl_poll_go                           ; PAGE_FLIP is in flight, cap at
-    mov edx, 100                             ; 100ms: a DRM completion event
-.sl_poll_go:                                 ; that never arrives (driver quirk
-    syscall                                  ; on a mode/plane change, etc.)
-    test rax, rax                            ; would otherwise wedge flip_pending
-    jz .sl_flip_lost                         ; forever = frozen black screen.
+    jne .sl_poll_flip                        ; PAGE_FLIP is in flight, cap at
+    cmp byte [comp_dirty], 0                 ; 100ms; and after a one-cycle bg
+    je .sl_poll_go                           ; defer (comp_dirty held, no flip),
+    mov edx, 16                              ; wake in 16ms so the fallback
+    jmp .sl_poll_go                          ; bg-repaint still happens if the WM
+.sl_poll_flip:                               ; never maps a replacement.
+    mov edx, 100                             ; a DRM completion event that never
+.sl_poll_go:                                 ; arrives would otherwise wedge
+    syscall                                  ; flip_pending forever = black screen.
+    test rax, rax
+    jz .sl_poll_timeout
     js .sl_iter                              ; -EINTR or similar — re-poll
     jmp .sl_poll_done
-.sl_flip_lost:
-    ; poll timed out with a flip still pending → assume the event was lost and
-    ; unstick the compositor. If the flip was merely slow, the next present
-    ; gets -EBUSY and .rs_no_swap handles it. Only reachable while flip_pending
-    ; is set (idle poll is infinite), so no idle cost.
-    mov byte [flip_pending], 0
-    jmp .sl_iter
+.sl_poll_timeout:
+    cmp byte [flip_pending], 0               ; flip was pending → lost-flip path:
+    je .sl_poll_done                         ; unstick + re-poll. Else this was the
+    mov byte [flip_pending], 0               ; 16ms bg-defer fallback → fall to the
+    jmp .sl_iter                             ; composite check and paint it.
 .sl_poll_done:
 
     ; --- Listen fd ready: accept all pending connections.
@@ -3791,6 +3803,11 @@ serve_loop:
     je .sl_iter
     cmp byte [flip_pending], 0
     jne .sl_iter
+    cmp byte [defer_bg_composite], 0         ; a toplevel was just removed?
+    je .sl_do_composite
+    mov byte [defer_bg_composite], 0         ; consume the one-cycle grace: leave
+    jmp .sl_iter                             ; comp_dirty set, composite next time
+.sl_do_composite:                            ; (poll now uses a 16ms fallback)
     mov byte [comp_dirty], 0
     call recomposite_screen
     jmp .sl_iter
