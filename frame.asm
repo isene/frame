@@ -242,6 +242,7 @@ DEFAULT REL
 %define SHM_EVENT_BASE       94          ; ShmCompletion = base+0
 %define SHM_ERROR_BASE       156         ; BadShmSeg
 
+%define XTEST_MAJOR          128         ; XTEST (copyq paste, xdotool)
 %define SHAPE_MAJOR          129         ; SHAPE (spot's dim-with-hole overlays)
 %define SHAPE_EVENT_BASE     92          ; ShapeNotify = base+0 (never sent yet)
 %define SHAPE_MAX_SLOTS      8           ; shaped windows are rare (spot = 1)
@@ -300,6 +301,7 @@ shmid_ds_buf:       resb 128               ; shmctl(IPC_STAT) scratch (shm_segsz
 ; count 0 is a SET empty region (input: click-through) — distinct from no
 ; slot at all (unshaped).
 shape_slots:        resb SHAPE_MAX_SLOTS * SHAPE_SLOT_SIZE
+xtest_fake_ev:      resb 24                ; synthetic input_event for FakeInput
 bws_clip_save:      resd 4                 ; blit_window_shaped clip save
 bws_abs_x:          resd 1
 bws_abs_y:          resd 1
@@ -778,7 +780,7 @@ log_render_min:     db "RENDER minor=", 0
 log_rr_minor:       db "  RANDR minor=", 0
 ; ListExtensions STR list: length byte + name, 39 bytes total (matches the
 ; QueryExtension set exactly — advertising one obligates serving it).
-ext_names:          db 6, "RENDER", 5, "RANDR", 9, "XKEYBOARD", 15, "XInputExtension", 6, "XFIXES", 7, "MIT-SHM", 5, "SHAPE"
+ext_names:          db 6, "RENDER", 5, "RANDR", 9, "XKEYBOARD", 15, "XInputExtension", 6, "XFIXES", 7, "MIT-SHM", 5, "SHAPE", 5, "XTEST"
 ext_names_len       equ $ - ext_names       ; 46 bytes (5 STRs), padded to 48 in reply
 ; Keysym names for ~/.framerc `keycode` lines: db "name",0 + dd keysym;
 ; terminated by a lone 0 byte. Covers the user's ~/.Xmodmap vocabulary +
@@ -900,6 +902,7 @@ str_xinput:         db "XInputExtension"
 str_xfixes:         db "XFIXES"
 str_shm:            db "MIT-SHM"
 str_shape:          db "SHAPE"
+str_xtest:          db "XTEST"
 str_xi_pointer:     db "Virtual core pointer"      ; 20 bytes
 str_xi_keyboard:    db "Virtual core keyboard"     ; 21 bytes
 str_rel_x:          db "Rel X"
@@ -3240,6 +3243,7 @@ client_cleanup_resources:
     cmp [ptr_grab_slot], r12d
     jne .ccr_grab_ok
     mov dword [ptr_grab_win], 0
+    mov byte [ptr_grab_xi2], 0               ; stale XI2 routing wedges menus
 .ccr_grab_ok:
     ; Keyboard grab held by the dying client → release (a crashed rofi
     ; must not wedge the keyboard).
@@ -3247,6 +3251,7 @@ client_cleanup_resources:
     jne .ccr_kbd_ok
     mov dword [active_kbd_slot], -1
     mov dword [active_kbd_window], 0
+    mov byte [kbd_grab_xi2], 0
 .ccr_kbd_ok:
     ; Focus on a dying window → revert to PointerRoot.
     mov eax, [focus_window]
@@ -4128,6 +4133,8 @@ dispatch_request:
     je .dr_shm
     cmp eax, SHAPE_MAJOR
     je .dr_shape
+    cmp eax, XTEST_MAJOR
+    je .dr_xtest
     ; Void no-ops — requests with no reply that frame can safely accept and
     ; ignore. Silences the log noise and, for toolkits that follow them with
     ; a blocking round-trip, keeps the stream healthy. 36/37 Grab/UngrabServer
@@ -4204,6 +4211,12 @@ dispatch_request:
     mov edi, ebx
     mov rsi, r12
     call handle_shape
+    jmp .dr_done
+
+.dr_xtest:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_xtest
     jmp .dr_done
 
 .dr_xinput:
@@ -5037,7 +5050,7 @@ handle_query_extension:
 .qe_cmp_shape:
     mov dl, [rsi]
     cmp dl, [rdi]
-    jne .qe_send
+    jne .qe_try_xtest                        ; len 5 but not SHAPE → try XTEST
     inc rsi
     inc rdi
     dec ecx
@@ -5047,6 +5060,25 @@ handle_query_extension:
     mov byte [rdi + 9], SHAPE_MAJOR
     mov byte [rdi + 10], SHAPE_EVENT_BASE
     mov byte [rdi + 11], 0                   ; SHAPE defines no errors
+    jmp .qe_send
+
+.qe_try_xtest:
+    lea rsi, [r13 + 8]
+    lea rdi, [str_xtest]
+    mov ecx, 5
+.qe_cmp_xtest:
+    mov dl, [rsi]
+    cmp dl, [rdi]
+    jne .qe_send
+    inc rsi
+    inc rdi
+    dec ecx
+    jnz .qe_cmp_xtest
+    lea rdi, [reply_buf]
+    mov byte [rdi + 8], 1                    ; present = True
+    mov byte [rdi + 9], XTEST_MAJOR
+    mov byte [rdi + 10], 0                   ; XTest has no events
+    mov byte [rdi + 11], 0                   ; ...and no errors
 
 .qe_send:
     mov edi, [r12]
@@ -5055,6 +5087,177 @@ handle_query_extension:
     mov rdx, 32
     syscall
 
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; XTEST extension — synthetic input injection (copyq's paste-into-terminal,
+; xdotool). Minors: 0 GetVersion, 1 CompareCursor (trivial true), 2 FakeInput
+; (the one that matters), 3 GrabControl (void no-op). FakeInput synthesises a
+; 24-byte input_event and feeds dispatch_input_event — the exact pipeline
+; real evdev and --testinput use, so grabs/focus/modifiers all behave
+; identically. The request's time field (delay) is treated as 0/now.
+; ============================================================================
+handle_xtest:
+    movzx eax, byte [rsi + 1]
+    test eax, eax
+    jz .xt_get_version
+    cmp eax, 1
+    je .xt_compare_cursor
+    cmp eax, 2
+    je .xt_fake_input
+    ret                                      ; 3 GrabControl (void) + unknown
+
+.xt_get_version:
+    mov esi, 32
+    call xkb_reply_zero
+    mov byte [rdi + 1], 2                    ; majorVersion = 2
+    mov word [rdi + 8], 2                    ; minorVersion = 2
+    mov edi, r15d
+    lea rsi, [reply_buf]
+    mov edx, r8d
+    mov eax, SYS_WRITE
+    syscall
+    ret
+
+.xt_compare_cursor:
+    mov esi, 32
+    call xkb_reply_zero
+    mov byte [rdi + 1], 1                    ; same = True
+    mov edi, r15d
+    lea rsi, [reply_buf]
+    mov edx, r8d
+    mov eax, SYS_WRITE
+    syscall
+    ret
+
+.xt_fake_input:
+    ; Embedded core-event layout: type@+4 detail@+5 time@+8 root@+12
+    ; rootX s16 @+24  rootY s16 @+26.
+    push rbx
+    push r12
+    push r13
+    mov r12, rsi
+    ; Stamp the synthetic event with the current server time so
+    ; server_time_ms doesn't jump backwards (dispatch derives it from the
+    ; record's tv fields).
+    lea rbx, [xtest_fake_ev]
+    mov eax, [server_time_ms]
+    xor edx, edx
+    mov ecx, 1000
+    div ecx                                  ; eax = sec, edx = ms
+    mov [rbx], rax                           ; tv_sec (upper bits 0)
+    imul edx, 1000
+    mov [rbx + 8], rdx                       ; tv_usec (upper bits 0)
+    movzx eax, byte [r12 + 4]                ; fake event type
+    movzx r13d, byte [r12 + 5]               ; detail
+    cmp eax, 2
+    je .xt_key_press
+    cmp eax, 3
+    je .xt_key_release
+    cmp eax, 4
+    je .xt_btn_press
+    cmp eax, 5
+    je .xt_btn_release
+    cmp eax, 6
+    je .xt_motion
+    jmp .xt_out
+
+.xt_key_press:
+    mov ecx, 1
+    jmp .xt_key
+.xt_key_release:
+    xor ecx, ecx
+.xt_key:
+    ; X keycode = evdev code + 8
+    sub r13d, 8
+    js  .xt_out
+    mov word [rbx + 16], EV_KEY
+    mov [rbx + 18], r13w
+    mov [rbx + 20], ecx
+    lea rdi, [rbx]
+    call dispatch_input_event
+    jmp .xt_out
+
+.xt_btn_press:
+    mov ecx, 1
+    jmp .xt_btn
+.xt_btn_release:
+    xor ecx, ecx
+.xt_btn:
+    ; buttons 4-7 are wheel steps: one EV_REL on press, nothing on release
+    cmp r13d, 4
+    jb  .xt_btn_real
+    cmp r13d, 7
+    ja  .xt_btn_real
+    test ecx, ecx
+    jz  .xt_out                              ; wheel release = no-op
+    mov word [rbx + 16], EV_REL
+    mov word [rbx + 18], 8                   ; REL_WHEEL
+    mov edx, 1
+    cmp r13d, 4
+    je  .xt_wheel_set
+    mov edx, -1
+.xt_wheel_set:
+    mov [rbx + 20], edx
+    lea rdi, [rbx]
+    call dispatch_input_event
+    jmp .xt_out
+.xt_btn_real:
+    ; 1=BTN_LEFT 2=BTN_MIDDLE 3=BTN_RIGHT 8=BTN_SIDE 9=BTN_EXTRA
+    mov edx, 0x110                           ; BTN_LEFT
+    cmp r13d, 2
+    jne .xt_b3q
+    mov edx, 0x112                           ; BTN_MIDDLE
+.xt_b3q:
+    cmp r13d, 3
+    jne .xt_b8q
+    mov edx, 0x111                           ; BTN_RIGHT
+.xt_b8q:
+    cmp r13d, 8
+    jne .xt_b9q
+    mov edx, 0x113                           ; BTN_SIDE
+.xt_b9q:
+    cmp r13d, 9
+    jne .xt_bset
+    mov edx, 0x114                           ; BTN_EXTRA
+.xt_bset:
+    mov word [rbx + 16], EV_KEY
+    mov [rbx + 18], dx
+    mov [rbx + 20], ecx
+    lea rdi, [rbx]
+    call dispatch_input_event
+    jmp .xt_out
+
+.xt_motion:
+    ; detail 0 = absolute (rootX/rootY are targets), 1 = relative deltas.
+    movsx eax, word [r12 + 24]               ; rootX
+    movsx edx, word [r12 + 26]               ; rootY
+    cmp r13d, 0
+    jne .xt_mot_rel
+    sub eax, [cursor_x]
+    sub edx, [cursor_y]
+.xt_mot_rel:
+    push rdx
+    test eax, eax
+    jz  .xt_mot_y
+    mov word [rbx + 16], EV_REL
+    mov word [rbx + 18], 0                   ; REL_X
+    mov [rbx + 20], eax
+    lea rdi, [rbx]
+    call dispatch_input_event
+.xt_mot_y:
+    pop rdx
+    test edx, edx
+    jz  .xt_out
+    mov word [rbx + 16], EV_REL
+    mov word [rbx + 18], 1                   ; REL_Y
+    mov [rbx + 20], edx
+    lea rdi, [rbx]
+    call dispatch_input_event
+.xt_out:
     pop r13
     pop r12
     pop rbx
@@ -6806,10 +7009,10 @@ handle_list_extensions:
 
     lea rdi, [reply_buf]
     mov byte [rdi + 0], 1
-    mov byte [rdi + 1], 7                    ; nExtensions
+    mov byte [rdi + 1], 8                    ; nExtensions
     mov ecx, [r12 + 8]
     mov [rdi + 2], cx
-    mov dword [rdi + 4], 15                  ; 60 bytes of names (exact)
+    mov dword [rdi + 4], 17                  ; 68 bytes of names (66 + 2 pad)
     mov dword [rdi + 8], 0
     mov dword [rdi + 12], 0
     mov dword [rdi + 16], 0
@@ -6826,7 +7029,7 @@ handle_list_extensions:
     mov edi, [r12]
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
-    mov rdx, 92                              ; 32 header + 60 names
+    mov rdx, 100                             ; 32 header + 68 names
     syscall
 
     pop r12
@@ -8091,7 +8294,17 @@ handle_destroy_window:
     cmp ecx, [ptr_grab_win]
     jne .hd_nograb
     mov dword [ptr_grab_win], 0
+    mov byte [ptr_grab_xi2], 0
 .hd_nograb:
+    ; A dying window holding the KEYBOARD grab wedged all key input (GTK
+    ; menus grab pointer AND keyboard; only the pointer was released).
+    mov ecx, [r13]
+    cmp ecx, [active_kbd_window]
+    jne .hd_nokbd
+    mov dword [active_kbd_slot], -1
+    mov dword [active_kbd_window], 0
+    mov byte [kbd_grab_xi2], 0
+.hd_nokbd:
     ; If the window is still MAPPED, send its own UnmapNotify first — Xorg
     ; unmaps before destroy, and GTK's map/unmap freeze/thaw needs the pair.
     cmp byte [r13 + 28], 0
@@ -8252,7 +8465,15 @@ handle_unmap_window:
     cmp eax, [ptr_grab_win]
     jne .uw_nograb
     mov dword [ptr_grab_win], 0
+    mov byte [ptr_grab_xi2], 0
 .uw_nograb:
+    mov eax, [r12]                            ; keyboard grab too (GTK menus
+    cmp eax, [active_kbd_window]              ; grab both; a badly-closed menu
+    jne .uw_nokbd                             ; must not wedge key input)
+    mov dword [active_kbd_slot], -1
+    mov dword [active_kbd_window], 0
+    mov byte [kbd_grab_xi2], 0
+.uw_nokbd:
     ; Send the window its OWN UnmapNotify (StructureNotify) — mirrors the
     ; MapNotify in handle_map_window. Without it GTK's map/unmap freeze/thaw
     ; underflows (Gdk-CRITICAL thaw assertion -> GIMP aborts on menu use).
