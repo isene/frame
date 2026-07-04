@@ -106,6 +106,8 @@ DEFAULT REL
 %define IPC_STAT        2
 %define SHM_RDONLY      0x1000
 %define SYS_NANOSLEEP   35
+%define SYS_CLOCK_GETTIME 228
+%define CLOCK_MONOTONIC 1
 %define PROT_RW         3            ; PROT_READ | PROT_WRITE
 %define MAP_SHARED      1
 %define MAP_PRIVATE     2
@@ -302,6 +304,14 @@ shmid_ds_buf:       resb 128               ; shmctl(IPC_STAT) scratch (shm_segsz
 ; slot at all (unshaped).
 shape_slots:        resb SHAPE_MAX_SLOTS * SHAPE_SLOT_SIZE
 xtest_fake_ev:      resb 24                ; synthetic input_event for FakeInput
+
+; ---- screen auto-off (framerc blank_timeout, default 600s, 0 = never) ----
+cfg_blank_ms:       resd 1                 ; idle ms before panel off
+blank_state:        resb 1                 ; 1 = panel currently off
+    alignb 8
+last_input_mono:    resq 1                 ; CLOCK_MONOTONIC ms of last input
+mono_ts:            resq 2                 ; clock_gettime scratch
+blank_crtc_cmd:     resb 104               ; zeroed SETCRTC = CRTC off
 bws_clip_save:      resd 4                 ; blit_window_shaped clip save
 bws_abs_x:          resd 1
 bws_abs_y:          resd 1
@@ -886,6 +896,10 @@ log_input_pre:      db "opened ", 0
 log_input_pre_len   equ $ - log_input_pre - 1
 log_input_suf:      db " input device(s)", 10
 log_input_suf_len   equ $ - log_input_suf
+log_blank:          db "frame: panel off (idle blank_timeout)", 10
+log_blank_len       equ $ - log_blank
+log_unblank:        db "frame: panel on (input)", 10
+log_unblank_len     equ $ - log_unblank
 log_comp_pre:       db "compositor: mode ", 0
 log_comp_pre_len    equ $ - log_comp_pre - 1
 log_comp_x:         db "x"
@@ -1399,6 +1413,7 @@ _start:
 .main_fbtest_init:
     call init_fbtest
 .main_fbtest_done:
+    mov dword [cfg_blank_ms], -1             ; sentinel: blank_timeout default
     call read_framerc                        ; ~/.framerc → keymap_is_no
     cmp byte [fbtest_mode], 0                 ; fbtest: dims already set by init_fbtest,
     je .wp_not_fbtest                         ; so load the wallpaper now (--display
@@ -3706,13 +3721,46 @@ serve_loop:
     cmp byte [flip_pending], 0               ; wakeups → battery). But while a
     jne .sl_poll_flip                        ; PAGE_FLIP is in flight, cap at
     cmp byte [comp_dirty], 0                 ; 100ms; and after a one-cycle bg
-    je .sl_poll_go                           ; defer (comp_dirty held, no flip),
+    je .sl_chk_blank                         ; defer (comp_dirty held, no flip),
     mov edx, 16                              ; wake in 16ms so the fallback
     jmp .sl_poll_go                          ; bg-repaint still happens if the WM
 .sl_poll_flip:                               ; never maps a replacement.
     mov edx, 100                             ; a DRM completion event that never
-.sl_poll_go:                                 ; arrives would otherwise wedge
-    syscall                                  ; flip_pending forever = black screen.
+    jmp .sl_poll_go                          ; arrives would otherwise wedge
+.sl_chk_blank:                               ; flip_pending forever = black screen.
+    ; Fully idle. Screen auto-off: wake exactly once, at the blank deadline.
+    ; Once blanked (or disabled/fbtest) the timeout stays infinite — zero
+    ; idle wakeups either way.
+    cmp byte [compositor_active], 0
+    je .sl_poll_go
+    cmp byte [fbtest_mode], 0                ; no panel to power off — and
+    jne .sl_poll_go                          ; last_input_mono is never armed
+    cmp byte [blank_state], 0
+    jne .sl_poll_go
+    mov eax, [cfg_blank_ms]
+    test eax, eax
+    jz .sl_poll_go
+    push rax
+    call now_mono_ms
+    pop rcx                                  ; cfg ms
+    mov rdx, [last_input_mono]
+    add rdx, rcx                             ; deadline
+    sub rdx, rax                             ; remaining
+    jg  .sl_blank_wait
+    call comp_blank                          ; deadline passed → panel off
+    mov edx, -1
+    jmp .sl_poll_go
+.sl_blank_wait:
+    mov rax, 0x7FFFFFFF                      ; cap to poll's int range
+    cmp rdx, rax
+    cmova rdx, rax
+    mov edx, edx                             ; timeout = ms until blank
+.sl_poll_go:
+    ; re-load the poll registers — the blank-deadline path clobbers them
+    mov rax, SYS_POLL
+    lea rdi, [pollfd_buf]
+    mov esi, MAX_CLIENTS + 1 + MAX_INPUTS + 1
+    syscall                                  ; (timeout in edx)
     test rax, rax
     jz .sl_poll_timeout
     js .sl_iter                              ; -EINTR or similar — re-poll
@@ -3826,7 +3874,12 @@ serve_loop:
     ; comp_dirty + damage rects rather than repainting per request.
     cmp byte [comp_dirty], 0
     je .sl_iter
-    cmp byte [flip_pending], 0
+    cmp byte [blank_state], 0                ; panel dark: swallow the dirt —
+    je .sl_blank_ok                          ; compositing (and flipping on a
+    mov byte [comp_dirty], 0                 ; disabled CRTC) is pure waste, and
+    jmp .sl_iter                             ; a held comp_dirty means 16ms
+.sl_blank_ok:                                ; wakeups forever. Unblank forces a
+    cmp byte [flip_pending], 0               ; full repaint anyway.
     jne .sl_iter
     cmp byte [defer_bg_composite], 0         ; a toplevel was just removed?
     je .sl_do_composite
@@ -9551,7 +9604,7 @@ parse_framerc:
     ; cursor_color = RRGGBB  /  cursor_transparency = N
     mov eax, [rsi]
     cmp eax, 'curs'
-    jne .pf_chk_bg
+    jne .pf_chk_blank
     mov al, [rsi + 7]                          ; cursor_[c]olor / [t]ransparency
     cmp al, 'c'
     je .pf_cur_color
@@ -9566,6 +9619,18 @@ parse_framerc:
     call pf_parse_hex
     mov [cursor_rgb], eax
     jmp .pf_next_line
+.pf_chk_blank:
+    ; blank_timeout = N (seconds of idle before the panel powers off;
+    ; 0 disables). Default 600.
+    mov eax, [rsi]
+    cmp eax, 'blan'
+    jne .pf_chk_bg
+    call pf_to_value
+    call pf_parse_dec
+    imul eax, eax, 1000                       ; s → ms (0 stays 0 = never)
+    mov [cfg_blank_ms], eax
+    jmp .pf_next_line
+
 .pf_chk_bg:
     ; background = <path to raw BGRX file>
     mov eax, [rsi]
@@ -10395,6 +10460,16 @@ process_input:
     test rax, rax
     jle .pi_done                             ; 0=EOF, <0=error/EAGAIN
     mov r13, rax                             ; total bytes
+    ; Screen auto-off bookkeeping: stamp the idle clock once per batch (one
+    ; clock_gettime per wake, not per event) and wake the panel if dark.
+    push rax
+    call now_mono_ms
+    mov [last_input_mono], rax
+    cmp byte [blank_state], 1
+    jne .pi_awake
+    call comp_unblank
+.pi_awake:
+    pop rax
     xor ebx, ebx
 .pi_event:
     cmp rbx, r13
@@ -12802,6 +12877,17 @@ init_compositor:
 
     mov byte [compositor_active], 1
 
+    ; Arm the screen auto-off clock. The framerc parser ran before this and
+    ; left cfg_blank_ms = -1 (sentinel) when no blank_timeout line existed —
+    ; apply the 600s default in that case (explicit 0 = never stays 0).
+    cmp dword [cfg_blank_ms], -1
+    jne .ic_blank_cfg_ok
+    mov dword [cfg_blank_ms], 600000
+.ic_blank_cfg_ok:
+    call now_mono_ms
+    mov [last_input_mono], rax
+    mov byte [blank_state], 0
+
     ; Bring up the hardware cursor sprite (non-fatal if unsupported).
     call init_hw_cursor
 
@@ -13869,6 +13955,77 @@ bg_fill_rect:
 ; (Ctrl+C), SIGTERM (kill / the test script's cleanup), and SIGHUP so
 ; any of them runs compositor_shutdown before exiting.
 ; ============================================================================
+
+; ----------------------------------------------------------------------------
+; now_mono_ms — rax = CLOCK_MONOTONIC in milliseconds.
+; ----------------------------------------------------------------------------
+now_mono_ms:
+    push rcx
+    mov rax, SYS_CLOCK_GETTIME
+    mov edi, CLOCK_MONOTONIC
+    lea rsi, [mono_ts]
+    syscall
+    mov rax, [mono_ts]
+    imul rax, rax, 1000
+    push rax
+    mov rax, [mono_ts + 8]
+    xor edx, edx
+    mov rcx, 1000000
+    div rcx
+    pop rcx
+    add rax, rcx
+    pop rcx
+    ret
+
+; ----------------------------------------------------------------------------
+; comp_blank — panel off after blank_timeout of idle: SETCRTC with no fb and
+; no mode disables the CRTC; the display engine and eDP panel power down.
+; ----------------------------------------------------------------------------
+comp_blank:
+    cmp byte [compositor_active], 0
+    je .cb_out
+    cmp byte [blank_state], 0
+    jne .cb_out
+    lea rdi, [blank_crtc_cmd]
+    xor eax, eax
+    mov ecx, 13
+    rep stosq
+    mov eax, [drm_chosen_crtc]
+    mov [blank_crtc_cmd + 12], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_SETCRTC
+    lea rdx, [blank_crtc_cmd]
+    syscall
+    mov byte [blank_state], 1
+    lea rsi, [log_blank]
+    mov rdx, log_blank_len
+    call write_stderr
+.cb_out:
+    ret
+
+; ----------------------------------------------------------------------------
+; comp_unblank — input arrived while dark: replay the compositor's SETCRTC
+; (drm_crtc_set stays populated from init) and force a full repaint.
+; ----------------------------------------------------------------------------
+comp_unblank:
+    cmp byte [blank_state], 1
+    jne .cu_out
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_SETCRTC
+    lea rdx, [drm_crtc_set]
+    syscall
+    mov byte [blank_state], 0
+    mov byte [flip_pending], 0               ; any in-flight flip died with the CRTC
+    mov dword [dmg_count0], -1               ; whole-screen repaint, both buffers
+    mov dword [dmg_count1], -1
+    mov byte [comp_dirty], 1
+    lea rsi, [log_unblank]
+    mov rdx, log_unblank_len
+    call write_stderr
+.cu_out:
+    ret
 
 ; ----------------------------------------------------------------------------
 ; install_exit_handler — edi = signal number. Installs exit_handler with

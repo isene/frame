@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.91-blue)
+![Version](https://img.shields.io/badge/version-0.0.92-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -227,6 +227,7 @@ sensitivity = 75           # pointer speed, percent of raw (default 100)
 cursor_color = ffffff      # cursor fill colour, RRGGBB hex (default ffffff)
 cursor_transparency = 50   # cursor % transparent: 0 solid .. 100 invisible (default 50)
 background = ~/.framebg    # desktop wallpaper: a raw BGRX file at panel res
+blank_timeout = 600        # idle seconds before the panel powers off (0 = never)
 ```
 
 `keymap`: `us` (the default, or no file) is the standard US layout. `no`
@@ -243,6 +244,14 @@ client (glass, xterm, …) picks it up.
 see-through it is. The black outline is always kept for contrast. Colour
 is `RRGGBB` hex; transparency `0` is solid, `100` fully invisible. Free
 alpha — the DRM cursor plane blends it in hardware.
+
+`blank_timeout`: screen auto-off, like `xset dpms` on Xorg. After this many
+seconds without keyboard/mouse/touchpad input the compositor disables the
+CRTC — the display engine and eDP panel power down completely. Any input
+wakes it back up with a full repaint. Battery-tight by design: frame wakes
+exactly once at the deadline (the idle poll timeout IS the deadline), and
+while dark it sleeps indefinitely, swallowing client redraws. Default 600
+(10 minutes); `0` disables.
 
 `background`: a desktop wallpaper, drawn natively by the compositor (no feh,
 no root-pixmap). frame carries no image decoder, so the value points at a
