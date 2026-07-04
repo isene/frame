@@ -13282,21 +13282,69 @@ compositor_shutdown:
     cmp byte [compositor_active], 0
     je .cs_done
     mov byte [compositor_active], 0          ; idempotent guard
+    cmp byte [fbtest_mode], 0                ; --fbtest has no DRM/panel to
+    jne .cs_done                             ; restore (buffers are anon mmaps)
 
-    ; Restore the console's original CRTC. drm_crtc_save was filled by
-    ; GETCRTC in init_compositor; replaying it via SETCRTC puts the text
-    ; framebuffer back on the panel.
+    ; 1. Restore the console's original CRTC. drm_crtc_save was filled by
+    ;    GETCRTC in init_compositor; replaying it via SETCRTC puts the text
+    ;    framebuffer back on the panel (and off frame's soon-to-be-freed fb).
     mov rax, SYS_IOCTL
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_SETCRTC
     lea rdx, [drm_crtc_save]
     syscall
 
-    ; Drop DRM master so the next session (gdm/Xorg) can take it.
+    ; 2. Tear down BOTH compositor buffers: RMFB → munmap → DESTROY_DUMB. Doing
+    ;    this deterministically here (not implicitly at exit) is what lets the
+    ;    next DRM master — gdm/Xorg — reclaim KMS cleanly. Leaving frame's fbs
+    ;    registered across the master handoff can wedge the next modeset.
+    mov eax, [comp_fbid + 0]
+    mov [drm_dumb_destroy], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_RMFB
+    lea rdx, [drm_dumb_destroy]
+    syscall
+    mov rax, SYS_MUNMAP
+    mov rdi, [comp_addr + 0]
+    mov rsi, [drm_dumb_size]
+    syscall
+    mov eax, [comp_handle + 0]
+    mov [drm_dumb_destroy], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_DESTROY_DUMB
+    lea rdx, [drm_dumb_destroy]
+    syscall
+
+    mov eax, [comp_fbid + 4]
+    mov [drm_dumb_destroy], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_RMFB
+    lea rdx, [drm_dumb_destroy]
+    syscall
+    mov rax, SYS_MUNMAP
+    mov rdi, [comp_addr + 8]
+    mov rsi, [drm_dumb_size]
+    syscall
+    mov eax, [comp_handle + 4]
+    mov [drm_dumb_destroy], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_DESTROY_DUMB
+    lea rdx, [drm_dumb_destroy]
+    syscall
+
+    ; 3. Drop DRM master, then CLOSE the fd — releasing master + every remaining
+    ;    resource before we exit, so gdm/Xorg finds a fully-free device.
     mov rax, SYS_IOCTL
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_DROP_MASTER
     xor edx, edx
+    syscall
+    mov rax, SYS_CLOSE
+    mov rdi, [drm_fd]
     syscall
 .cs_done:
     ret
