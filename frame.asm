@@ -10621,8 +10621,44 @@ pointer_crossings:
     ret
 
 ; ----------------------------------------------------------------------------
+; core_motion_wanted — eax = a core event mask. Returns ZF=0 (jnz) if a
+; MotionNotify should be delivered for the current button_state:
+;   PointerMotionMask   (0x40)          → always
+;   Button[1-5]MotionMask (0x100..0x1000) → while THAT button is held
+;   ButtonMotionMask    (0x2000)        → while ANY button is held
+; The per-button selection bits line up with button_state's bits, so an AND
+; tests "selected AND held" in one step. This is what makes drag-select work
+; (scrot -s, DND): those grab with ButtonMotionMask, not PointerMotionMask.
+; Clobbers eax only (ecx/edx preserved).
+; ----------------------------------------------------------------------------
+core_motion_wanted:
+    push rcx
+    push rdx
+    test eax, 0x40                           ; PointerMotionMask → unconditional
+    jnz .cmw_yes
+    mov edx, eax
+    and edx, 0x1F00                          ; Button1..5MotionMask bits selected
+    and edx, [button_state]                  ; ...AND that button currently held
+    jnz .cmw_yes
+    test eax, 0x2000                          ; ButtonMotionMask → any button held
+    jz .cmw_no
+    cmp dword [button_state], 0
+    jne .cmw_yes
+.cmw_no:
+    xor eax, eax                             ; ZF=1 → don't deliver
+    pop rdx
+    pop rcx
+    ret
+.cmw_yes:
+    mov eax, 1
+    test eax, eax                            ; ZF=0 → deliver
+    pop rdx
+    pop rcx
+    ret
+
 ; deliver_pointer_motion — send MotionNotify to the window under the cursor
-; if it selected PointerMotionMask (0x40). No-op otherwise.
+; (or, during a grab, to the grabbing client) if the core mask wants motion
+; for the current button_state (see core_motion_wanted). No-op otherwise.
 ; ----------------------------------------------------------------------------
 deliver_pointer_motion:
     push rbx
@@ -10640,9 +10676,11 @@ deliver_pointer_motion:
     ; and a click has no selected item to activate.
     test dword [rbx + 52], 0x40             ; XI2 Motion selected → skip core gate
     jnz .dpm_gdeliver
-    test dword [rbx + 24], 0x40             ; target window wants motion?
+    mov eax, [rbx + 24]                     ; target window's core mask wants motion?
+    call core_motion_wanted
     jnz .dpm_gdeliver
-    test dword [ptr_grab_mask], 0x40        ; else the grab itself wants motion?
+    mov eax, [ptr_grab_mask]                ; else the grab's mask (scrot -s: Button
+    call core_motion_wanted                 ; MotionMask while dragging → deliver)
     jz .dpm_done
 .dpm_gdeliver:
     mov r8d, [cursor_x]
@@ -10663,7 +10701,8 @@ deliver_pointer_motion:
     call pointer_crossings                   ; Enter/Leave BEFORE motion gating
     test dword [rbx + 52], 0x40              ; XI2 Motion selected?
     jnz .dpm_calc
-    test dword [rbx + 24], 0x40              ; core PointerMotionMask
+    mov eax, [rbx + 24]                      ; core mask (Pointer/Button motion)
+    call core_motion_wanted
     jz .dpm_done
 .dpm_calc:
     mov r8d, [cursor_x]
