@@ -241,6 +241,14 @@ DEFAULT REL
 %define SHM_MAJOR            130         ; MIT-SHM (shared-memory image transfer)
 %define SHM_EVENT_BASE       94          ; ShmCompletion = base+0
 %define SHM_ERROR_BASE       156         ; BadShmSeg
+
+%define SHAPE_MAJOR          129         ; SHAPE (spot's dim-with-hole overlays)
+%define SHAPE_EVENT_BASE     92          ; ShapeNotify = base+0 (never sent yet)
+%define SHAPE_MAX_SLOTS      8           ; shaped windows are rare (spot = 1)
+%define SHAPE_MAX_RECTS      2048        ; spot: 2 bands + 2 slivers × 2R rows ≈ 562
+%define SHAPE_SLOT_SIZE      (16 + SHAPE_MAX_RECTS*8)
+%define SHAPE_KIND_BOUNDING  0
+%define SHAPE_KIND_INPUT     2
 %define X_RID_MASK           0x001FFFFF
 
 ; ============================================================================
@@ -285,6 +293,17 @@ xfixes_sub_evbuf:   resb 32
 SHM_SEG_MAX         equ 32
 shm_segs:           resb SHM_SEG_MAX * 24
 shmid_ds_buf:       resb 128               ; shmctl(IPC_STAT) scratch (shm_segsz @ +48)
+
+; ---- SHAPE state ------------------------------------------------------------
+; Per (window, kind) rect lists. Slot: +0 xid, +4 kind, +8 count, +12 pad,
+; +16 rects (x s16, y s16, w u16, h u16 each, window-local). A slot with
+; count 0 is a SET empty region (input: click-through) — distinct from no
+; slot at all (unshaped).
+shape_slots:        resb SHAPE_MAX_SLOTS * SHAPE_SLOT_SIZE
+bws_clip_save:      resd 4                 ; blit_window_shaped clip save
+bws_abs_x:          resd 1
+bws_abs_y:          resd 1
+sih_result:         resb 1                 ; shape_input_hit scratch flag
 framerc_path:       resb 256               ; "$HOME/.framerc"
 framerc_buf:        resb 2048              ; ~/.framerc contents
 WALL_MAX            equ 1920*1200*4        ; max backing for the wallpaper (panel res)
@@ -759,7 +778,7 @@ log_render_min:     db "RENDER minor=", 0
 log_rr_minor:       db "  RANDR minor=", 0
 ; ListExtensions STR list: length byte + name, 39 bytes total (matches the
 ; QueryExtension set exactly — advertising one obligates serving it).
-ext_names:          db 6, "RENDER", 5, "RANDR", 9, "XKEYBOARD", 15, "XInputExtension", 6, "XFIXES", 7, "MIT-SHM"
+ext_names:          db 6, "RENDER", 5, "RANDR", 9, "XKEYBOARD", 15, "XInputExtension", 6, "XFIXES", 7, "MIT-SHM", 5, "SHAPE"
 ext_names_len       equ $ - ext_names       ; 46 bytes (5 STRs), padded to 48 in reply
 ; Keysym names for ~/.framerc `keycode` lines: db "name",0 + dd keysym;
 ; terminated by a lone 0 byte. Covers the user's ~/.Xmodmap vocabulary +
@@ -880,6 +899,7 @@ str_randr:          db "RANDR"
 str_xinput:         db "XInputExtension"
 str_xfixes:         db "XFIXES"
 str_shm:            db "MIT-SHM"
+str_shape:          db "SHAPE"
 str_xi_pointer:     db "Virtual core pointer"      ; 20 bytes
 str_xi_keyboard:    db "Virtual core keyboard"     ; 21 bytes
 str_rel_x:          db "Rel X"
@@ -4106,6 +4126,8 @@ dispatch_request:
     je .dr_xfixes
     cmp eax, SHM_MAJOR
     je .dr_shm
+    cmp eax, SHAPE_MAJOR
+    je .dr_shape
     ; Void no-ops — requests with no reply that frame can safely accept and
     ; ignore. Silences the log noise and, for toolkits that follow them with
     ; a blocking round-trip, keeps the stream healthy. 36/37 Grab/UngrabServer
@@ -4176,6 +4198,12 @@ dispatch_request:
     mov rsi, r12
     mov edx, r13d
     call handle_shm
+    jmp .dr_done
+
+.dr_shape:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_shape
     jmp .dr_done
 
 .dr_xinput:
@@ -4948,7 +4976,7 @@ handle_query_extension:
 .qe_cmp_rr:
     mov dl, [rsi]
     cmp dl, [rdi]
-    jne .qe_send
+    jne .qe_try_shape                        ; len 5 but not RANDR → try SHAPE
     inc rsi
     inc rdi
     dec ecx
@@ -4981,7 +5009,7 @@ handle_query_extension:
     jmp .qe_send
 .qe_try_shm:
     cmp eax, 7
-    jne .qe_send
+    jne .qe_try_shape
     lea rsi, [r13 + 8]
     lea rdi, [str_shm]
     mov ecx, 7
@@ -4998,6 +5026,27 @@ handle_query_extension:
     mov byte [rdi + 9], SHM_MAJOR
     mov byte [rdi + 10], SHM_EVENT_BASE
     mov byte [rdi + 11], SHM_ERROR_BASE
+    jmp .qe_send
+
+.qe_try_shape:
+    cmp eax, 5
+    jne .qe_send
+    lea rsi, [r13 + 8]
+    lea rdi, [str_shape]
+    mov ecx, 5
+.qe_cmp_shape:
+    mov dl, [rsi]
+    cmp dl, [rdi]
+    jne .qe_send
+    inc rsi
+    inc rdi
+    dec ecx
+    jnz .qe_cmp_shape
+    lea rdi, [reply_buf]
+    mov byte [rdi + 8], 1                    ; present = True
+    mov byte [rdi + 9], SHAPE_MAJOR
+    mov byte [rdi + 10], SHAPE_EVENT_BASE
+    mov byte [rdi + 11], 0                   ; SHAPE defines no errors
 
 .qe_send:
     mov edi, [r12]
@@ -5009,6 +5058,343 @@ handle_query_extension:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; ============================================================================
+; SHAPE extension — minors: 0 QueryVersion, 1 Rectangles (the one spot uses),
+; 5 QueryExtents, 6 SelectInput (no-op), 7 InputSelected, 8 GetRectangles.
+; Mask/Combine/Offset (2/3/4) are void and ignored. Regions are stored as
+; window-local rect lists in shape_slots; the compositor honours bounding
+; regions in blit_window_shaped, the pickers honour input regions via
+; shape_input_hit (empty input region = click-through — spot's overlay).
+; ============================================================================
+handle_shape:
+    movzx eax, byte [rsi + 1]
+    test eax, eax
+    jz .shp_query_version
+    cmp eax, 1
+    je .shp_rectangles
+    cmp eax, 5
+    je .shp_query_extents
+    cmp eax, 6
+    je .shp_done                             ; SelectInput — void, no events yet
+    cmp eax, 7
+    je .shp_input_selected
+    cmp eax, 8
+    je .shp_get_rectangles
+.shp_done:
+    ret
+
+.shp_query_version:
+    mov esi, 32
+    call xkb_reply_zero                      ; rdi=buf r15d=fd r8d=total
+    mov byte [rdi + 1], 0
+    mov word [rdi + 8], 1                    ; majorVersion
+    mov word [rdi + 10], 1                   ; minorVersion
+    mov edi, r15d
+    lea rsi, [reply_buf]
+    mov edx, r8d
+    mov eax, SYS_WRITE
+    syscall
+    ret
+
+.shp_rectangles:
+    ; +4 op  +5 kind  +6 ordering  +8 window  +12 xOff s16  +14 yOff s16
+    ; +16.. rects (8 bytes each). Length = 4 + 2n words. op treated as Set
+    ; (spot re-sends the full list each move).
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rsi                             ; req
+    movzx ebx, byte [rsi + 5]                ; kind
+    cmp ebx, 1
+    je .shp_r_out                            ; clip region — nothing to clip
+    mov r13d, [rsi + 8]                      ; window xid
+    movzx ecx, word [rsi + 2]                ; request length (words)
+    sub ecx, 4
+    shr ecx, 1                               ; rect count
+    cmp ecx, SHAPE_MAX_RECTS
+    jbe .shp_r_cap
+    mov ecx, SHAPE_MAX_RECTS
+.shp_r_cap:
+    mov r14d, ecx
+    mov edi, r13d
+    mov esi, ebx
+    call shape_slot_get
+    test rax, rax
+    jz .shp_r_out                            ; table full → ignore
+    mov [rax + 8], r14d                      ; count (0 = SET empty region)
+    ; Copy rects, applying the request's xOff/yOff to each.
+    lea rdi, [rax + 16]
+    lea rsi, [r12 + 16]
+    movsx r8d, word [r12 + 12]               ; xOff
+    movsx r9d, word [r12 + 14]               ; yOff
+    mov ecx, r14d
+.shp_r_copy:
+    test ecx, ecx
+    jz .shp_r_copied
+    movsx edx, word [rsi]
+    add edx, r8d
+    mov [rdi], dx                            ; x + xOff
+    movsx edx, word [rsi + 2]
+    add edx, r9d
+    mov [rdi + 2], dx                        ; y + yOff
+    mov edx, [rsi + 4]
+    mov [rdi + 4], edx                       ; w,h
+    add rsi, 8
+    add rdi, 8
+    dec ecx
+    jmp .shp_r_copy
+.shp_r_copied:
+    ; Damage the whole window — a shrinking shape exposes what's beneath.
+    mov edi, r13d
+    call window_lookup
+    test rax, rax
+    jz .shp_r_out
+    mov rdi, rax
+    movzx ecx, word [rax + 12]               ; w
+    movzx r8d, word [rax + 14]               ; h
+    xor eax, eax
+    xor edx, edx
+    call damage_add_local
+    mov byte [comp_dirty], 1
+.shp_r_out:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.shp_query_extents:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r14d, edi                            ; client slot
+    mov r12d, [rsi + 4]                      ; window xid
+    mov edi, r12d
+    call window_lookup
+    mov r13, rax                             ; window rec (0 ok)
+    mov edi, r12d
+    xor esi, esi                             ; kind bounding
+    call shape_slot_find
+    mov rbx, rax                             ; bounding slot (0 ok)
+    mov edi, r14d
+    mov esi, 32
+    call xkb_reply_zero
+    xor eax, eax
+    test rbx, rbx
+    setnz al
+    mov [rdi + 1], al                        ; boundingShaped
+    mov byte [rdi + 8], 0                    ; clipShaped = False
+    test r13, r13
+    jz .shp_qe_send
+    ; extents = full window rect, window-local (x/y stay 0)
+    movzx eax, word [r13 + 12]               ; w
+    mov [rdi + 16], ax
+    mov [rdi + 24], ax
+    movzx eax, word [r13 + 14]               ; h
+    mov [rdi + 18], ax
+    mov [rdi + 26], ax
+.shp_qe_send:
+    mov edi, r15d
+    lea rsi, [reply_buf]
+    mov edx, r8d
+    mov eax, SYS_WRITE
+    syscall
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.shp_input_selected:
+    mov esi, 32
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0                    ; enabled = False
+    mov edi, r15d
+    lea rsi, [reply_buf]
+    mov edx, r8d
+    mov eax, SYS_WRITE
+    syscall
+    ret
+
+.shp_get_rectangles:
+    ; Reports the full window rect as one rectangle. Nobody in the app set
+    ; reads back the stored list (spot never calls this); answering at all
+    ; is what matters — a reply-less request would hang the client.
+    push rbx
+    push r13
+    mov r13d, edi                            ; client slot
+    mov edi, [rsi + 4]
+    call window_lookup
+    mov rbx, rax                             ; window rec (0 ok)
+    mov edi, r13d
+    mov esi, 40                              ; 32 header + 1 rect
+    call xkb_reply_zero                      ; sets length = 2 words
+    mov byte [rdi + 1], 0                    ; ordering = UnSorted
+    mov dword [rdi + 8], 1                   ; nrects = 1
+    test rbx, rbx
+    jz .shp_gr_send
+    movzx eax, word [rbx + 12]
+    mov [rdi + 36], ax                       ; w (x/y stay 0)
+    movzx eax, word [rbx + 14]
+    mov [rdi + 38], ax                       ; h
+.shp_gr_send:
+    mov edi, r15d
+    lea rsi, [reply_buf]
+    mov edx, r8d
+    mov eax, SYS_WRITE
+    syscall
+    pop r13
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; shape_slot_find — edi = xid, esi = kind. rax = slot ptr or 0. Preserves all
+; other registers (including edi/esi).
+; ----------------------------------------------------------------------------
+shape_slot_find:
+    push rbx
+    xor ebx, ebx
+.ssf_loop:
+    cmp ebx, SHAPE_MAX_SLOTS
+    jge .ssf_miss
+    mov rax, rbx
+    imul rax, SHAPE_SLOT_SIZE
+    lea rax, [shape_slots + rax]
+    cmp [rax], edi
+    jne .ssf_next
+    cmp [rax + 4], esi
+    jne .ssf_next
+    pop rbx
+    ret
+.ssf_next:
+    inc ebx
+    jmp .ssf_loop
+.ssf_miss:
+    xor eax, eax
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; shape_slot_get — edi = xid, esi = kind. Find or allocate. rax = ptr or 0.
+; ----------------------------------------------------------------------------
+shape_slot_get:
+    push rbx
+    call shape_slot_find
+    test rax, rax
+    jnz .ssg_out
+    xor ebx, ebx
+.ssg_scan:
+    cmp ebx, SHAPE_MAX_SLOTS
+    jge .ssg_full
+    mov rax, rbx
+    imul rax, SHAPE_SLOT_SIZE
+    lea rax, [shape_slots + rax]
+    cmp dword [rax], 0
+    je .ssg_take
+    inc ebx
+    jmp .ssg_scan
+.ssg_take:
+    mov [rax], edi
+    mov [rax + 4], esi
+    mov dword [rax + 8], 0
+    jmp .ssg_out
+.ssg_full:
+    xor eax, eax
+.ssg_out:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; shape_free_window — edi = xid. Frees all shape slots for the window.
+; Preserves all registers.
+; ----------------------------------------------------------------------------
+shape_free_window:
+    push rax
+    push rbx
+    xor ebx, ebx
+.sfw_loop:
+    cmp ebx, SHAPE_MAX_SLOTS
+    jge .sfw_done
+    mov rax, rbx
+    imul rax, SHAPE_SLOT_SIZE
+    lea rax, [shape_slots + rax]
+    cmp [rax], edi
+    jne .sfw_next
+    mov dword [rax], 0
+.sfw_next:
+    inc ebx
+    jmp .sfw_loop
+.sfw_done:
+    pop rbx
+    pop rax
+    ret
+
+; ----------------------------------------------------------------------------
+; shape_input_hit — edi = xid, esi = point x, edx = point y (window-local).
+; Returns ZF=1 → window takes the input, ZF=0 → click-through (skip window).
+; Preserves ALL registers; only flags change.
+; ----------------------------------------------------------------------------
+shape_input_hit:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    mov ebx, esi                             ; px
+    mov ecx, edx                             ; py
+    mov esi, SHAPE_KIND_INPUT
+    call shape_slot_find
+    test rax, rax
+    jz .sih_hit                              ; no input shape → normal delivery
+    mov edx, [rax + 8]                       ; count
+    test edx, edx
+    jz .sih_miss                             ; SET empty → click-through
+    xor esi, esi
+.sih_loop:
+    cmp esi, edx
+    jge .sih_miss
+    lea rdi, [rsi*8]
+    lea rdi, [rax + rdi + 16]
+    movsx r8d, word [rdi]                    ; rx
+    cmp ebx, r8d
+    jl .sih_next
+    movzx r8d, word [rdi + 4]                ; rw
+    add r8w, word [rdi]
+    movsx r8d, r8w
+    cmp ebx, r8d
+    jge .sih_next
+    movsx r8d, word [rdi + 2]                ; ry
+    cmp ecx, r8d
+    jl .sih_next
+    movzx r8d, word [rdi + 6]                ; rh
+    add r8w, word [rdi + 2]
+    movsx r8d, r8w
+    cmp ecx, r8d
+    jge .sih_next
+    jmp .sih_hit
+.sih_next:
+    inc esi
+    jmp .sih_loop
+.sih_hit:
+    mov byte [sih_result], 1
+    jmp .sih_out
+.sih_miss:
+    mov byte [sih_result], 0
+.sih_out:
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    cmp byte [sih_result], 1                 ; ZF=1 → deliver
     ret
 
 ; ============================================================================
@@ -6420,10 +6806,10 @@ handle_list_extensions:
 
     lea rdi, [reply_buf]
     mov byte [rdi + 0], 1
-    mov byte [rdi + 1], 6                    ; nExtensions
+    mov byte [rdi + 1], 7                    ; nExtensions
     mov ecx, [r12 + 8]
     mov [rdi + 2], cx
-    mov dword [rdi + 4], 14                  ; 56 bytes of names (54 + 2 pad)
+    mov dword [rdi + 4], 15                  ; 60 bytes of names (exact)
     mov dword [rdi + 8], 0
     mov dword [rdi + 12], 0
     mov dword [rdi + 16], 0
@@ -6440,7 +6826,7 @@ handle_list_extensions:
     mov edi, [r12]
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
-    mov rdx, 88                              ; 32 header + 56 names
+    mov rdx, 92                              ; 32 header + 60 names
     syscall
 
     pop r12
@@ -7375,6 +7761,7 @@ window_destroy:
     push r13
     cmp edi, X_ROOT_WINDOW
     je .wd_done
+    call shape_free_window                   ; drop any SHAPE regions (preserves regs)
     mov r12d, edi                            ; xid being destroyed
     xor ebx, ebx
 .wd_walk:
@@ -7462,12 +7849,24 @@ apply_cw_values:
     jnc .av_skip_bit
     ; Bit r14 is set. Get the corresponding CARD32 and dispatch.
     mov eax, [r12]
+    test r14d, r14d                          ; CW_BACK_PIXMAP bit pos (0)
+    jz .av_back_pixmap
     cmp r14d, 1                              ; CW_BACK_PIXEL bit pos
     je .av_back_pixel
     cmp r14d, 9                              ; CW_OVERRIDE_REDIRECT bit pos
     je .av_override
     cmp r14d, 11                             ; CW_EVENT_MASK bit pos
     je .av_event_mask
+    jmp .av_advance
+.av_back_pixmap:
+    ; Background pixmap: materialise it straight into the window backing
+    ; (spot's dim-cover overlay is a back-pixmap-only window — it never
+    ; draws). None (0) / ParentRelative (1) keep the back_pixel behaviour.
+    cmp eax, 1
+    jbe .av_advance
+    mov rdi, r13
+    mov esi, eax
+    call window_apply_back_pixmap            ; preserves rbx/r12/r13/r14
     jmp .av_advance
 .av_back_pixel:
     mov [r13 + 44], eax                      ; back_pixel
@@ -10516,6 +10915,17 @@ window_at_point:
     mov r9d, [r8 + 48]                         ; covers point — compare z-order
     cmp r9d, r12d
     jbe .wap_next                             ; below current best → keep best
+    ; SHAPE input region: an empty input shape means click-through (spot's
+    ; overlay) — the window never becomes the pick.
+    mov edi, [r8]
+    movsx esi, word [r8 + 8]
+    neg esi
+    add esi, r10d                             ; px window-local
+    movsx edx, word [r8 + 10]
+    neg edx
+    add edx, r11d                             ; py window-local
+    call shape_input_hit                      ; preserves all regs
+    jnz .wap_next                             ; ZF=0 → pass through
     mov r12d, r9d                              ; new topmost stk
     mov rax, r8                               ; new topmost window
 .wap_next:
@@ -10588,6 +10998,19 @@ window_at_point_deep:
     mov ecx, [rax + 48]                       ; contains point — topmost wins
     cmp ecx, [wapd_best_stk]
     jb .wapd_scan_next
+    ; SHAPE input region check (empty region = click-through)
+    mov edi, [rax]
+    movsx esi, word [rax + 8]
+    add esi, [wapd_abs_x]
+    neg esi
+    add esi, r13d                             ; px window-local
+    movsx edx, word [rax + 10]
+    add edx, [wapd_abs_y]
+    neg edx
+    add edx, r14d                             ; py window-local
+    call shape_input_hit                      ; preserves all regs
+    jnz .wapd_scan_next                       ; ZF=0 → pass through
+    mov ecx, [rax + 48]
     mov [wapd_best_stk], ecx
     mov r12, rax
 .wapd_scan_next:
@@ -12933,7 +13356,7 @@ rs_composite_children:
     cmp byte [r14 + 31], 0                    ; has backing? blit it (a backless
     je .rcc_recurse                          ; container still needs its kids)
     mov rdi, r14
-    call blit_window
+    call blit_window_shaped
 .rcc_recurse:
     mov edi, [r14]                            ; recurse into this child's subtree
     call rs_composite_children
@@ -13610,6 +14033,73 @@ handle_set_clip_rectangles:
     shr edx, 3                                ; rect count
     call clip_store
 .scr_done:
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; window_apply_back_pixmap — rdi = window record, esi = pixmap xid. Copies
+; the pixmap into the window's backing (allocating it if needed) — frame's
+; take on CW_BACK_PIXMAP: materialise once at set time instead of consulting
+; the pixmap at every expose. Enough for spot's snapshot cover; a client that
+; mutates the pixmap afterwards and expects live refresh would need more.
+; Preserves rbx/r12/r13/r14 (apply_cw_values' live registers).
+; ----------------------------------------------------------------------------
+window_apply_back_pixmap:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi                             ; window rec
+    mov edi, esi
+    call pixmap_lookup
+    test rax, rax
+    jz .abp_out
+    mov r13, rax                             ; pixmap rec
+    mov r15, [r13 + 16]                      ; src backing
+    test r15, r15
+    jz .abp_out
+    mov rdi, r12
+    call window_ensure_backing
+    test rax, rax
+    jz .abp_out
+    mov r14, rax                             ; dst backing
+    ; copy w = min(dst stride, src w); copy h = min(dst h, src h)
+    movzx r8d, word [r12 + 40]
+    movzx edx, word [r13 + 4]
+    cmp edx, r8d
+    cmovb r8d, edx
+    movzx r9d, word [r12 + 42]
+    movzx edx, word [r13 + 6]
+    cmp edx, r9d
+    cmovb r9d, edx
+    xor ebx, ebx                             ; row
+.abp_row:
+    cmp ebx, r9d
+    jge .abp_damage
+    movzx eax, word [r12 + 40]               ; dst stride
+    imul eax, ebx
+    lea rdi, [r14 + rax*4]
+    movzx eax, word [r13 + 4]                ; src stride
+    imul eax, ebx
+    lea rsi, [r15 + rax*4]
+    mov ecx, r8d
+    rep movsd
+    inc ebx
+    jmp .abp_row
+.abp_damage:
+    mov rdi, r12
+    movzx ecx, word [r12 + 12]               ; w
+    movzx r8d, word [r12 + 14]               ; h
+    xor eax, eax
+    xor edx, edx
+    call damage_add_local
+    mov byte [comp_dirty], 1
+.abp_out:
+    pop r15
+    pop r14
+    pop r13
     pop r12
     pop rbx
     ret
@@ -14446,6 +14936,103 @@ handle_shm_put_image:
     add rsp, 80
     pop rbp
     pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; blit_window_shaped — rdi = window record ptr. If the window has a SHAPE
+; bounding region, blit each region rect separately by intersecting it with
+; the current bw_clip (painter's order already put the content beneath, so
+; the punched-out areas show through). Unshaped windows take the plain path
+; with zero overhead beyond one table probe.
+; ----------------------------------------------------------------------------
+blit_window_shaped:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rdi                             ; record
+    mov edi, [r12]                           ; xid
+    xor esi, esi                             ; kind = bounding
+    call shape_slot_find
+    test rax, rax
+    jz .bws_plain
+    mov r13, rax                             ; shape slot
+    ; save the caller's clip
+    mov eax, [bw_clip_x1]
+    mov [bws_clip_save + 0], eax
+    mov eax, [bw_clip_y1]
+    mov [bws_clip_save + 4], eax
+    mov eax, [bw_clip_x2]
+    mov [bws_clip_save + 8], eax
+    mov eax, [bw_clip_y2]
+    mov [bws_clip_save + 12], eax
+    ; window absolute origin (rects are window-local)
+    mov edi, [r12]
+    call window_abs_xy                       ; r10d/r11d
+    mov [bws_abs_x], r10d
+    mov [bws_abs_y], r11d
+    xor r14d, r14d                           ; rect index
+.bws_loop:
+    cmp r14d, [r13 + 8]
+    jge .bws_restore
+    lea rbx, [r14*8]
+    lea rbx, [r13 + rbx + 16]                ; rect ptr
+    movsx eax, word [rbx]                    ; x1 = abs_x + rx
+    add eax, [bws_abs_x]
+    movsx edx, word [rbx + 2]                ; y1 = abs_y + ry
+    add edx, [bws_abs_y]
+    movzx ecx, word [rbx + 4]                ; x2 = x1 + rw
+    add ecx, eax
+    movzx r8d, word [rbx + 6]                ; y2 = y1 + rh
+    add r8d, edx
+    ; intersect with the saved clip
+    cmp eax, [bws_clip_save + 0]
+    jge .bws_k1
+    mov eax, [bws_clip_save + 0]
+.bws_k1:
+    cmp edx, [bws_clip_save + 4]
+    jge .bws_k2
+    mov edx, [bws_clip_save + 4]
+.bws_k2:
+    cmp ecx, [bws_clip_save + 8]
+    jle .bws_k3
+    mov ecx, [bws_clip_save + 8]
+.bws_k3:
+    cmp r8d, [bws_clip_save + 12]
+    jle .bws_k4
+    mov r8d, [bws_clip_save + 12]
+.bws_k4:
+    cmp eax, ecx
+    jge .bws_next                            ; empty intersection
+    cmp edx, r8d
+    jge .bws_next
+    mov [bw_clip_x1], eax
+    mov [bw_clip_y1], edx
+    mov [bw_clip_x2], ecx
+    mov [bw_clip_y2], r8d
+    mov rdi, r12
+    call blit_window
+.bws_next:
+    inc r14d
+    jmp .bws_loop
+.bws_restore:
+    mov eax, [bws_clip_save + 0]
+    mov [bw_clip_x1], eax
+    mov eax, [bws_clip_save + 4]
+    mov [bw_clip_y1], eax
+    mov eax, [bws_clip_save + 8]
+    mov [bw_clip_x2], eax
+    mov eax, [bws_clip_save + 12]
+    mov [bw_clip_y2], eax
+    jmp .bws_out
+.bws_plain:
+    mov rdi, r12
+    call blit_window
+.bws_out:
     pop r14
     pop r13
     pop r12
