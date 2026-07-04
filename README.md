@@ -247,10 +247,11 @@ alpha — the DRM cursor plane blends it in hardware.
 `background`: a desktop wallpaper, drawn natively by the compositor (no feh,
 no root-pixmap). frame carries no image decoder, so the value points at a
 **raw BGRX buffer at panel resolution** (`screen_w * screen_h * 4` bytes),
-not a PNG/JPEG. The `frame-bg <image>` helper pre-renders any image to
-`~/.framebg` at the panel size and adds this line for you — decode happens
-once, offline; frame just mmaps the buffer and blits it. A wrong-sized file
-is ignored (falls back to the solid background colour).
+not a PNG/JPEG. The `chasm-bg <image>` helper (ships with
+[bolt](https://github.com/isene/bolt)) pre-renders any image to `~/.framebg`
+at the panel size — plus the bolt locker's `~/.lockbg.rgb` — and adds this
+line for you. Decode happens once, offline; frame just mmaps the buffer and
+blits it. A wrong-sized file is ignored (falls back to the solid colour).
 
 ## How it's built
 
