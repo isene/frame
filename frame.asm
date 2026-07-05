@@ -14507,10 +14507,57 @@ compositor_reconfigure:
     jne .crc_awake                           ; CRTCs would fight the blank
     call comp_unblank
 .crc_awake:
+    ; Snapshot the output config. VT reacquire's own SETCRTC fires a DRM
+    ; change uevent; a reconfigure that changes NOTHING must not rebuild —
+    ; the RRScreenChangeNotify makes strip exit(0) to re-init, dropping
+    ; every docked tray icon on each TTY round trip.
+    mov eax, [drm_chosen_conn]
+    push rax
+    mov eax, [panel_w]
+    push rax
+    mov eax, [panel_h]
+    push rax
+    movzx eax, byte [ext_active]
+    push rax
+    mov eax, [ext_conn]
+    push rax
+    mov eax, [ext_w]
+    push rax
+    mov eax, [ext_h]
+    push rax
     call drm_probe_resources
     call modeset_pick_outputs
     test eax, eax
-    jz .crc_done                             ; no connector at all: keep as-is
+    jz .crc_unchanged                        ; no connector at all: keep as-is
+    pop r9                                   ; ext_h
+    pop r8                                   ; ext_w
+    pop rdx                                  ; ext_conn
+    pop rcx                                  ; ext_active
+    pop rsi                                  ; panel_h
+    pop rdi                                  ; panel_w
+    pop rax                                  ; drm_chosen_conn
+    cmp eax, [drm_chosen_conn]
+    jne .crc_changed
+    cmp edi, [panel_w]
+    jne .crc_changed
+    cmp esi, [panel_h]
+    jne .crc_changed
+    movzx eax, byte [ext_active]
+    cmp ecx, eax
+    jne .crc_changed
+    test eax, eax                            ; both single-output → done
+    jz .crc_done
+    cmp edx, [ext_conn]
+    jne .crc_changed
+    cmp r8d, [ext_w]
+    jne .crc_changed
+    cmp r9d, [ext_h]
+    jne .crc_changed
+    jmp .crc_done                            ; identical config: no-op
+.crc_unchanged:
+    add rsp, 56                              ; drop the snapshot
+    jmp .crc_done
+.crc_changed:
     call compositor_release_buffers
     call compositor_create_buffers
     test rax, rax
