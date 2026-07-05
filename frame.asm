@@ -586,6 +586,8 @@ input_fd_count:     resd 1
 grab_bits:          resb 96                ; EVIOCGBIT capability scratch
 mod_state:          resd 1
 focus_window:       resd 1               ; SetInputFocus target (0/1 = none/PointerRoot)
+keys_down:          resb 32              ; QueryKeymap bitmap: bit = X keycode,
+                                         ; set on press, cleared on release
 screen_w:           resd 1               ; advertised screen size; defaults to
 screen_h:           resd 1               ; X_SCREEN_W/H, overwritten by the real
                                          ; DRM mode in init_compositor (--display)
@@ -932,7 +934,13 @@ log_xi_minor:       db "xi minor=", 0
 ; assigned FOUR_LEVEL (index 3, 4 levels: base / Shift / AltGr(Mod5) / both) so
 ; one uniform width-4 sym map covers base+shift+AltGr. Each xkbKeyTypeWireDesc
 ; is 8 bytes (mask, realMods, vmods:2, numLevels, nMapEntries, preserve, pad)
-; followed by nMapEntries xkbKTSetMapEntryWireDesc (level, realMods, vmods:2).
+; followed by nMapEntries × 8-byte xkbKTMapEntryWireDesc (active, mask, level,
+; realMods, vmods:2, pad:2). NOT the 4-byte xkbKTSetMapEntryWireDesc — that's
+; the SetMap REQUEST format. Serving it here desynced every client's type
+; parse (by luck it consumed exactly these 56 bytes, so the reply "worked"),
+; leaving all keys on a 1-level type whose map entry read as "level 0 needs
+; Mod5" — xdotool wrapped every plain char in ISO_Level3_Shift, and copyq's
+; synthetic paste keys came out at the wrong shift level in glass.
 align 4
 xkb_types_blob:
     db 0x00, 0x00              ; type 0 ONE_LEVEL: mask, realMods
@@ -941,24 +949,24 @@ xkb_types_blob:
     db 0x01, 0x01              ; type 1 TWO_LEVEL: mask=Shift
     dw 0x0000
     db 2, 1, 0, 0              ;   numLevels=2, nMapEntries=1
-    db 1, 0x01                 ;     entry: level1 on Shift
-    dw 0x0000
+    db 1, 0x01, 1, 0x01        ;     active, mask=Shift, level=1, realMods=Shift
+    dw 0x0000, 0x0000          ;     vmods, pad
     db 0x03, 0x03              ; type 2 ALPHABETIC: mask=Shift|Lock
     dw 0x0000
     db 2, 2, 0, 0              ;   numLevels=2, nMapEntries=2
-    db 1, 0x01                 ;     level1 on Shift
-    dw 0x0000
-    db 1, 0x02                 ;     level1 on Lock
-    dw 0x0000
+    db 1, 0x01, 1, 0x01        ;     Shift → level 1
+    dw 0x0000, 0x0000
+    db 1, 0x02, 1, 0x02        ;     Lock → level 1
+    dw 0x0000, 0x0000
     db 0x81, 0x81              ; type 3 FOUR_LEVEL: mask=Shift|Mod5
     dw 0x0000
     db 4, 3, 0, 0              ;   numLevels=4, nMapEntries=3
-    db 1, 0x01                 ;     level1 on Shift
-    dw 0x0000
-    db 2, 0x80                 ;     level2 on Mod5 (AltGr)
-    dw 0x0000
-    db 3, 0x81                 ;     level3 on Shift|Mod5
-    dw 0x0000
+    db 1, 0x01, 1, 0x01        ;     Shift → level 1
+    dw 0x0000, 0x0000
+    db 1, 0x80, 2, 0x80        ;     Mod5 (AltGr) → level 2
+    dw 0x0000, 0x0000
+    db 1, 0x81, 3, 0x81        ;     Shift|Mod5 → level 3
+    dw 0x0000, 0x0000
 xkb_types_blob_end:
 XKB_TYPES_BYTES equ xkb_types_blob_end - xkb_types_blob
 
@@ -4147,6 +4155,8 @@ dispatch_request:
     je .dr_set_input_focus
     cmp eax, 43
     je .dr_get_input_focus
+    cmp eax, 44
+    je .dr_query_keymap
     cmp eax, 38
     je .dr_query_pointer
     cmp eax, 40
@@ -4406,6 +4416,10 @@ dispatch_request:
 .dr_get_input_focus:
     mov edi, ebx
     call handle_get_input_focus
+    jmp .dr_done
+.dr_query_keymap:
+    mov edi, ebx
+    call handle_query_keymap
     jmp .dr_done
 
 .dr_list_extensions:
@@ -5800,11 +5814,40 @@ handle_xkb:
     mov ecx, [r9 + 4]                        ; shift  (level 1)
     mov edx, [r9 + 16]                       ; AltGr  (level 2)
     mov ebp, [r9 + 20]                       ; AltGr+Shift (level 3)
-    mov r11d, eax
-    or  r11d, ecx
-    or  r11d, edx
+    ; Type by key shape, like real Xorg: AltGr levels → FOUR_LEVEL;
+    ; distinct base/shift → TWO_LEVEL; single sym (modifier keys — often
+    ; duplicated across both columns) → ONE_LEVEL. A blanket FOUR_LEVEL
+    ; sent lookups on held-modifier state (e.g. Mod5 while typing AltGr
+    ; combos) to an empty level: the key read NoSymbol.
+    mov r11d, edx
     or  r11d, ebp
+    jnz .gm_sym_four
+    test ecx, ecx
+    jz  .gm_sym_one
+    cmp ecx, eax
+    jne .gm_sym_two
+.gm_sym_one:
+    test eax, eax
     jz  .gm_sym_empty
+    mov dword [rdi + 0], 0                    ; ktIndex = ONE_LEVEL
+    mov byte  [rdi + 4], 1                    ; groupInfo: 1 group
+    mov byte  [rdi + 5], 1                    ; width
+    mov word  [rdi + 6], 1                    ; nSyms
+    mov [rdi + 8], eax
+    add rdi, 12
+    inc r10d
+    jmp .gm_sym_next
+.gm_sym_two:
+    mov dword [rdi + 0], 1                    ; ktIndex = TWO_LEVEL
+    mov byte  [rdi + 4], 1
+    mov byte  [rdi + 5], 2                    ; width
+    mov word  [rdi + 6], 2                    ; nSyms
+    mov [rdi + 8], eax
+    mov [rdi + 12], ecx
+    add rdi, 16
+    add r10d, 2
+    jmp .gm_sym_next
+.gm_sym_four:
     mov dword [rdi + 0], 3                    ; ktIndex = {3,0,0,0} (FOUR_LEVEL)
     mov byte  [rdi + 4], 1                    ; groupInfo: 1 group
     mov byte  [rdi + 5], 4                    ; width
@@ -7035,14 +7078,14 @@ handle_query_tree:
     ret
 
 ; ============================================================================
-; handle_get_input_focus — edi = slot. Phase 4a stand-in: replies focus =
-; PointerRoot (1), revert-to = PointerRoot (1). Real focus model lands in
-; phase 4d (input).
+; handle_get_input_focus — edi = slot. Replies with the real focus_window
+; (see handle_set_input_focus); PointerRoot (1) when nothing was focused.
+; copyq/xdotool resolve their paste/type target from this reply.
 ;
 ; Reply (32 bytes):
 ;   +0 1                  +1 revert-to (PointerRoot=1)
 ;   +2 seq                +4 reply length 0
-;   +8 focus (PointerRoot=1)
+;   +8 focus (window XID, or 1 = PointerRoot)
 ;   +12..31 pad
 ; ============================================================================
 ; ============================================================================
@@ -7297,6 +7340,39 @@ handle_list_installed_colormaps:
     pop rbx
     ret
 
+; handle_query_keymap — edi = slot. Reply: 8-byte header + the 32-byte
+; keys_down bitmap (bit = X keycode, maintained by dispatch_input_event).
+handle_query_keymap:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 0
+    mov ecx, [r12 + 8]
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 2                   ; length = 2 (40 bytes total)
+    lea rsi, [keys_down]
+    mov rax, [rsi]
+    mov [rdi + 8], rax
+    mov rax, [rsi + 8]
+    mov [rdi + 16], rax
+    mov rax, [rsi + 16]
+    mov [rdi + 24], rax
+    mov rax, [rsi + 24]
+    mov [rdi + 32], rax
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 40
+    syscall
+    pop r12
+    pop rbx
+    ret
+
 handle_get_input_focus:
     push rbx
     push r12
@@ -7311,8 +7387,9 @@ handle_get_input_focus:
     mov ecx, [r12 + 8]
     mov [rdi + 2], cx
     mov dword [rdi + 4], 0
-    mov dword [rdi + 8], 1                   ; focus = PointerRoot
-    mov dword [rdi + 12], 0
+    mov eax, [focus_window]                  ; the REAL focus — copyq targets
+    mov [rdi + 8], eax                       ; its paste at this window; the
+    mov dword [rdi + 12], 0                  ; old PointerRoot stub broke it
     mov dword [rdi + 16], 0
     mov dword [rdi + 20], 0
     mov dword [rdi + 24], 0
@@ -9047,6 +9124,13 @@ send_property_notify:
     jz .spn_done
     test dword [rax + 24], EM_PROPERTY_CHANGE
     jz .spn_done
+    ; Fresh timestamp, not the last-input one: Qt and GTK learn "server
+    ; time" from THIS event's time field (their zero-length-property
+    ; dance), then Qt refuses to serve selections it acquired at time 0 —
+    ; a stale/zero stamp here is why copyq owned CLIPBOARD but answered
+    ; every ConvertSelection with a property=None refusal.
+    call now_real_ms
+    mov [server_time_ms], eax
     lea rdi, [pn_buf]
     mov dword [rdi], 28                      ; code 28, rest of dword 0
     mov [rdi + 4], r12d                      ; window
@@ -10735,6 +10819,18 @@ dispatch_input_event:
 .die_nozap:
     ; x11_keycode = evdev_code + 8 (kept in r12d from here on).
     add r12d, 8
+
+    ; QueryKeymap bitmap: bit = X keycode. copyq (and anything else that
+    ; waits for modifiers to be released before faking keys) polls this.
+    cmp r13d, 2
+    je .die_kd_done                          ; repeat: state unchanged
+    test r13d, r13d
+    jz .die_kd_up
+    bts dword [keys_down], r12d
+    jmp .die_kd_done
+.die_kd_up:
+    btr dword [keys_down], r12d
+.die_kd_done:
 
     ; framerc blank_key: exact modifier match on the resolved keycode →
     ; panel off NOW. Server-level like the zap/VT combos: the combo never
@@ -14105,6 +14201,30 @@ now_mono_ms:
     push rcx
     mov rax, SYS_CLOCK_GETTIME
     mov edi, CLOCK_MONOTONIC
+    lea rsi, [mono_ts]
+    syscall
+    mov rax, [mono_ts]
+    imul rax, rax, 1000
+    push rax
+    mov rax, [mono_ts + 8]
+    xor edx, edx
+    mov rcx, 1000000
+    div rcx
+    pop rcx
+    add rax, rcx
+    pop rcx
+    ret
+
+; ----------------------------------------------------------------------------
+; now_real_ms — rax = CLOCK_REALTIME in milliseconds (low bits; X time is
+; CARD32 and wraps). REALTIME, not MONOTONIC: server_time_ms is otherwise
+; stamped from evdev event timestamps, which default to CLOCK_REALTIME —
+; the two sources must share a timebase or event times jump backwards.
+; ----------------------------------------------------------------------------
+now_real_ms:
+    push rcx
+    mov rax, SYS_CLOCK_GETTIME
+    xor edi, edi                             ; CLOCK_REALTIME
     lea rsi, [mono_ts]
     syscall
     mov rax, [mono_ts]
