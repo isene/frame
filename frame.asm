@@ -13333,23 +13333,109 @@ send_key_press:
 ; ============================================================================
 handle_reparent_window:
     push rbx
+    push r12
+    push r13
+    push r14
     mov edi, [rsi + 4]
+    mov r14, rsi                              ; req
     call window_lookup
     test rax, rax
     jz .rp_done
+    mov r12, rax                              ; window record
+    mov r13d, [rax + 4]                       ; OLD parent xid
     mov rdi, rax                              ; damage the OLD position
     call damage_add_window
-    mov ecx, [rsi + 8]
-    mov [rax + 4], ecx                        ; new parent
-    mov dx, [rsi + 12]
-    mov [rax + 8], dx                         ; new x
-    mov dx, [rsi + 14]
-    mov [rax + 10], dx                        ; new y
-    mov rdi, rax                              ; ...and the NEW one
+    mov ecx, [r14 + 8]
+    mov [r12 + 4], ecx                        ; new parent
+    mov dx, [r14 + 12]
+    mov [r12 + 8], dx                         ; new x
+    mov dx, [r14 + 14]
+    mov [r12 + 10], dx                        ; new y
+    mov rdi, r12                              ; ...and the NEW one
     call damage_add_window
     mov byte [comp_dirty], 1                  ; was missing: screen stayed
                                               ; stale after every reparent
+    ; ReparentNotify to the OLD parent's SubstructureNotify subscriber —
+    ; strip undocks a tray icon whose owner reparents it AWAY (GTK status
+    ; icons dock via XEmbed before snixembed's SNI watcher exists, then
+    ; switch to SNI and pull the icon back: without this event, strip
+    ; kept the slot forever = the ghost gap at the tray's right edge.
+    mov edi, r13d
+    call window_lookup
+    test rax, rax
+    jz .rp_notify_win
+    test dword [rax + 24], EM_SUBSTRUCTURE_NOTIFY
+    jz .rp_notify_win
+    cmp dword [rax], X_ROOT_WINDOW
+    jne .rp_old_owner
+    movsx edi, byte [rax + 30]                ; root → the WM's redirect owner
+    cmp edi, 0
+    jl .rp_notify_win
+    jmp .rp_old_send
+.rp_old_owner:
+    mov edi, [rax]
+    sub edi, X_RID_BASE
+    shr edi, 21
+    cmp edi, MAX_CLIENTS
+    jae .rp_notify_win
+.rp_old_send:
+    mov esi, [rax]                            ; event window = old parent
+    mov edx, [r12]                            ; window
+    mov ecx, [r12 + 4]                        ; new parent
+    call send_reparent_notify
+.rp_notify_win:
+    ; ...and to the window's own StructureNotify selector (its owner).
+    test dword [r12 + 24], EM_STRUCTURE_NOTIFY
+    jz .rp_done
+    mov eax, [r12]
+    cmp eax, X_RID_BASE
+    jb .rp_done
+    sub eax, X_RID_BASE
+    shr eax, 21
+    cmp eax, MAX_CLIENTS
+    jae .rp_done
+    mov edi, eax
+    mov esi, [r12]                            ; event window = the window
+    mov edx, [r12]
+    mov ecx, [r12 + 4]
+    call send_reparent_notify
 .rp_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; send_reparent_notify — edi = slot, esi = event window, edx = window,
+; ecx = new parent. ReparentNotify (21): event@4, window@8, parent@12,
+; x@16 (s16), y@18, override-redirect@20.
+; ----------------------------------------------------------------------------
+send_reparent_notify:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov ebx, edi
+    mov r12d, esi
+    mov r13d, edx
+    mov r14d, ecx
+    lea rdi, [reply_buf]
+    xor eax, eax
+    mov [rdi], rax
+    mov [rdi + 8], rax
+    mov [rdi + 16], rax
+    mov [rdi + 24], rax
+    mov byte [rdi + 0], 21                   ; ReparentNotify
+    mov [rdi + 4], r12d                      ; event
+    mov [rdi + 8], r13d                      ; window
+    mov [rdi + 12], r14d                     ; parent
+    mov edi, ebx
+    lea rsi, [reply_buf]
+    call send_event_to_slot
+    pop r14
+    pop r13
+    pop r12
     pop rbx
     ret
 
