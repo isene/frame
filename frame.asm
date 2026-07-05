@@ -9486,15 +9486,29 @@ handle_map_window:
     movzx r9d, word [r12 + 14]                  ; height
     call send_expose
 .mw_no_expose:
-    ; If parent has SubstructureNotify, notify the redirect-owner subscriber.
+    ; Parent's SubstructureNotify subscriber: root → the WM's redirect
+    ; owner; other parents → the parent's owner client (a bar owner must
+    ; see children map).
     test r13, r13
     jz .mw_done
     mov eax, [r13 + 24]
     test eax, EM_SUBSTRUCTURE_NOTIFY
     jz .mw_done
+    cmp dword [r13], X_ROOT_WINDOW
+    jne .mw_sub_owner
     movsx r14d, byte [r13 + 30]
     cmp r14d, 0
     jl .mw_done
+    jmp .mw_sub_send
+.mw_sub_owner:
+    mov r14d, [r13]
+    sub r14d, X_RID_BASE
+    shr r14d, 21
+    cmp r14d, MAX_CLIENTS
+    jae .mw_done
+.mw_sub_send:
+    cmp r14d, ebx                              ; skip echo to the requester
+    je .mw_done
     mov edi, r14d
     mov esi, [r13]                             ; parent xid (the event window)
     mov edx, [r12]                             ; child xid
@@ -9568,9 +9582,24 @@ handle_unmap_window:
     mov eax, [r13 + 24]
     test eax, EM_SUBSTRUCTURE_NOTIFY
     jz .uw_done
+    ; Subscriber: root → the WM's redirect owner; any other parent → the
+    ; parent's OWNER client (strip must hear a tray icon's unmap — GTK's
+    ; SNI switch unmaps its XEmbed icon; redirect_owner is -1 on a bar).
+    cmp dword [r13], X_ROOT_WINDOW
+    jne .uw_sub_owner
     movsx r14d, byte [r13 + 30]
     cmp r14d, 0
     jl .uw_done
+    jmp .uw_sub_send
+.uw_sub_owner:
+    mov r14d, [r13]
+    sub r14d, X_RID_BASE
+    shr r14d, 21
+    cmp r14d, MAX_CLIENTS
+    jae .uw_done
+.uw_sub_send:
+    cmp r14d, ebx                             ; skip echo to the requester
+    je .uw_done
     mov edi, r14d
     mov esi, [r13]
     mov edx, [r12]
