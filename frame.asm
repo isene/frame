@@ -4755,6 +4755,7 @@ dispatch_request:
     jmp .dr_done
 
 .dr_reparent_window:
+    mov edi, ebx
     mov rsi, r12
     call handle_reparent_window
     jmp .dr_done
@@ -9402,9 +9403,17 @@ handle_map_window:
     push r14
     mov ebx, edi                              ; requester slot
     mov edi, [rsi + 4]                        ; window xid
+    push rsi
     call window_lookup
+    pop rsi
     test rax, rax
-    jz .mw_done
+    jnz .mw_have
+    mov edi, ebx
+    mov esi, [rsi + 4]
+    mov edx, 8
+    call send_bad_window
+    jmp .mw_done
+.mw_have:
     mov r12, rax                              ; window record
     ; X11: MapWindow on an already-mapped window has NO effect — no MapRequest,
     ; no MapNotify. Skipping this let GTK re-map generate a duplicate MapNotify;
@@ -9643,7 +9652,13 @@ handle_configure_window:
     mov edi, [r12 + 4]
     call window_lookup
     test rax, rax
-    jz .cfgw_done
+    jnz .cfgw_have
+    mov edi, ebx                             ; window gone → BadWindow
+    mov esi, [r12 + 4]
+    mov edx, 12
+    call send_bad_window
+    jmp .cfgw_done
+.cfgw_have:
     mov r13, rax                             ; record ptr
 
     ; Override-redirect windows (menus, tooltips, DND, combo popups) bypass
@@ -13365,11 +13380,18 @@ handle_reparent_window:
     push r12
     push r13
     push r14
+    mov ebx, edi                              ; requester slot
     mov edi, [rsi + 4]
     mov r14, rsi                              ; req
     call window_lookup
     test rax, rax
-    jz .rp_done
+    jnz .rp_have
+    mov edi, ebx                              ; window gone → BadWindow (strip's
+    mov esi, [r14 + 4]                        ; mid-dock race relies on it)
+    mov edx, 7
+    call send_bad_window
+    jmp .rp_done
+.rp_have:
     mov r12, rax                              ; window record
     mov r13d, [rax + 4]                       ; OLD parent xid
     mov rdi, rax                              ; damage the OLD position
@@ -13878,6 +13900,46 @@ send_configure_notify:
     mov edi, ebx
     lea rsi, [reply_buf]
     call send_event_to_slot
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; send_bad_window — edi = client slot, esi = the bad xid, edx = major opcode.
+; X error 3 (BadWindow) with the client's CURRENT sequence number. A request
+; on a nonexistent window must ERROR, not vanish: strip docks tray icons
+; with Reparent/Configure/Map and relies on BadWindow to drop an icon whose
+; owner destroyed it mid-dock (the nm-applet SNI-switch race) — silence
+; leaks the slot as a tray ghost.
+; ----------------------------------------------------------------------------
+send_bad_window:
+    push rbx
+    push r12
+    push r13
+    mov ebx, edi
+    mov r12d, esi
+    mov r13d, edx
+    mov eax, ebx
+    call client_meta_addr
+    mov rbx, rax
+    lea rdi, [reply_buf]
+    xor eax, eax
+    mov [rdi], rax
+    mov [rdi + 8], rax
+    mov [rdi + 16], rax
+    mov [rdi + 24], rax
+    mov byte [rdi + 0], 0                    ; Error
+    mov byte [rdi + 1], 3                    ; BadWindow
+    mov eax, [rbx + 8]
+    mov [rdi + 2], ax                        ; sequence
+    mov [rdi + 4], r12d                      ; bad resource id
+    mov [rdi + 10], r13b                     ; major opcode
+    mov edi, [rbx]                           ; fd
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov edx, 32
+    syscall
+    pop r13
     pop r12
     pop rbx
     ret
