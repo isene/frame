@@ -3372,9 +3372,24 @@ client_cleanup_resources:
     jz .ccr_win_destroy
     test dword [rax + 24], EM_SUBSTRUCTURE_NOTIFY
     jz .ccr_win_destroy
-    movsx edi, byte [rax + 30]               ; subscriber slot (the WM)
+    ; Subscriber slot: for a ROOT child it's the redirect owner (tile —
+    ; root has no owning client). For any other parent it's the parent's
+    ; OWNER (XID band): strip selects SubstructureNotify on its bar and
+    ; must hear about dying tray icons, or their slots leak as gaps —
+    ; the old code read redirect_owner (-1 on a bar) and never notified.
+    cmp dword [rax], X_ROOT_WINDOW
+    jne .ccr_win_owner
+    movsx edi, byte [rax + 30]               ; root → redirect owner (the WM)
     cmp edi, 0
     jl .ccr_win_destroy
+    jmp .ccr_win_have_slot
+.ccr_win_owner:
+    mov edi, [rax]
+    sub edi, X_RID_BASE
+    shr edi, 21                              ; parent's owner slot
+    cmp edi, MAX_CLIENTS
+    jae .ccr_win_destroy
+.ccr_win_have_slot:
     cmp edi, r12d                            ; the dead client itself
     je .ccr_win_destroy
     mov esi, [rax]                           ; event window = parent
