@@ -359,7 +359,8 @@ clients_bufs:       resb MAX_CLIENTS * CLIENT_BUF_SIZE
 ; MAX_INPUTS evdev devices. Rebuilt each poll iteration; ~1.2 KB of
 ; writes at full census, sub-microsecond. MAX_INPUTS is defined further
 ; down (16) — total = 1 + 128 + 16 = 145 entries.
-pollfd_buf:         resb (MAX_CLIENTS + 1 + 16 + 1) * 8   ; +1: drm_fd (flip events)
+pollfd_buf:         resb (MAX_CLIENTS + 1 + 16 + 2) * 8   ; +1: drm_fd (flip events)
+                                                          ; +1: uevent_fd (hotplug)
 
 ; Atom interning table. Atom 0 = None. Atoms 1..predef_count_max are
 ; X11's predefined set (PRIMARY, ATOM, STRING, WM_NAME, ...).
@@ -703,6 +704,29 @@ drm_chosen_crtc:    resd 1
 drm_chosen_conn:    resd 1
 nanosleep_ts:       resq 2
 
+; ---- Second output (external display) --------------------------------------
+; One wide framebuffer spans both outputs side by side; each CRTC scans its
+; own region via the SETCRTC x offset. screen_w/h describe the whole fb;
+; panel_w/h and ext_w/h the per-output regions.
+panel_w:            resd 1                 ; output-1 (eDP) mode dims
+panel_h:            resd 1
+ext_active:         resb 1                 ; 1 = second output is live
+ext_conn:           resd 1                 ; its connector / crtc ids
+ext_crtc:           resd 1
+ext_x:              resd 1                 ; fb x where output 2 starts (= panel_w)
+ext_w:              resd 1                 ; its mode dims
+ext_h:              resd 1
+mode1_save:         resb 68                ; drm_mode_modeinfo per output —
+mode2_save:         resb 68                ; drm_modes_buf is scan scratch
+drm_crtc_set2:      resb 104               ; SETCRTC block for output 2
+drm_set_conn_id2:   resd 1
+cursor_crtc:        resd 1                 ; crtc currently showing the sprite
+uevent_fd:          resd 1                 ; netlink hotplug socket (-1 = none)
+hotplug_pending:    resb 1                 ; uevent arrived; re-probe next cycle
+rr_evwins:          resd MAX_CLIENTS       ; RRSelectInput window per client
+uevent_buf:         resb 4096
+nl_addr:            resb 12                ; sockaddr_nl for the uevent bind
+
 ; drm_mode_fb_dirty_cmd (24 bytes) for kicking the panel after a
 ; framebuffer update. fb_id at +0, flags at +4, color at +8,
 ; num_clips at +12, clips_ptr at +16.
@@ -905,6 +929,8 @@ log_blank:          db "frame: panel off (idle blank_timeout)", 10
 log_blank_len       equ $ - log_blank
 log_unblank:        db "frame: panel on (input)", 10
 log_unblank_len     equ $ - log_unblank
+log_hotplug:        db "frame: display hotplug — outputs reconfigured", 10
+log_hotplug_len     equ $ - log_hotplug
 log_comp_pre:       db "compositor: mode ", 0
 log_comp_pre_len    equ $ - log_comp_pre - 1
 log_comp_x:         db "x"
@@ -927,6 +953,7 @@ str_xi_keyboard:    db "Virtual core keyboard"     ; 21 bytes
 str_rel_x:          db "Rel X"
 str_rel_y:          db "Rel Y"
 str_monitor_default: db "default"
+str_monitor_ext:     db "ext"
 log_xkb_minor:      db "xkb minor=", 0
 log_xi_minor:       db "xi minor=", 0
 
@@ -1089,6 +1116,7 @@ predef_atom_stream:
     ATM "Rel X"                              ; XInput2 pointer axis labels
     ATM "Rel Y"
     ATM "default"                            ; RANDR monitor / output name
+    ATM "ext"                                ; RANDR monitor 2 name
     db 0                                     ; terminator
 
 ; ---- probe-mode strings ---------------------------------------------------
@@ -1353,11 +1381,15 @@ _start:
     jge .main
     mov rdi, [rsp + 8 + rcx*8]
     cmp dword [rdi], '--fb'                  ; --fbtest: DRM-free compositor
-    jne .flag_not_fbtest
-    cmp dword [rdi + 4], 'test'
-    jne .flag_not_fbtest
+    jne .flag_not_fbtest                     ; --fbtest2: same + a fake second
+    cmp dword [rdi + 4], 'test'              ;   1920x1080 output (headless
+    jne .flag_not_fbtest                     ;   dual-head testing)
     cmp byte [rdi + 8], 0
+    je .flag_fbtest_on
+    cmp word [rdi + 8], '2'                  ; '2' + NUL
     jne .flag_not_fbtest
+    mov byte [ext_active], 1
+.flag_fbtest_on:
     mov byte [fbtest_mode], 1
     jmp .flag_scan_next
 .flag_not_fbtest:
@@ -1458,7 +1490,8 @@ _start:
     call init_compositor
     call load_wallpaper                       ; ~/.framerc background → wallpaper_ptr
 .skip_compositor:
-    jmp serve_loop
+    call init_uevent_socket                   ; display-hotplug watch; sets the
+    jmp serve_loop                            ; poll slot to -1 in all other modes
 
 .die_bind:
     mov rsi, log_bind_fail
@@ -3257,6 +3290,7 @@ client_cleanup_resources:
     push r14
     push r15
     mov r12d, edi                            ; slot
+    mov dword [rr_evwins + r12*4], 0         ; drop its RandR notify sub
     mov r13d, edi
     shl r13d, 21
     add r13d, X_RID_BASE                     ; band base
@@ -3726,10 +3760,18 @@ serve_loop:
     mov [pollfd_buf + rax], edx
     mov word [pollfd_buf + rax + 4], 1       ; POLLIN
     mov word [pollfd_buf + rax + 6], 0
+    ; --- Very last slot: the netlink uevent socket (display hotplug).
+    ; -1 when unavailable — poll ignores negative fds, zero idle cost.
+    mov edx, [uevent_fd]
+    mov eax, MAX_CLIENTS + 1 + MAX_INPUTS + 1
+    shl eax, 3
+    mov [pollfd_buf + rax], edx
+    mov word [pollfd_buf + rax + 4], 1       ; POLLIN
+    mov word [pollfd_buf + rax + 6], 0
 .sl_poll:
     mov rax, SYS_POLL
     lea rdi, [pollfd_buf]
-    mov esi, MAX_CLIENTS + 1 + MAX_INPUTS + 1
+    mov esi, MAX_CLIENTS + 1 + MAX_INPUTS + 2
     mov edx, -1                              ; infinite timeout when idle (no
     cmp byte [flip_pending], 0               ; wakeups → battery). But while a
     jne .sl_poll_flip                        ; PAGE_FLIP is in flight, cap at
@@ -3772,7 +3814,7 @@ serve_loop:
     ; re-load the poll registers — the blank-deadline path clobbers them
     mov rax, SYS_POLL
     lea rdi, [pollfd_buf]
-    mov esi, MAX_CLIENTS + 1 + MAX_INPUTS + 1
+    mov esi, MAX_CLIENTS + 1 + MAX_INPUTS + 2
     syscall                                  ; (timeout in edx)
     test rax, rax
     jz .sl_poll_timeout
@@ -3860,6 +3902,47 @@ serve_loop:
     jmp .sl_iw
 
 .sl_flush:
+    ; --- Display hotplug: drain the uevent socket; any DRM change event
+    ; schedules a reconfigure (run below once no flip is in flight).
+    mov eax, MAX_CLIENTS + 1 + MAX_INPUTS + 1
+    shl eax, 3
+    movzx eax, word [pollfd_buf + rax + 6]   ; revents
+    test eax, 1                              ; POLLIN
+    jz .sl_no_uevent
+.sl_uevent_drain:
+    mov rax, SYS_READ
+    mov edi, [uevent_fd]
+    lea rsi, [uevent_buf]
+    mov rdx, 4096
+    syscall
+    test rax, rax
+    jle .sl_no_uevent                        ; EAGAIN → drained
+    ; scan the datagram for "drm" (change@ ... /drm/cardN, HOTPLUG=1)
+    lea rdi, [uevent_buf]
+    lea rcx, [rax - 3]
+.sl_uev_scan:
+    test rcx, rcx
+    jle .sl_uevent_drain
+    cmp word [rdi], 'dr'
+    jne .sl_uev_next
+    cmp byte [rdi + 2], 'm'
+    je .sl_uev_hit
+.sl_uev_next:
+    inc rdi
+    dec rcx
+    jmp .sl_uev_scan
+.sl_uev_hit:
+    mov byte [hotplug_pending], 1
+    jmp .sl_uevent_drain
+.sl_no_uevent:
+    cmp byte [hotplug_pending], 0
+    je .sl_no_hotplug
+    cmp byte [flip_pending], 0               ; wait until in-flight flips land
+    jne .sl_no_hotplug
+    mov byte [hotplug_pending], 0
+    call compositor_reconfigure
+.sl_no_hotplug:
+
     ; Flip completion: the DRM fd's POLLIN means the pending page flip
     ; landed at vblank — drain the event and clear the gate. POLLERR/POLLHUP
     ; (GPU reset, device loss) must ALSO be consumed or poll returns
@@ -3879,7 +3962,28 @@ serve_loop:
     lea rsi, [drm_event_buf]
     mov rdx, 64
     syscall
-    mov byte [flip_pending], 0
+    ; Walk the events: each FLIP_COMPLETE (type 2) retires one in-flight
+    ; flip. With two outputs the two completions can arrive in one read or
+    ; two wakeups — flip_pending is a count, not a flag.
+    test rax, rax
+    jle .sl_composite
+    xor ecx, ecx
+.sl_drm_ev:
+    lea rdx, [rax - 8]
+    cmp rcx, rdx                             ; need type+length header
+    jg .sl_composite
+    mov edx, [drm_event_buf + rcx + 4]       ; event length
+    cmp edx, 8
+    jl .sl_composite                         ; malformed → stop
+    cmp dword [drm_event_buf + rcx], 2       ; DRM_EVENT_FLIP_COMPLETE
+    jne .sl_drm_ev_next
+    cmp byte [flip_pending], 0
+    je .sl_drm_ev_next
+    dec byte [flip_pending]
+.sl_drm_ev_next:
+    add ecx, edx
+    cmp rcx, rax
+    jl .sl_drm_ev
 .sl_composite:
     ; Coalesced, flip-paced repaint: at most ONE damage repaint + async
     ; page-flip per poll cycle, and none while a flip is still in flight
@@ -6236,10 +6340,20 @@ handle_randr:
                                              ; call it: we advertise 1.4 (< 1.5).
     cmp eax, 15                              ; GetOutputProperty — Qt reads EDID and
     je .rr_get_output_property               ; BLOCKS on the reply (3x per screen)
-    cmp eax, 4                               ; RRSelectInput: void, no reply
-    je .rr_void
+    cmp eax, 4                               ; RRSelectInput: void, no reply —
+    je .rr_select_input                      ; but record the notify window
     cmp eax, 32                              ; GetProviders (RandR 1.4) — Firefox
     je .rr_get_providers                     ; probes GPU providers; empty is fine
+    cmp eax, 28                              ; GetPanning — xrandr 1.5 asks per
+    je .rr_get_panning                       ; crtc and blocks; zeros = disabled
+    cmp eax, 27                              ; GetCrtcTransform — ditto; reply
+    je .rr_get_crtc_transform                ; identity matrices, no filters
+    cmp eax, 22                              ; GetCrtcGammaSize / GetCrtcGamma —
+    je .rr_gamma_zero                        ; size 0 = no gamma ramp; xrandr
+    cmp eax, 23                              ; blocks on both
+    je .rr_gamma_zero
+    cmp eax, 5                               ; GetScreenInfo (RandR 1.0) —
+    je .rr_get_screen_info                   ; xrandr --listmonitors blocks on it
     ; Unhandled RANDR minor — log it (each is a potential client hang).
     push rax
     mov rsi, log_rr_minor
@@ -6251,6 +6365,17 @@ handle_randr:
     mov edx, 1
     call write_stderr
 .rr_void:
+    ret
+
+.rr_select_input:
+    ; Record where RRScreenChangeNotify goes on hotplug (mask bit 0).
+    mov eax, [rsi + 4]                       ; window
+    movzx ecx, word [rsi + 8]                ; enable mask
+    test ecx, 1                              ; ScreenChangeNotifyMask
+    jnz .rr_si_set
+    xor eax, eax
+.rr_si_set:
+    mov [rr_evwins + rdi*4], eax             ; rdi = client slot
     ret
 
 .rr_get_output_property:
@@ -6268,7 +6393,7 @@ handle_randr:
     call xkb_reply_zero
     mov byte [rdi + 1], 0
     mov dword [rdi + 8], 1                    ; majorVersion = 1
-    mov dword [rdi + 12], 4                   ; minorVersion = 4 (pre-GetMonitors)
+    mov dword [rdi + 12], 5                   ; minorVersion = 5 (GetMonitors)
     jmp .rr_write
 
 .rr_get_size_range:
@@ -6288,6 +6413,57 @@ handle_randr:
     mov dword [rdi + 8], RR_OUTPUT_ID         ; output
     jmp .rr_write
 
+.rr_get_screen_info:
+    ; xRRGetScreenInfoReply: one size (the whole fb), Rotate_0, 60 Hz.
+    mov esi, 44                              ; 32 hdr + 8 size + 4 rate info
+    call xkb_reply_zero
+    mov byte [rdi + 1], 1                    ; setOfRotations = Rotate_0
+    mov dword [rdi + 8], X_ROOT_WINDOW       ; root
+    mov dword [rdi + 12], 1                  ; timestamp
+    mov dword [rdi + 16], 1                  ; configTimestamp
+    mov word [rdi + 20], 1                   ; nSizes
+    mov word [rdi + 22], 0                   ; sizeID
+    mov word [rdi + 24], 1                   ; rotation = Rotate_0
+    mov word [rdi + 26], 60                  ; rate
+    mov word [rdi + 28], 2                   ; nrateEnts (count + one rate)
+    mov eax, [screen_w]
+    mov [rdi + 32], ax                       ; size: widthInPixels
+    mov eax, [screen_h]
+    mov [rdi + 34], ax                       ; heightInPixels
+    mov word [rdi + 36], X_SCREEN_W_MM       ; mmWidth
+    mov word [rdi + 38], X_SCREEN_H_MM       ; mmHeight
+    mov word [rdi + 40], 1                   ; nRates for size 0
+    mov word [rdi + 42], 60                  ; the rate
+    jmp .rr_write
+
+.rr_gamma_zero:
+    mov esi, 32                              ; size@8 stays 0, no ramp data
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0
+    jmp .rr_write
+
+.rr_get_crtc_transform:
+    ; xRRGetCrtcTransformReply: 96 bytes. Both transforms = identity
+    ; (fixed-point 1.0 on the diagonal), no filters.
+    mov esi, 96
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0                    ; status
+    mov dword [rdi + 8],  0x10000            ; pendingTransform m11
+    mov dword [rdi + 24], 0x10000            ; m22
+    mov dword [rdi + 40], 0x10000            ; m33
+    mov byte  [rdi + 44], 0                  ; hasTransforms = False
+    mov dword [rdi + 48], 0x10000            ; currentTransform m11
+    mov dword [rdi + 64], 0x10000            ; m22
+    mov dword [rdi + 80], 0x10000            ; m33
+    jmp .rr_write
+
+.rr_get_panning:
+    mov esi, 36                              ; xRRGetPanningReply (length = 1)
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0                    ; status = Success
+    mov dword [rdi + 8], 1                   ; timestamp
+    jmp .rr_write
+
 .rr_get_providers:
     ; RRGetProviders reply: +8 timestamp, +12 nProviders (u16 = 0). frame has
     ; no GPU-offload providers, so an empty list is correct. Firefox's
@@ -6300,6 +6476,8 @@ handle_randr:
     jmp .rr_write
 
 .rr_get_resources:
+    cmp byte [ext_active], 0
+    jne .rr_res_dual
     mov esi, 80                              ; 32 header + 48 body (1 crtc/out/mode)
     call xkb_reply_zero
     mov byte [rdi + 1], 0
@@ -6312,9 +6490,9 @@ handle_randr:
     mov dword [rdi + 32], RR_CRTC_ID          ; crtcs[0]
     mov dword [rdi + 36], RR_OUTPUT_ID        ; outputs[0]
     mov dword [rdi + 40], RR_MODE_ID          ; modeInfo.id
-    mov eax, [screen_w]
+    mov eax, [panel_w]
     mov [rdi + 44], ax                        ; modeInfo.width
-    mov eax, [screen_h]
+    mov eax, [panel_h]
     mov [rdi + 46], ax                        ; modeInfo.height
     mov dword [rdi + 48], 148500000           ; dotClock
     mov word [rdi + 56], 2200                 ; hTotal  (refresh ≈ 60)
@@ -6324,8 +6502,68 @@ handle_randr:
     mov word [rdi + 76], 'ul'
     mov byte [rdi + 78], 't'
     jmp .rr_write
+.rr_res_dual:
+    ; 32 hdr + crtcs 2×4 + outputs 2×4 + modes 2×32 + names 7+3 → 122, pad 124
+    mov esi, 124
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0
+    mov dword [rdi + 8], 1                    ; timestamp
+    mov dword [rdi + 12], 1                   ; configTimestamp
+    mov word [rdi + 16], 2                    ; nCrtcs
+    mov word [rdi + 18], 2                    ; nOutputs
+    mov word [rdi + 20], 2                    ; nModes
+    mov word [rdi + 22], 10                   ; nbytesNames
+    mov dword [rdi + 32], RR_CRTC_ID          ; crtcs
+    mov dword [rdi + 36], RR_CRTC_ID + 1
+    mov dword [rdi + 40], RR_OUTPUT_ID        ; outputs
+    mov dword [rdi + 44], RR_OUTPUT_ID + 1
+    mov dword [rdi + 48], RR_MODE_ID          ; mode 1 @48..79
+    mov eax, [panel_w]
+    mov [rdi + 52], ax
+    mov eax, [panel_h]
+    mov [rdi + 54], ax
+    mov dword [rdi + 56], 148500000
+    mov word [rdi + 64], 2200
+    mov word [rdi + 72], 1125
+    mov word [rdi + 74], 7                    ; nameLength "default"
+    mov dword [rdi + 80], RR_MODE_ID + 1      ; mode 2 @80..111
+    mov eax, [ext_w]
+    mov [rdi + 84], ax
+    mov eax, [ext_h]
+    mov [rdi + 86], ax
+    mov dword [rdi + 88], 148500000
+    mov word [rdi + 96], 2200
+    mov word [rdi + 104], 1125
+    mov word [rdi + 106], 3                   ; nameLength "ext"
+    mov dword [rdi + 112], 'defa'             ; names: "default" + "ext"
+    mov word [rdi + 116], 'ul'
+    mov byte [rdi + 118], 't'
+    mov word [rdi + 119], 'ex'
+    mov byte [rdi + 121], 't'
+    jmp .rr_write
 
 .rr_get_output_info:
+    mov eax, [rsi + 4]                       ; requested output id
+    cmp eax, RR_OUTPUT_ID + 1
+    jne .rr_oi_one
+    cmp byte [ext_active], 0
+    je .rr_oi_one
+    ; output 2 (external)
+    mov esi, 48                              ; 36 header + 8 body + "ext" pad
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0
+    mov dword [rdi + 8], 1                    ; timestamp
+    mov dword [rdi + 12], RR_CRTC_ID + 1      ; crtc
+    mov word [rdi + 26], 1                    ; nCrtcs (mm unknown = 0)
+    mov word [rdi + 28], 1                    ; nModes
+    mov word [rdi + 30], 1                    ; nPreferred
+    mov word [rdi + 34], 3                    ; nameLength
+    mov dword [rdi + 36], RR_CRTC_ID + 1      ; crtcs[0]
+    mov dword [rdi + 40], RR_MODE_ID + 1      ; modes[0]
+    mov word [rdi + 44], 'ex'                 ; name "ext"
+    mov byte [rdi + 46], 't'
+    jmp .rr_write
+.rr_oi_one:
     mov esi, 52                              ; 36 header + 16 body
     call xkb_reply_zero
     mov byte [rdi + 1], 0                     ; status = Success
@@ -6345,13 +6583,37 @@ handle_randr:
     jmp .rr_write
 
 .rr_get_crtc_info:
+    mov eax, [rsi + 4]                       ; requested crtc id
+    cmp eax, RR_CRTC_ID + 1
+    jne .rr_ci_one
+    cmp byte [ext_active], 0
+    je .rr_ci_one
+    mov esi, 40                              ; crtc 2: external's fb slice
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0
+    mov dword [rdi + 8], 1                    ; timestamp
+    mov eax, [ext_x]
+    mov [rdi + 12], ax                        ; x
+    mov eax, [ext_w]
+    mov [rdi + 16], ax                        ; width  (y at +14 stays 0)
+    mov eax, [ext_h]
+    mov [rdi + 18], ax                        ; height
+    mov dword [rdi + 20], RR_MODE_ID + 1      ; mode
+    mov word [rdi + 24], 1                    ; rotation
+    mov word [rdi + 26], 1                    ; rotations
+    mov word [rdi + 28], 1                    ; nOutput
+    mov word [rdi + 30], 1                    ; nPossibleOutput
+    mov dword [rdi + 32], RR_OUTPUT_ID + 1
+    mov dword [rdi + 36], RR_OUTPUT_ID + 1
+    jmp .rr_write
+.rr_ci_one:
     mov esi, 40                              ; 32 header + 8 body
     call xkb_reply_zero
     mov byte [rdi + 1], 0                     ; status
     mov dword [rdi + 8], 1                    ; timestamp (x=0,y=0 at +12,+14)
-    mov eax, [screen_w]
+    mov eax, [panel_w]
     mov [rdi + 16], ax                        ; width
-    mov eax, [screen_h]
+    mov eax, [panel_h]
     mov [rdi + 18], ax                        ; height
     mov dword [rdi + 20], RR_MODE_ID          ; mode
     mov word [rdi + 24], 1                    ; rotation = Rotate_0
@@ -6363,13 +6625,21 @@ handle_randr:
     jmp .rr_write
 
 .rr_get_monitors:
-    ; xRRGetMonitorsReply: 32-byte header + one MONITORINFO (24) + 1 output (4).
+    ; xRRGetMonitorsReply: 32-byte header + MONITORINFO (24) + 1 output (4)
+    ; per monitor. Monitor 1 = the panel at fb (0,0); monitor 2 = the
+    ; external at fb (ext_x, 0). tile pins WS10 to monitor 2 from this.
     mov esi, 60
+    cmp byte [ext_active], 0
+    je .rr_gm_sized
+    mov esi, 88
+.rr_gm_sized:
     call xkb_reply_zero
     mov byte  [rdi + 1], 0
     mov dword [rdi + 8],  1                   ; timestamp
-    mov dword [rdi + 12], 1                   ; nmonitors = 1
-    mov dword [rdi + 16], 1                   ; noutputs (total) = 1
+    movzx eax, byte [ext_active]
+    inc eax
+    mov [rdi + 12], eax                       ; nmonitors
+    mov [rdi + 16], eax                       ; noutputs (total)
     ; resolve the monitor-name atom ("default"); save rdi/r8/r15 across the call
     push rdi
     push r8
@@ -6385,13 +6655,37 @@ handle_randr:
     mov byte [rdi + 37], 1                    ; automatic = True
     mov word [rdi + 38], 1                    ; noutput  = 1
     ; x, y at +40/+42 stay 0
-    mov eax, [screen_w]
+    mov eax, [panel_w]
     mov [rdi + 44], ax                        ; width  (pixels)
-    mov eax, [screen_h]
+    mov eax, [panel_h]
     mov [rdi + 46], ax                        ; height (pixels)
     mov dword [rdi + 48], X_SCREEN_W_MM       ; widthInMillimeters
     mov dword [rdi + 52], X_SCREEN_H_MM       ; heightInMillimeters
     mov dword [rdi + 56], RR_OUTPUT_ID        ; outputs[0]
+    cmp byte [ext_active], 0
+    je .rr_write
+    ; monitor 2 @60..87
+    push rdi
+    push r8
+    push r15
+    lea rdi, [str_monitor_ext]
+    mov esi, 3
+    call atom_lookup
+    pop r15
+    pop r8
+    pop rdi
+    mov [rdi + 60], eax                       ; name atom "ext"
+    mov byte [rdi + 64], 0                    ; primary = False
+    mov byte [rdi + 65], 1                    ; automatic
+    mov word [rdi + 66], 1                    ; noutput
+    mov eax, [ext_x]
+    mov [rdi + 68], ax                        ; x  (y at +70 stays 0)
+    mov eax, [ext_w]
+    mov [rdi + 72], ax                        ; width
+    mov eax, [ext_h]
+    mov [rdi + 74], ax                        ; height
+    ; mm at +76/+80 stay 0 (unknown)
+    mov dword [rdi + 84], RR_OUTPUT_ID + 1    ; outputs[0]
     jmp .rr_write
 
 .rr_write:
@@ -6400,6 +6694,55 @@ handle_randr:
     mov edx, r8d
     mov eax, SYS_WRITE
     syscall
+    ret
+
+; ----------------------------------------------------------------------------
+; rr_emit_screen_change — RRScreenChangeNotify to every client that did
+; RRSelectInput (rr_evwins). Hotplug calls this after reconfiguring; tile
+; rediscovers outputs and retiles on receipt.
+; ----------------------------------------------------------------------------
+rr_emit_screen_change:
+    push rbx
+    push r12
+    xor ebx, ebx
+.esc_loop:
+    cmp ebx, MAX_CLIENTS
+    jge .esc_done
+    mov r12d, [rr_evwins + rbx*4]
+    test r12d, r12d
+    jz .esc_next
+    mov eax, ebx
+    call client_meta_addr
+    cmp dword [rax], -1                      ; fd live?
+    je .esc_next
+    lea rdi, [pn_buf]
+    xor eax, eax
+    mov [rdi + 0], rax
+    mov [rdi + 8], rax
+    mov [rdi + 16], rax
+    mov [rdi + 24], rax
+    mov byte [rdi + 0], RR_EVENT_BASE        ; ScreenChangeNotify
+    mov byte [rdi + 1], 1                    ; rotation = Rotate_0
+    mov eax, [server_time_ms]
+    mov [rdi + 4], eax                       ; timestamp
+    mov [rdi + 8], eax                       ; configTimestamp
+    mov dword [rdi + 12], X_ROOT_WINDOW      ; root
+    mov [rdi + 16], r12d                     ; the subscribing window
+    mov eax, [screen_w]
+    mov [rdi + 24], ax                       ; widthInPixels
+    mov eax, [screen_h]
+    mov [rdi + 26], ax                       ; heightInPixels
+    mov word [rdi + 28], X_SCREEN_W_MM       ; widthInMM
+    mov word [rdi + 30], X_SCREEN_H_MM       ; heightInMM
+    mov edi, ebx
+    lea rsi, [pn_buf]
+    call send_event_to_slot
+.esc_next:
+    inc ebx
+    jmp .esc_loop
+.esc_done:
+    pop r12
+    pop rbx
     ret
 
 ; ============================================================================
@@ -12844,233 +13187,17 @@ init_compositor:
     test rax, rax
     js .ic_fail_master
 
-    ; --- resources + first connected connector ---
+    ; --- resources + outputs: primary panel + optional external ---
     call drm_probe_resources
-    call modeset_find_connector
+    call modeset_pick_outputs
     test eax, eax
     jz .ic_fail_no_conn
-    mov [drm_chosen_conn], r12d
+    mov r13d, [drm_chosen_crtc]
 
-    ; --- GETENCODER → CRTC ---
-    lea rdi, [drm_encoder_buf]
-    xor eax, eax
-    mov ecx, 5
-    rep stosd
-    mov eax, [drm_conn_buf + 44]
-    mov [drm_encoder_buf], eax
-    mov rax, SYS_IOCTL
-    mov rdi, [drm_fd]
-    mov esi, DRM_IOCTL_MODE_GETENCODER
-    lea rdx, [drm_encoder_buf]
-    syscall
+    ; --- buffers: create both wide dumb buffers + fbs ---
+    call compositor_create_buffers
     test rax, rax
     js .ic_fail_other
-    mov eax, [drm_encoder_buf + 8]
-    test eax, eax
-    jnz .ic_have_crtc
-    mov ecx, [drm_encoder_buf + 12]
-    bsf rdx, rcx
-    mov eax, [drm_crtc_ids + rdx*4]
-.ic_have_crtc:
-    mov r13d, eax
-    mov [drm_chosen_crtc], eax
-
-    ; --- CREATE_DUMB at hdisplay × vdisplay × 32 bpp ---
-    lea rdi, [drm_dumb_create]
-    xor eax, eax
-    mov ecx, 4
-    rep stosq
-    movzx eax, word [drm_modes_buf + 4]      ; hdisplay
-    mov [drm_dumb_create + 4], eax
-    ; Advertise the REAL panel width to X clients (setup reply + root window
-    ; record slot 0), so the WM sizes windows to the full panel instead of
-    ; the hardcoded X_SCREEN_W/H default. Root rec width is at windows+12.
-    mov [screen_w], eax
-    mov word [windows + 12], ax
-    movzx eax, word [drm_modes_buf + 14]     ; vdisplay
-    mov [drm_dumb_create + 0], eax
-    mov [screen_h], eax
-    mov word [windows + 14], ax
-    ; Re-centre the pointer on the real panel size.
-    mov eax, [screen_w]
-    shr eax, 1
-    mov [cursor_x], eax
-    mov eax, [screen_h]
-    shr eax, 1
-    mov [cursor_y], eax
-    mov dword [drm_dumb_create + 8], 32
-    mov dword [drm_dumb_create + 12], 0
-    mov rax, SYS_IOCTL
-    mov rdi, [drm_fd]
-    mov esi, DRM_IOCTL_MODE_CREATE_DUMB
-    lea rdx, [drm_dumb_create]
-    syscall
-    test rax, rax
-    js .ic_fail_other
-    mov eax, [drm_dumb_create + 16]
-    mov [drm_dumb_handle], eax
-    mov eax, [drm_dumb_create + 20]
-    mov [drm_dumb_pitch], eax
-    mov rax, [drm_dumb_create + 24]
-    mov [drm_dumb_size], rax
-
-    ; --- MAP_DUMB → mmap ---
-    lea rdi, [drm_dumb_map]
-    xor eax, eax
-    mov ecx, 2
-    rep stosq
-    mov eax, [drm_dumb_handle]
-    mov [drm_dumb_map], eax
-    mov rax, SYS_IOCTL
-    mov rdi, [drm_fd]
-    mov esi, DRM_IOCTL_MODE_MAP_DUMB
-    lea rdx, [drm_dumb_map]
-    syscall
-    test rax, rax
-    js .ic_fail_other
-    mov rax, [drm_dumb_map + 8]
-    mov [drm_dumb_offset], rax
-
-    mov rax, SYS_MMAP
-    xor edi, edi
-    mov rsi, [drm_dumb_size]
-    mov edx, PROT_RW
-    mov r10d, MAP_SHARED
-    mov r8, [drm_fd]
-    mov r9, [drm_dumb_offset]
-    syscall
-    cmp rax, -4096
-    ja .ic_fail_other
-    mov [drm_dumb_addr], rax
-
-    ; --- Initial background fill BEFORE ADDFB. The phase 2b modeset
-    ;     path works exactly because it does this order: fill → ADDFB
-    ;     → SETCRTC. The kernel's ADDFB sets up GTT coherency on the
-    ;     buffer's current pages; writes done AFTER ADDFB sit in CPU
-    ;     write-back cache and never reach the panel without an
-    ;     explicit flush. So we paint the initial blue here.
-    mov rdi, [drm_dumb_addr]
-    mov rcx, [drm_dumb_size]
-    shr rcx, 2
-    mov eax, COMP_BG_COLOR
-    rep stosd
-
-    ; --- ADDFB ---
-    lea rdi, [drm_fb_cmd]
-    xor eax, eax
-    mov ecx, 7
-    rep stosd
-    mov eax, [drm_dumb_create + 4]
-    mov [drm_fb_cmd + 4], eax
-    mov eax, [drm_dumb_create + 0]
-    mov [drm_fb_cmd + 8], eax
-    mov eax, [drm_dumb_pitch]
-    mov [drm_fb_cmd + 12], eax
-    mov dword [drm_fb_cmd + 16], 32
-    mov dword [drm_fb_cmd + 20], 24
-    mov eax, [drm_dumb_handle]
-    mov [drm_fb_cmd + 24], eax
-    mov rax, SYS_IOCTL
-    mov rdi, [drm_fd]
-    mov esi, DRM_IOCTL_MODE_ADDFB
-    lea rdx, [drm_fb_cmd]
-    syscall
-    test rax, rax
-    js .ic_fail_other
-    mov eax, [drm_fb_cmd]
-    mov [drm_fb_id], eax
-
-    ; Record buffer 0 (the one SETCRTC will show first = front).
-    mov rax, [drm_dumb_addr]
-    mov [comp_addr + 0], rax
-    mov eax, [drm_fb_id]
-    mov [comp_fbid + 0], eax
-    mov eax, [drm_dumb_handle]
-    mov [comp_handle + 0], eax
-
-    ; --- Create buffer 1 (back). Same dims/pitch/size as buffer 0. The
-    ;     compositor renders the back buffer then PAGE_FLIPs to it, which
-    ;     forces the display engine to re-scan at vblank — the only way to
-    ;     beat FBC/PSR staleness on a legacy framebuffer (DIRTYFB is
-    ;     unsupported: returns -ENOENT). ---
-    lea rdi, [drm_dumb_create]
-    xor eax, eax
-    mov ecx, 4
-    rep stosq
-    movzx eax, word [drm_modes_buf + 4]
-    mov [drm_dumb_create + 4], eax
-    movzx eax, word [drm_modes_buf + 14]
-    mov [drm_dumb_create + 0], eax
-    mov dword [drm_dumb_create + 8], 32
-    mov dword [drm_dumb_create + 12], 0
-    mov rax, SYS_IOCTL
-    mov rdi, [drm_fd]
-    mov esi, DRM_IOCTL_MODE_CREATE_DUMB
-    lea rdx, [drm_dumb_create]
-    syscall
-    test rax, rax
-    js .ic_fail_other
-    mov eax, [drm_dumb_create + 16]
-    mov [comp_handle + 4], eax               ; buffer 1 handle
-    ; MAP_DUMB
-    lea rdi, [drm_dumb_map]
-    xor eax, eax
-    mov ecx, 2
-    rep stosq
-    mov eax, [comp_handle + 4]
-    mov [drm_dumb_map], eax
-    mov rax, SYS_IOCTL
-    mov rdi, [drm_fd]
-    mov esi, DRM_IOCTL_MODE_MAP_DUMB
-    lea rdx, [drm_dumb_map]
-    syscall
-    test rax, rax
-    js .ic_fail_other
-    mov rax, [drm_dumb_map + 8]
-    mov [drm_dumb_offset], rax               ; reuse as temp
-    ; mmap
-    mov rax, SYS_MMAP
-    xor edi, edi
-    mov rsi, [drm_dumb_size]
-    mov edx, PROT_RW
-    mov r10d, MAP_SHARED
-    mov r8, [drm_fd]
-    mov r9, [drm_dumb_offset]
-    syscall
-    cmp rax, -4096
-    ja .ic_fail_other
-    mov [comp_addr + 8], rax                 ; buffer 1 addr
-    ; fill buffer 1 blue
-    mov rdi, rax
-    mov rcx, [drm_dumb_size]
-    shr rcx, 2
-    mov eax, COMP_BG_COLOR
-    rep stosd
-    ; ADDFB for buffer 1
-    lea rdi, [drm_fb_cmd]
-    xor eax, eax
-    mov ecx, 7
-    rep stosd
-    mov eax, [drm_dumb_create + 4]
-    mov [drm_fb_cmd + 4], eax
-    mov eax, [drm_dumb_create + 0]
-    mov [drm_fb_cmd + 8], eax
-    mov eax, [drm_dumb_pitch]
-    mov [drm_fb_cmd + 12], eax
-    mov dword [drm_fb_cmd + 16], 32
-    mov dword [drm_fb_cmd + 20], 24
-    mov eax, [comp_handle + 4]
-    mov [drm_fb_cmd + 24], eax
-    mov rax, SYS_IOCTL
-    mov rdi, [drm_fd]
-    mov esi, DRM_IOCTL_MODE_ADDFB
-    lea rdx, [drm_fb_cmd]
-    syscall
-    test rax, rax
-    js .ic_fail_other
-    mov eax, [drm_fb_cmd]
-    mov [comp_fbid + 4], eax                 ; buffer 1 fbid
-    mov dword [comp_back], 1                  ; render buffer 1 first (front=0)
 
     ; --- GETCRTC: save the console's current CRTC state so a clean exit
     ;     (Ctrl+C, SIGTERM) can restore the text VT instead of leaving
@@ -13087,29 +13214,8 @@ init_compositor:
     lea rdx, [drm_crtc_save]
     syscall
 
-    ; --- SETCRTC: program the CRTC to scan our buffer ---
-    mov eax, [drm_chosen_conn]
-    mov [drm_set_conn_id], eax
-    lea rdi, [drm_crtc_set]
-    xor eax, eax
-    mov ecx, 13
-    rep stosq
-    lea rax, [drm_set_conn_id]
-    mov [drm_crtc_set + 0], rax
-    mov dword [drm_crtc_set + 8], 1
-    mov [drm_crtc_set + 12], r13d
-    mov eax, [drm_fb_id]
-    mov [drm_crtc_set + 16], eax
-    mov dword [drm_crtc_set + 32], 1
-    lea rsi, [drm_modes_buf]
-    lea rdi, [drm_crtc_set + 36]
-    mov ecx, 17
-    rep movsd
-    mov rax, SYS_IOCTL
-    mov rdi, [drm_fd]
-    mov esi, DRM_IOCTL_MODE_SETCRTC
-    lea rdx, [drm_crtc_set]
-    syscall
+    ; --- SETCRTC both outputs (crtc 1 at fb x=0, crtc 2 panned to ext_x) ---
+    call compositor_program_crtcs
     test rax, rax
     js .ic_fail_other
 
@@ -13145,12 +13251,12 @@ init_compositor:
     mov rsi, log_comp_pre
     mov rdx, log_comp_pre_len
     call write_stderr
-    movzx eax, word [drm_modes_buf + 4]
+    mov eax, [screen_w]
     call write_u64_stderr
     mov rsi, log_comp_x
     mov rdx, 1
     call write_stderr
-    movzx eax, word [drm_modes_buf + 14]
+    mov eax, [screen_h]
     call write_u64_stderr
     mov rsi, log_comp_pitch
     mov rdx, log_comp_pitch_len
@@ -13199,6 +13305,580 @@ init_compositor:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; compositor_create_buffers — CREATE_DUMB/MAP/mmap/fill/ADDFB for both
+; buffers at the current output dims (panel_w/h + ext_w/h). Sets screen_w/h,
+; the root window record dims and all drm_dumb_*/comp_* state. rax = 0 ok,
+; -1 fail. Callable at init and again at hotplug reconfigure.
+; ----------------------------------------------------------------------------
+compositor_create_buffers:
+    ; --- CREATE_DUMB at fb dims (spans both outputs) × 32 bpp ---
+    lea rdi, [drm_dumb_create]
+    xor eax, eax
+    mov ecx, 4
+    rep stosq
+    ; fb width = panel_w (+ ext_w when a second output is live), height =
+    ; max of the two modes. Advertise the fb dims to X clients (setup
+    ; reply + root window record slot 0); root rec width is at windows+12.
+    mov eax, [panel_w]
+    mov edx, [panel_h]
+    cmp byte [ext_active], 0
+    je .ccb_dims_done
+    add eax, [ext_w]
+    cmp edx, [ext_h]
+    jge .ccb_dims_done
+    mov edx, [ext_h]
+.ccb_dims_done:
+    mov [drm_dumb_create + 4], eax
+    mov [screen_w], eax
+    mov word [windows + 12], ax
+    mov [drm_dumb_create + 0], edx
+    mov [screen_h], edx
+    mov word [windows + 14], dx
+    ; Re-centre the pointer on the real panel size.
+    mov eax, [screen_w]
+    shr eax, 1
+    mov [cursor_x], eax
+    mov eax, [screen_h]
+    shr eax, 1
+    mov [cursor_y], eax
+    mov dword [drm_dumb_create + 8], 32
+    mov dword [drm_dumb_create + 12], 0
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_CREATE_DUMB
+    lea rdx, [drm_dumb_create]
+    syscall
+    test rax, rax
+    js .ccb_fail
+    mov eax, [drm_dumb_create + 16]
+    mov [drm_dumb_handle], eax
+    mov eax, [drm_dumb_create + 20]
+    mov [drm_dumb_pitch], eax
+    mov rax, [drm_dumb_create + 24]
+    mov [drm_dumb_size], rax
+
+    ; --- MAP_DUMB → mmap ---
+    lea rdi, [drm_dumb_map]
+    xor eax, eax
+    mov ecx, 2
+    rep stosq
+    mov eax, [drm_dumb_handle]
+    mov [drm_dumb_map], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_MAP_DUMB
+    lea rdx, [drm_dumb_map]
+    syscall
+    test rax, rax
+    js .ccb_fail
+    mov rax, [drm_dumb_map + 8]
+    mov [drm_dumb_offset], rax
+
+    mov rax, SYS_MMAP
+    xor edi, edi
+    mov rsi, [drm_dumb_size]
+    mov edx, PROT_RW
+    mov r10d, MAP_SHARED
+    mov r8, [drm_fd]
+    mov r9, [drm_dumb_offset]
+    syscall
+    cmp rax, -4096
+    ja .ccb_fail
+    mov [drm_dumb_addr], rax
+
+    ; --- Initial background fill BEFORE ADDFB. The phase 2b modeset
+    ;     path works exactly because it does this order: fill → ADDFB
+    ;     → SETCRTC. The kernel's ADDFB sets up GTT coherency on the
+    ;     buffer's current pages; writes done AFTER ADDFB sit in CPU
+    ;     write-back cache and never reach the panel without an
+    ;     explicit flush. So we paint the initial blue here.
+    mov rdi, [drm_dumb_addr]
+    mov rcx, [drm_dumb_size]
+    shr rcx, 2
+    mov eax, COMP_BG_COLOR
+    rep stosd
+
+    ; --- ADDFB ---
+    lea rdi, [drm_fb_cmd]
+    xor eax, eax
+    mov ecx, 7
+    rep stosd
+    mov eax, [drm_dumb_create + 4]
+    mov [drm_fb_cmd + 4], eax
+    mov eax, [drm_dumb_create + 0]
+    mov [drm_fb_cmd + 8], eax
+    mov eax, [drm_dumb_pitch]
+    mov [drm_fb_cmd + 12], eax
+    mov dword [drm_fb_cmd + 16], 32
+    mov dword [drm_fb_cmd + 20], 24
+    mov eax, [drm_dumb_handle]
+    mov [drm_fb_cmd + 24], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_ADDFB
+    lea rdx, [drm_fb_cmd]
+    syscall
+    test rax, rax
+    js .ccb_fail
+    mov eax, [drm_fb_cmd]
+    mov [drm_fb_id], eax
+
+    ; Record buffer 0 (the one SETCRTC will show first = front).
+    mov rax, [drm_dumb_addr]
+    mov [comp_addr + 0], rax
+    mov eax, [drm_fb_id]
+    mov [comp_fbid + 0], eax
+    mov eax, [drm_dumb_handle]
+    mov [comp_handle + 0], eax
+
+    ; --- Create buffer 1 (back). Same dims/pitch/size as buffer 0. The
+    ;     compositor renders the back buffer then PAGE_FLIPs to it, which
+    ;     forces the display engine to re-scan at vblank — the only way to
+    ;     beat FBC/PSR staleness on a legacy framebuffer (DIRTYFB is
+    ;     unsupported: returns -ENOENT). ---
+    lea rdi, [drm_dumb_create]
+    xor eax, eax
+    mov ecx, 4
+    rep stosq
+    mov eax, [screen_w]
+    mov [drm_dumb_create + 4], eax
+    mov eax, [screen_h]
+    mov [drm_dumb_create + 0], eax
+    mov dword [drm_dumb_create + 8], 32
+    mov dword [drm_dumb_create + 12], 0
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_CREATE_DUMB
+    lea rdx, [drm_dumb_create]
+    syscall
+    test rax, rax
+    js .ccb_fail
+    mov eax, [drm_dumb_create + 16]
+    mov [comp_handle + 4], eax               ; buffer 1 handle
+    ; MAP_DUMB
+    lea rdi, [drm_dumb_map]
+    xor eax, eax
+    mov ecx, 2
+    rep stosq
+    mov eax, [comp_handle + 4]
+    mov [drm_dumb_map], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_MAP_DUMB
+    lea rdx, [drm_dumb_map]
+    syscall
+    test rax, rax
+    js .ccb_fail
+    mov rax, [drm_dumb_map + 8]
+    mov [drm_dumb_offset], rax               ; reuse as temp
+    ; mmap
+    mov rax, SYS_MMAP
+    xor edi, edi
+    mov rsi, [drm_dumb_size]
+    mov edx, PROT_RW
+    mov r10d, MAP_SHARED
+    mov r8, [drm_fd]
+    mov r9, [drm_dumb_offset]
+    syscall
+    cmp rax, -4096
+    ja .ccb_fail
+    mov [comp_addr + 8], rax                 ; buffer 1 addr
+    ; fill buffer 1 blue
+    mov rdi, rax
+    mov rcx, [drm_dumb_size]
+    shr rcx, 2
+    mov eax, COMP_BG_COLOR
+    rep stosd
+    ; ADDFB for buffer 1
+    lea rdi, [drm_fb_cmd]
+    xor eax, eax
+    mov ecx, 7
+    rep stosd
+    mov eax, [drm_dumb_create + 4]
+    mov [drm_fb_cmd + 4], eax
+    mov eax, [drm_dumb_create + 0]
+    mov [drm_fb_cmd + 8], eax
+    mov eax, [drm_dumb_pitch]
+    mov [drm_fb_cmd + 12], eax
+    mov dword [drm_fb_cmd + 16], 32
+    mov dword [drm_fb_cmd + 20], 24
+    mov eax, [comp_handle + 4]
+    mov [drm_fb_cmd + 24], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_ADDFB
+    lea rdx, [drm_fb_cmd]
+    syscall
+    test rax, rax
+    js .ccb_fail
+    mov eax, [drm_fb_cmd]
+    mov [comp_fbid + 4], eax                 ; buffer 1 fbid
+    mov dword [comp_back], 1                  ; render buffer 1 first (front=0)
+
+    xor eax, eax
+    ret
+.ccb_fail:
+    mov rax, -1
+    ret
+
+; ----------------------------------------------------------------------------
+; encoder_pick_crtc — edi = encoder id, esi = crtc id to exclude (0 = none).
+; GETENCODER, then: the encoder's current crtc if usable, else the first
+; crtc in possible_crtcs that isn't excluded. eax = crtc id, 0 = none.
+; ----------------------------------------------------------------------------
+encoder_pick_crtc:
+    push rbx
+    push r12
+    mov r12d, esi                            ; excluded crtc
+    mov ebx, edi                             ; encoder id
+    lea rdi, [drm_encoder_buf]
+    xor eax, eax
+    mov ecx, 5
+    rep stosd
+    mov [drm_encoder_buf], ebx
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_GETENCODER
+    lea rdx, [drm_encoder_buf]
+    syscall
+    test rax, rax
+    js .epc_none
+    mov eax, [drm_encoder_buf + 8]           ; current crtc
+    test eax, eax
+    jz .epc_mask
+    cmp eax, r12d
+    jne .epc_ret
+.epc_mask:
+    mov ecx, [drm_encoder_buf + 12]          ; possible_crtcs (bit i = crtc_ids[i])
+    xor edx, edx
+.epc_scan:
+    cmp edx, [drm_res_buf + 36]              ; count_crtcs
+    jge .epc_none
+    bt ecx, edx
+    jnc .epc_next
+    mov eax, [drm_crtc_ids + rdx*4]
+    cmp eax, r12d
+    jne .epc_ret
+.epc_next:
+    inc edx
+    jmp .epc_scan
+.epc_none:
+    xor eax, eax
+.epc_ret:
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; modeset_pick_outputs — choose output 1 (first connected connector, its
+; preferred mode -> mode1_save/panel_w/h, crtc -> drm_chosen_crtc) and, when
+; present, output 2 (next connected connector on a DIFFERENT crtc ->
+; mode2_save/ext_*, ext_active=1). eax = 1 ok, 0 = no usable connector.
+; Re-runnable: hotplug calls this again after a uevent.
+; ----------------------------------------------------------------------------
+modeset_pick_outputs:
+    push rbx
+    push r12
+    push r13
+    mov byte [ext_active], 0
+    call modeset_find_connector              ; r12d = conn id, fills conn/modes buf
+    test eax, eax
+    jz .mpo_fail
+    mov [drm_chosen_conn], r12d
+    lea rsi, [drm_modes_buf]                 ; save mode 1 before the second
+    lea rdi, [mode1_save]                    ; scan clobbers the scratch bufs
+    mov ecx, 17
+    rep movsd
+    movzx eax, word [mode1_save + 4]
+    mov [panel_w], eax
+    movzx eax, word [mode1_save + 14]
+    mov [panel_h], eax
+    mov edi, [drm_conn_buf + 44]             ; encoder id
+    xor esi, esi
+    call encoder_pick_crtc
+    test eax, eax
+    jz .mpo_fail
+    mov [drm_chosen_crtc], eax
+
+    ; --- scan for a second connected connector (skip output 1's) ---
+    mov r13d, [drm_res_buf + 40]             ; count_connectors
+    xor ebx, ebx
+.mpo2_loop:
+    cmp ebx, r13d
+    jge .mpo_ok                              ; none -> single output
+    mov r12d, [drm_conn_ids + rbx*4]
+    cmp r12d, [drm_chosen_conn]
+    je .mpo2_next
+    lea rdi, [drm_conn_buf]
+    xor eax, eax
+    mov ecx, 10
+    rep stosq
+    mov [drm_conn_buf + 32], dword DRM_MAX_MODES
+    mov [drm_conn_buf + 36], dword DRM_MAX_PROPS
+    mov [drm_conn_buf + 40], dword DRM_MAX_IDS
+    mov [drm_conn_buf + 48], r12d
+    lea rax, [drm_enc_arr]
+    mov [drm_conn_buf + 0], rax
+    lea rax, [drm_modes_buf]
+    mov [drm_conn_buf + 8], rax
+    lea rax, [drm_props_arr]
+    mov [drm_conn_buf + 16], rax
+    lea rax, [drm_propvals_arr]
+    mov [drm_conn_buf + 24], rax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_GETCONNECTOR
+    lea rdx, [drm_conn_buf]
+    syscall
+    test rax, rax
+    js .mpo2_next
+    cmp dword [drm_conn_buf + 60], DRM_MODE_CONNECTED
+    jne .mpo2_next
+    cmp dword [drm_conn_buf + 32], 0         ; count_modes
+    je .mpo2_next
+    mov edi, [drm_conn_buf + 44]             ; its encoder
+    mov esi, [drm_chosen_crtc]               ; must land on a different crtc
+    call encoder_pick_crtc
+    test eax, eax
+    jz .mpo2_next
+    mov [ext_crtc], eax
+    mov [ext_conn], r12d
+    lea rsi, [drm_modes_buf]
+    lea rdi, [mode2_save]
+    mov ecx, 17
+    rep movsd
+    movzx eax, word [mode2_save + 4]
+    mov [ext_w], eax
+    movzx eax, word [mode2_save + 14]
+    mov [ext_h], eax
+    mov eax, [panel_w]
+    mov [ext_x], eax
+    mov byte [ext_active], 1
+    jmp .mpo_ok
+.mpo2_next:
+    inc ebx
+    jmp .mpo2_loop
+.mpo_ok:
+    mov eax, 1
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.mpo_fail:
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; compositor_program_crtcs — SETCRTC output 1 (fb x=0) and, when live,
+; output 2 (fb x=ext_x: the pan offset selects its slice of the wide fb).
+; rax < 0 = output 1 failed (fatal); an output-2 failure just drops
+; ext_active back to 0 and returns 0.
+; ----------------------------------------------------------------------------
+compositor_program_crtcs:
+    mov eax, [drm_chosen_conn]
+    mov [drm_set_conn_id], eax
+    lea rdi, [drm_crtc_set]
+    xor eax, eax
+    mov ecx, 13
+    rep stosq
+    lea rax, [drm_set_conn_id]
+    mov [drm_crtc_set + 0], rax
+    mov dword [drm_crtc_set + 8], 1
+    mov eax, [drm_chosen_crtc]
+    mov [drm_crtc_set + 12], eax
+    mov eax, [drm_fb_id]
+    mov [drm_crtc_set + 16], eax
+    mov dword [drm_crtc_set + 32], 1
+    lea rsi, [mode1_save]
+    lea rdi, [drm_crtc_set + 36]
+    mov ecx, 17
+    rep movsd
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_SETCRTC
+    lea rdx, [drm_crtc_set]
+    syscall
+    test rax, rax
+    js .cpc_ret
+    cmp byte [ext_active], 0
+    je .cpc_ok
+    mov eax, [ext_conn]
+    mov [drm_set_conn_id2], eax
+    lea rdi, [drm_crtc_set2]
+    xor eax, eax
+    mov ecx, 13
+    rep stosq
+    lea rax, [drm_set_conn_id2]
+    mov [drm_crtc_set2 + 0], rax
+    mov dword [drm_crtc_set2 + 8], 1
+    mov eax, [ext_crtc]
+    mov [drm_crtc_set2 + 12], eax
+    mov eax, [drm_fb_id]
+    mov [drm_crtc_set2 + 16], eax
+    mov eax, [ext_x]
+    mov [drm_crtc_set2 + 20], eax            ; x pan into the wide fb
+    mov dword [drm_crtc_set2 + 32], 1
+    lea rsi, [mode2_save]
+    lea rdi, [drm_crtc_set2 + 36]
+    mov ecx, 17
+    rep movsd
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_SETCRTC
+    lea rdx, [drm_crtc_set2]
+    syscall
+    test rax, rax
+    jns .cpc_ok
+    mov byte [ext_active], 0                 ; external refused its mode:
+.cpc_ok:                                     ; run single-output, don't die
+    xor eax, eax
+.cpc_ret:
+    ret
+
+; ----------------------------------------------------------------------------
+; init_uevent_socket — netlink KOBJECT_UEVENT socket, group 1, non-blocking.
+; Fully passive: one extra pollfd, zero wakeups until the kernel reports a
+; connector change. Leaves uevent_fd = -1 (slot ignored) when unavailable
+; or when there is no real DRM to reconfigure.
+; ----------------------------------------------------------------------------
+init_uevent_socket:
+    mov dword [uevent_fd], -1
+    cmp byte [compositor_active], 0
+    je .ius_done
+    cmp byte [fbtest_mode], 0
+    jne .ius_done
+    mov rax, SYS_SOCKET
+    mov edi, 16                              ; AF_NETLINK
+    mov esi, 2 | 0x800 | 0x80000             ; DGRAM | NONBLOCK | CLOEXEC
+    mov edx, 15                              ; NETLINK_KOBJECT_UEVENT
+    syscall
+    test rax, rax
+    js .ius_done
+    mov [uevent_fd], eax
+    lea rdi, [nl_addr]
+    xor eax, eax
+    mov [rdi], rax
+    mov [rdi + 4], eax
+    mov word [rdi], 16                       ; nl_family = AF_NETLINK
+    mov dword [rdi + 8], 1                   ; nl_groups = 1 (kernel uevents)
+    mov rax, SYS_BIND
+    mov edi, [uevent_fd]
+    lea rsi, [nl_addr]
+    mov edx, 12
+    syscall
+    test rax, rax
+    jns .ius_done
+    mov rax, SYS_CLOSE                       ; bind refused → feature off
+    mov edi, [uevent_fd]
+    syscall
+    mov dword [uevent_fd], -1
+.ius_done:
+    ret
+
+; ----------------------------------------------------------------------------
+; compositor_reconfigure — a DRM connector changed: re-pick outputs, rebuild
+; the (possibly resized) framebuffers, reprogram both CRTCs, re-seat the
+; cursor, force a full repaint and tell RandR subscribers (tile rediscovers
+; its outputs and retiles).
+; ----------------------------------------------------------------------------
+compositor_reconfigure:
+    cmp byte [compositor_active], 0
+    je .crc_done
+    cmp byte [fbtest_mode], 0
+    jne .crc_done
+    cmp byte [blank_state], 1                ; wake first: reprogramming dark
+    jne .crc_awake                           ; CRTCs would fight the blank
+    call comp_unblank
+.crc_awake:
+    call drm_probe_resources
+    call modeset_pick_outputs
+    test eax, eax
+    jz .crc_done                             ; no connector at all: keep as-is
+    call compositor_release_buffers
+    call compositor_create_buffers
+    test rax, rax
+    js .crc_done                             ; alloc failed — nothing sane left
+    call compositor_program_crtcs
+    cmp dword [cursor_ready], 0
+    je .crc_nocur
+    mov edi, [drm_chosen_crtc]               ; re-seat the sprite on (possibly
+    mov esi, [cursor_handle]                 ; new) crtc 1
+    call cursor_set_bo
+    mov eax, [drm_chosen_crtc]
+    mov [cursor_crtc], eax
+.crc_nocur:
+    mov eax, [screen_w]                      ; clamp the pointer into the new
+    dec eax                                  ; screen (it may have shrunk)
+    cmp [cursor_x], eax
+    jle .crc_xok
+    mov [cursor_x], eax
+.crc_xok:
+    mov eax, [screen_h]
+    dec eax
+    cmp [cursor_y], eax
+    jle .crc_yok
+    mov [cursor_y], eax
+.crc_yok:
+    call cursor_move_hw
+    mov byte [flip_pending], 0
+    mov dword [dmg_count0], -1               ; full repaint, both buffers
+    mov dword [dmg_count1], -1
+    mov byte [comp_dirty], 1
+    call rr_emit_screen_change
+    mov rsi, log_hotplug
+    mov rdx, log_hotplug_len
+    call write_stderr
+.crc_done:
+    ret
+
+; ----------------------------------------------------------------------------
+; compositor_release_buffers — RMFB → munmap → DESTROY_DUMB for both
+; buffers (the middle of compositor_shutdown, shared with hotplug
+; reconfigure which rebuilds them at the new size right after).
+; ----------------------------------------------------------------------------
+compositor_release_buffers:
+    mov eax, [comp_fbid + 0]
+    mov [drm_dumb_destroy], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_RMFB
+    lea rdx, [drm_dumb_destroy]
+    syscall
+    mov rax, SYS_MUNMAP
+    mov rdi, [comp_addr + 0]
+    mov rsi, [drm_dumb_size]
+    syscall
+    mov eax, [comp_handle + 0]
+    mov [drm_dumb_destroy], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_DESTROY_DUMB
+    lea rdx, [drm_dumb_destroy]
+    syscall
+    mov eax, [comp_fbid + 4]
+    mov [drm_dumb_destroy], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_RMFB
+    lea rdx, [drm_dumb_destroy]
+    syscall
+    mov rax, SYS_MUNMAP
+    mov rdi, [comp_addr + 8]
+    mov rsi, [drm_dumb_size]
+    syscall
+    mov eax, [comp_handle + 4]
+    mov [drm_dumb_destroy], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_DESTROY_DUMB
+    lea rdx, [drm_dumb_destroy]
+    syscall
     ret
 
 ; ----------------------------------------------------------------------------
@@ -13274,6 +13954,8 @@ init_hw_cursor:
     test rax, rax
     js .ihc_fail
     mov dword [cursor_ready], 1
+    mov eax, [drm_chosen_crtc]
+    mov [cursor_crtc], eax                   ; sprite lives on output 1 now
     call cursor_move_hw                      ; place at the centred start pos
 .ihc_fail:
     pop rbx
@@ -13340,11 +14022,37 @@ draw_cursor_arrow:
 cursor_move_hw:
     cmp dword [cursor_ready], 0
     je .cmh_done
-    mov dword [drm_cursor + 0], DRM_MODE_CURSOR_MOVE
-    mov eax, [drm_chosen_crtc]
-    mov [drm_cursor + 4], eax
+    ; Which output is the pointer on? ecx = its crtc, edx = crtc-local x.
+    mov ecx, [drm_chosen_crtc]
     mov eax, [cursor_x]
-    mov [drm_cursor + 8], eax                ; x
+    mov edx, eax
+    cmp byte [ext_active], 0
+    je .cmh_have
+    cmp eax, [ext_x]
+    jl .cmh_have
+    mov ecx, [ext_crtc]
+    sub edx, [ext_x]
+.cmh_have:
+    cmp ecx, [cursor_crtc]
+    je .cmh_move
+    ; Crossed outputs: hide the sprite on the old CRTC, show it on the new.
+    ; Costs 2 extra ioctls only at the crossing, not per motion event.
+    push rcx
+    push rdx
+    mov edi, [cursor_crtc]
+    xor esi, esi                             ; BO 0 = hide
+    call cursor_set_bo
+    mov ecx, [rsp + 8]
+    mov edi, ecx
+    mov esi, [cursor_handle]
+    call cursor_set_bo
+    pop rdx
+    pop rcx
+    mov [cursor_crtc], ecx
+.cmh_move:
+    mov dword [drm_cursor + 0], DRM_MODE_CURSOR_MOVE
+    mov [drm_cursor + 4], ecx                ; crtc_id
+    mov [drm_cursor + 8], edx                ; x (crtc-local)
     mov eax, [cursor_y]
     mov [drm_cursor + 12], eax               ; y
     mov rax, SYS_IOCTL
@@ -13353,6 +14061,30 @@ cursor_move_hw:
     lea rdx, [drm_cursor]
     syscall
 .cmh_done:
+    ret
+
+; cursor_set_bo — edi = crtc id, esi = cursor BO handle (0 = hide).
+cursor_set_bo:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov r12d, esi
+    lea rdi, [drm_cursor]
+    xor eax, eax
+    mov ecx, 7
+    rep stosd
+    mov dword [drm_cursor + 0], DRM_MODE_CURSOR_BO
+    mov [drm_cursor + 4], ebx
+    mov dword [drm_cursor + 16], 64
+    mov dword [drm_cursor + 20], 64
+    mov [drm_cursor + 24], r12d
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_CURSOR
+    lea rdx, [drm_cursor]
+    syscall
+    pop r12
+    pop rbx
     ret
 
 ; ----------------------------------------------------------------------------
@@ -13366,15 +14098,29 @@ init_fbtest:
     push rbx
     mov word [drm_modes_buf + 4], 1920
     mov word [drm_modes_buf + 14], 1080
-    mov dword [screen_w], 1920
+    mov dword [panel_w], 1920
+    mov dword [panel_h], 1080
+    mov eax, 1920
+    cmp byte [ext_active], 0                  ; --fbtest2: fake external,
+    je .ft_dims                               ; same 1920x1080, to the right
+    mov dword [ext_x], 1920
+    mov dword [ext_w], 1920
+    mov dword [ext_h], 1080
+    add eax, 1920
+.ft_dims:
+    mov [screen_w], eax
     mov dword [screen_h], 1080
-    mov dword [drm_dumb_pitch], 1920*4
-    mov qword [drm_dumb_size], 1920*1080*4
+    mov word [windows + 12], ax               ; root window record dims
+    mov word [windows + 14], 1080
+    shl eax, 2
+    mov [drm_dumb_pitch], eax                 ; stride = screen_w*4
+    imul eax, 1080
+    mov [drm_dumb_size], rax
     xor ebx, ebx
 .ft_buf:
     mov rax, SYS_MMAP
     xor edi, edi
-    mov rsi, 1920*1080*4
+    mov rsi, [drm_dumb_size]
     mov edx, 3                                ; PROT_READ|PROT_WRITE
     mov r10d, 0x22                            ; MAP_PRIVATE|MAP_ANONYMOUS
     mov r8, -1
@@ -13384,7 +14130,8 @@ init_fbtest:
     js .ft_fail
     mov [comp_addr + rbx*8], rax
     mov rdi, rax
-    mov rcx, 1920*1080
+    mov rcx, [drm_dumb_size]
+    shr rcx, 2
     mov eax, COMP_BG_COLOR
     rep stosd
     inc ebx
@@ -13437,12 +14184,12 @@ damage_add:
     jns .da_y1ok
     xor r10d, r10d
 .da_y1ok:
-    movzx eax, word [drm_modes_buf + 4]       ; screen w
+    mov eax, [screen_w]                       ; fb width (spans all outputs)
     cmp r11d, eax
     jle .da_x2ok
     mov r11d, eax
 .da_x2ok:
-    movzx eax, word [drm_modes_buf + 14]      ; screen h
+    mov eax, [screen_h]
     cmp ebx, eax
     jle .da_y2ok
     mov ebx, eax
@@ -13750,14 +14497,14 @@ recomposite_screen:
     xor eax, eax
     mov [bw_clip_x1], eax
     mov [bw_clip_y1], eax
-    movzx eax, word [drm_modes_buf + 4]
+    mov eax, [screen_w]
     mov [bw_clip_x2], eax
-    movzx eax, word [drm_modes_buf + 14]
+    mov eax, [screen_h]
     mov [bw_clip_y2], eax
     xor eax, eax                              ; whole-screen bg (wallpaper/solid)
     xor esi, esi
-    movzx edi, word [drm_modes_buf + 4]
-    movzx ecx, word [drm_modes_buf + 14]
+    mov edi, [screen_w]
+    mov ecx, [screen_h]
     call bg_fill_rect
     mov rax, [drm_dumb_size]
     shr rax, 2
@@ -13817,6 +14564,27 @@ recomposite_screen:
     cmp byte [drm_poll_dead], 0              ; no completion events any more →
     jne .rs_fb_swap                          ; fire-and-forget, never gate
     mov byte [flip_pending], 1
+    ; Second output: flip its CRTC to the same buffer. flip_pending counts
+    ; in-flight flips; the composite gate waits for both completions (the
+    ; effective composite rate becomes the slower display's — X11 norm).
+    cmp byte [ext_active], 0
+    je .rs_fb_swap
+    lea rdi, [drm_page_flip]
+    mov eax, [ext_crtc]
+    mov [rdi + 0], eax
+    mov eax, [comp_fbid + rbx*4]
+    mov [rdi + 4], eax
+    mov dword [rdi + 8], DRM_MODE_PAGE_FLIP_EVENT
+    mov dword [rdi + 12], 0
+    mov qword [rdi + 16], 0
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_PAGE_FLIP
+    lea rdx, [drm_page_flip]
+    syscall
+    test rax, rax
+    js .rs_fb_swap                           ; ext flip refused: don't gate on it
+    inc byte [flip_pending]
 .rs_fb_swap:
     mov eax, [comp_back]                     ; swap: submitted buffer is the
     xor eax, 1                               ; new front; render the other next
@@ -13950,8 +14718,8 @@ draw_rect:
     mov ebp, edx                             ; ebp = colour
 
     ; --- Clip x and width ---
-    movzx r12d, word [drm_modes_buf + 4]     ; screen w
-    movzx r13d, word [drm_modes_buf + 14]    ; screen h
+    mov r12d, [screen_w]
+    mov r13d, [screen_h]
     test eax, eax
     jns .dr_x_ok
     add edi, eax                              ; w shrinks by |x|
@@ -14106,8 +14874,8 @@ bg_fill_rect:
     push r14
     push r15
     push rbp
-    movzx r12d, word [drm_modes_buf + 4]      ; screen w
-    movzx r13d, word [drm_modes_buf + 14]     ; screen h
+    mov r12d, [screen_w]
+    mov r13d, [screen_h]
     ; --- clip x / w ---
     test eax, eax
     jns .bfr_x_ok
@@ -14261,6 +15029,16 @@ comp_blank:
     mov esi, DRM_IOCTL_MODE_SETCRTC
     lea rdx, [blank_crtc_cmd]
     syscall
+    cmp byte [ext_active], 0                 ; the external sleeps too
+    je .cb_one
+    mov eax, [ext_crtc]
+    mov [blank_crtc_cmd + 12], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_SETCRTC
+    lea rdx, [blank_crtc_cmd]
+    syscall
+.cb_one:
     mov byte [blank_state], 1
     lea rsi, [log_blank]
     mov rdx, log_blank_len
@@ -14280,6 +15058,14 @@ comp_unblank:
     mov esi, DRM_IOCTL_MODE_SETCRTC
     lea rdx, [drm_crtc_set]
     syscall
+    cmp byte [ext_active], 0
+    je .cu_one
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_SETCRTC
+    lea rdx, [drm_crtc_set2]
+    syscall
+.cu_one:
     mov byte [blank_state], 0
     mov byte [flip_pending], 0               ; any in-flight flip died with the CRTC
     mov dword [dmg_count0], -1               ; whole-screen repaint, both buffers
@@ -14370,6 +15156,22 @@ compositor_shutdown:
     ; 1. Restore the console's original CRTC. drm_crtc_save was filled by
     ;    GETCRTC in init_compositor; replaying it via SETCRTC puts the text
     ;    framebuffer back on the panel (and off frame's soon-to-be-freed fb).
+    ;    The external CRTC (which the console never used) is switched OFF
+    ;    first so it doesn't keep scanning the about-to-be-freed fb.
+    cmp byte [ext_active], 0
+    je .cs_ext_off_done
+    lea rdi, [blank_crtc_cmd]
+    xor eax, eax
+    mov ecx, 13
+    rep stosq
+    mov eax, [ext_crtc]
+    mov [blank_crtc_cmd + 12], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_SETCRTC
+    lea rdx, [blank_crtc_cmd]
+    syscall
+.cs_ext_off_done:
     mov rax, SYS_IOCTL
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_SETCRTC
@@ -14380,43 +15182,7 @@ compositor_shutdown:
     ;    this deterministically here (not implicitly at exit) is what lets the
     ;    next DRM master — gdm/Xorg — reclaim KMS cleanly. Leaving frame's fbs
     ;    registered across the master handoff can wedge the next modeset.
-    mov eax, [comp_fbid + 0]
-    mov [drm_dumb_destroy], eax
-    mov rax, SYS_IOCTL
-    mov rdi, [drm_fd]
-    mov esi, DRM_IOCTL_MODE_RMFB
-    lea rdx, [drm_dumb_destroy]
-    syscall
-    mov rax, SYS_MUNMAP
-    mov rdi, [comp_addr + 0]
-    mov rsi, [drm_dumb_size]
-    syscall
-    mov eax, [comp_handle + 0]
-    mov [drm_dumb_destroy], eax
-    mov rax, SYS_IOCTL
-    mov rdi, [drm_fd]
-    mov esi, DRM_IOCTL_MODE_DESTROY_DUMB
-    lea rdx, [drm_dumb_destroy]
-    syscall
-
-    mov eax, [comp_fbid + 4]
-    mov [drm_dumb_destroy], eax
-    mov rax, SYS_IOCTL
-    mov rdi, [drm_fd]
-    mov esi, DRM_IOCTL_MODE_RMFB
-    lea rdx, [drm_dumb_destroy]
-    syscall
-    mov rax, SYS_MUNMAP
-    mov rdi, [comp_addr + 8]
-    mov rsi, [drm_dumb_size]
-    syscall
-    mov eax, [comp_handle + 4]
-    mov [drm_dumb_destroy], eax
-    mov rax, SYS_IOCTL
-    mov rdi, [drm_fd]
-    mov esi, DRM_IOCTL_MODE_DESTROY_DUMB
-    lea rdx, [drm_dumb_destroy]
-    syscall
+    call compositor_release_buffers
 
     ; 3. Drop DRM master, then CLOSE the fd — releasing master + every remaining
     ;    resource before we exit, so gdm/Xorg finds a fully-free device.
@@ -15710,9 +16476,9 @@ blit_window:
     movzx eax, word [r13 + 42]            ; backing_h
     mov [rsp + 8], eax
     mov rbx, [r13 + 32]                    ; backing ptr
-    movzx eax, word [drm_modes_buf + 14]  ; screen h
+    mov eax, [screen_h]
     mov [rsp + 48], eax
-    movzx r15d, word [drm_modes_buf + 4]  ; screen w
+    mov r15d, [screen_w]
 
     ; X clip. win x in r14d.
     xor r8d, r8d                           ; src_x0

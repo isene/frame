@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.94-blue)
+![Version](https://img.shields.io/badge/version-0.0.95-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -270,6 +270,24 @@ not a PNG/JPEG. The `chasm-bg <image>` helper (ships with
 at the panel size — plus the bolt locker's `~/.lockbg.rgb` — and adds this
 line for you. Decode happens once, offline; frame just mmaps the buffer and
 blits it. A wrong-sized file is ignored (falls back to the solid colour).
+
+## External displays
+
+frame drives a second connected output natively: one wide framebuffer
+spans both screens side by side (panel left, external right), each CRTC
+scans its own slice via the SETCRTC pan offset, and page flips go to
+both. RandR reports two monitors ("default" + "ext"), so tile pins
+WS 10 to the external out of the box and `xrandr --listmonitors` shows
+both. Hotplug is event-driven: a netlink uevent socket sits in the
+serve loop's poll set (zero idle cost); plugging or unplugging a
+display rebuilds the framebuffers at the new combined size, reprograms
+the CRTCs and sends RRScreenChangeNotify so tile rediscovers and
+retiles. `./frame N --fbtest2` fakes a second 1920x1080 output for
+headless dual-head testing.
+
+Note: with two outputs the `background` file no longer matches the
+framebuffer size and is ignored (solid colour fallback) — re-render it
+at the combined resolution if wallpaper-on-dual matters.
 
 ## How it's built
 
