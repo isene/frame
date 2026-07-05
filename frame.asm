@@ -298,7 +298,8 @@ xfixes_sub_evbuf:   resb 32
 ; ShmPutImage reads the client's rendered image straight out of the mapped
 ; segment — no image bytes on the wire. Detached on ShmDetach + client death.
 SHM_SEG_MAX         equ 32
-shm_segs:           resb SHM_SEG_MAX * 24
+shm_segs:           resb SHM_SEG_MAX * 32  ; +0 shmseg +4 slot +8 addr
+                                           ; +16 size +24 readonly flag
 shmid_ds_buf:       resb 128               ; shmctl(IPC_STAT) scratch (shm_segsz @ +48)
 
 ; ---- SHAPE state ------------------------------------------------------------
@@ -606,6 +607,9 @@ server_time_ms:     resd 1               ; monotonic ms clock from the evdev eve
                                          ; (X time 0 = CurrentTime, which breaks GTK
                                          ; menu activation — must be a real time)
 ptr_grab_win:       resd 1               ; active pointer-grab window xid (0 = none)
+ptr_grab_owner:     resb 1               ; GrabPointer owner-events flag: 0 →
+                                         ; report everything against the grab
+                                         ; window (scrot -s filters on root)
 ptr_grab_mask:      resd 1               ; the grab's event mask (SETofPOINTEREVENT)
 ptr_grab_slot:      resd 1               ; client slot holding the grab — needed to
                                          ; release grabs on windows OUTSIDE the
@@ -946,6 +950,27 @@ log_hotplug:        db "frame: display hotplug — outputs reconfigured", 10
 log_hotplug_len     equ $ - log_hotplug
 log_vtback:         db "frame: VT reacquired", 10
 log_vtback_len      equ $ - log_vtback
+log_shm_minor:      db " SHM minor=", 0
+; AllocNamedColor table: len byte, lowercase name, RGB dword. 0-len ends.
+align 4
+color_names:
+    db 5, "black"
+    dd 0x000000
+    db 5, "white"
+    dd 0xFFFFFF
+    db 4, "gray"
+    dd 0xBEBEBE
+    db 4, "grey"
+    dd 0xBEBEBE
+    db 3, "red"
+    dd 0xFF0000
+    db 5, "green"
+    dd 0x00FF00
+    db 4, "blue"
+    dd 0x0000FF
+    db 6, "yellow"
+    dd 0xFFFF00
+    db 0
 str_vtactive:       db "/sys/class/tty/tty0/active", 0
 log_comp_pre:       db "compositor: mode ", 0
 log_comp_pre_len    equ $ - log_comp_pre - 1
@@ -3514,7 +3539,7 @@ client_cleanup_resources:
 .ccr_shm:
     cmp ebx, SHM_SEG_MAX
     jge .ccr_shm_done
-    imul ecx, ebx, 24
+    imul ecx, ebx, 32
     cmp dword [shm_segs + rcx], 0            ; occupied?
     je .ccr_shm_next
     cmp [shm_segs + rcx + 4], r12d           ; owned by the dying client?
@@ -4328,6 +4353,10 @@ dispatch_request:
     je .dr_query_keymap
     cmp eax, 41
     je .dr_warp_pointer
+    cmp eax, 84                              ; AllocColor / AllocNamedColor —
+    je .dr_alloc_color                       ; reply-carrying; scrot -s blocks
+    cmp eax, 85                              ; on 'gray' for its rubber band
+    je .dr_alloc_named_color
     cmp eax, 38
     je .dr_query_pointer
     cmp eax, 40
@@ -4595,6 +4624,16 @@ dispatch_request:
 .dr_warp_pointer:
     mov rsi, r12
     call handle_warp_pointer
+    jmp .dr_done
+.dr_alloc_color:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_alloc_color
+    jmp .dr_done
+.dr_alloc_named_color:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_alloc_named_color
     jmp .dr_done
 
 .dr_list_extensions:
@@ -4893,7 +4932,23 @@ handle_shm:
     je .shm_detach
     cmp eax, 3
     je .shm_put_image
-    ret                                      ; other minors: ignore
+    cmp eax, 4
+    je .shm_get_image
+    ; unknown minor: log it — a silently dropped reply-carrying request
+    ; wedges the client forever (ShmGetImage cost a debugging session)
+    push rax
+    mov rsi, log_shm_minor
+    mov edx, 11
+    call write_stderr
+    pop rax
+    call write_u64_stderr
+    mov rsi, qext_nl
+    mov edx, 1
+    call write_stderr
+    ret
+
+.shm_get_image:
+    jmp handle_shm_get_image                 ; edi=slot, rsi=req still set
 
 .shm_query_version:
     mov esi, 32
@@ -4918,15 +4973,36 @@ handle_shm:
     mov r12d, [rsi + 4]                      ; shmseg id
     mov r14d, edi                            ; client slot
     mov r13d, [rsi + 8]                      ; SysV shmid
-    mov eax, SYS_SHMAT                       ; shmat(shmid, NULL, SHM_RDONLY)
+    movzx ebx, byte [rsi + 12]               ; readOnly flag from the client
+    mov eax, SYS_SHMAT                       ; readOnly=0 → attach READ-WRITE:
+    mov edi, r13d                            ; ShmGetImage fills the segment
+    xor esi, esi
+    xor edx, edx
+    test ebx, ebx
+    jz .shm_att_mode
+    mov edx, SHM_RDONLY
+.shm_att_mode:
+    push rbx
+    syscall
+    pop rbx
+    test rax, rax
+    jns .shm_att_ok
+    ; RW attach refused (segment perms) → retry read-only; PutImage
+    ; still works, GetImage into it will refuse.
+    test ebx, ebx
+    jnz .shm_attach_done                     ; was already RO → give up
+    mov ebx, 1
+    mov eax, SYS_SHMAT
     mov edi, r13d
     xor esi, esi
     mov edx, SHM_RDONLY
+    push rbx
     syscall
-    cmp rax, -1
-    je .shm_attach_done                      ; attach failed → drop silently
+    pop rbx
     test rax, rax
     js .shm_attach_done
+.shm_att_ok:
+    push rbx                                 ; ro flag
     mov rbx, rax                             ; attached address
     mov eax, SYS_SHMCTL                      ; size = shm_segsz (IPC_STAT @ +48)
     mov edi, r13d
@@ -4940,7 +5016,7 @@ handle_shm:
 .shm_att_find:
     cmp ecx, SHM_SEG_MAX
     jge .shm_attach_detach                   ; table full → detach, drop
-    imul eax, ecx, 24
+    imul eax, ecx, 32
     mov edx, [shm_segs + rax]                ; shmseg (0 = empty)
     test edx, edx
     jz .shm_att_store
@@ -4953,12 +5029,17 @@ handle_shm:
     mov [shm_segs + rax + 4], r14d           ; owning client slot
     mov [shm_segs + rax + 8], rbx            ; attached address
     mov [shm_segs + rax + 16], r13           ; segment size
-    jmp .shm_attach_done
+    pop rcx                                  ; ro flag
+    mov [shm_segs + rax + 24], cl
+    jmp .shm_attach_ret
 .shm_attach_detach:
     mov eax, SYS_SHMDT
     mov rdi, rbx
     syscall
+    pop rcx                                  ; discard the pushed ro flag
+    jmp .shm_attach_ret
 .shm_attach_done:
+.shm_attach_ret:
     pop r14
     pop r13
     pop r12
@@ -4972,7 +5053,7 @@ handle_shm:
 .shm_det_find:
     cmp ecx, SHM_SEG_MAX
     jge .shm_detach_done
-    imul eax, ecx, 24
+    imul eax, ecx, 32
     cmp [shm_segs + rax], r9d
     je .shm_det_hit
     inc ecx
@@ -4990,6 +5071,187 @@ handle_shm:
 .shm_put_image:
     jmp handle_shm_put_image                  ; edi=slot, rsi=req still set
 
+; ----------------------------------------------------------------------------
+; handle_shm_get_image — edi = slot, rsi = req. ShmGetImage (minor 4):
+;   +4 drawable  +8 x s16  +10 y s16  +12 w u16  +14 h u16  +16 planemask
+;   +20 format (2 = ZPixmap)  +24 shmseg  +28 offset
+; Copies the rect into the client's attached segment (tight w*4 rows at
+; offset) and replies {depth, visual, size}. scrot/imlib2 grab the whole
+; screen this way — an unanswered ShmGetImage hangs them forever.
+; ----------------------------------------------------------------------------
+handle_shm_get_image:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 40
+    mov ebx, edi                             ; slot
+    mov r12, rsi                             ; req
+    mov eax, ebx
+    call client_meta_addr
+    mov [rsp], rax                           ; meta (fd +0, seq +8)
+    cmp byte [r12 + 20], 2                   ; ZPixmap only
+    jne .sgi_err
+    ; --- source pixels (mirror handle_get_image) ---
+    mov edi, [r12 + 4]
+    cmp edi, X_ROOT_WINDOW
+    jne .sgi_drawable
+    cmp byte [comp_dirty], 0                 ; fold pending damage first, or
+    je .sgi_root_fresh                       ; the grab misses fresh drawing
+    cmp byte [flip_pending], 0
+    jne .sgi_root_fresh
+    mov byte [comp_dirty], 0
+    call recomposite_screen
+.sgi_root_fresh:
+    mov eax, [comp_back]
+    xor eax, 1
+    mov r13, [comp_addr + rax*8]             ; FRONT buffer
+    test r13, r13
+    jz .sgi_err
+    mov eax, [screen_w]
+    mov [rsp + 8], eax                       ; src width (px)
+    mov eax, [screen_h]
+    mov [rsp + 12], eax                      ; src height
+    mov eax, [drm_dumb_pitch]
+    mov [rsp + 24], eax                      ; src pitch (bytes)
+    jmp .sgi_have_src
+.sgi_drawable:
+    call drawable_get_backing
+    test rax, rax
+    jz .sgi_err
+    mov r13, rax
+    mov [rsp + 8], edx
+    mov [rsp + 12], ecx
+    shl edx, 2
+    mov [rsp + 24], edx
+.sgi_have_src:
+    movsx r14d, word [r12 + 8]               ; x
+    movsx r15d, word [r12 + 10]              ; y
+    movzx ebp, word [r12 + 12]               ; w
+    movzx eax, word [r12 + 14]               ; h
+    mov [rsp + 16], eax
+    test ebp, ebp
+    jz .sgi_err
+    test eax, eax
+    jz .sgi_err
+    test r14d, r14d
+    js .sgi_err
+    test r15d, r15d
+    js .sgi_err
+    mov eax, r14d
+    add eax, ebp
+    cmp eax, [rsp + 8]                       ; x+w <= src width
+    jg .sgi_err
+    mov eax, r15d
+    add eax, [rsp + 16]
+    cmp eax, [rsp + 12]                      ; y+h <= src height
+    jg .sgi_err
+    ; --- destination segment: find entry (need addr + size + ro flag) ---
+    mov r9d, [r12 + 24]                      ; shmseg id
+    xor ecx, ecx
+.sgi_seg_find:
+    cmp ecx, SHM_SEG_MAX
+    jge .sgi_err
+    imul eax, ecx, 32
+    cmp [shm_segs + rax], r9d
+    je .sgi_seg_hit
+    inc ecx
+    jmp .sgi_seg_find
+.sgi_seg_hit:
+    cmp byte [shm_segs + rax + 24], 0        ; attached read-only → can't fill
+    jne .sgi_err
+    mov r10, [shm_segs + rax + 8]            ; segment address
+    mov r11, [shm_segs + rax + 16]           ; segment size
+    mov ecx, [r12 + 28]                      ; offset
+    add r10, rcx                             ; dst = addr + offset
+    sub r11, rcx                             ; remaining bytes
+    jb .sgi_err
+    ; bytes needed = w*4 * h
+    mov eax, ebp
+    shl eax, 2                               ; dst stride (tight)
+    mov [rsp + 28], eax
+    mov edx, [rsp + 16]                      ; h (zero-extended)
+    imul rax, rdx                            ; bytes needed = stride * h
+    cmp rax, r11
+    ja .sgi_err
+    ; --- copy rows: src = r13 + y*pitch + x*4 ---
+    mov eax, r15d
+    imul eax, dword [rsp + 24]
+    add r13, rax
+    mov eax, r14d
+    shl eax, 2
+    add r13, rax
+    mov edx, [rsp + 16]                      ; rows left
+.sgi_row:
+    test edx, edx
+    jz .sgi_done_copy
+    push rdx
+    mov rsi, r13
+    mov rdi, r10
+    mov ecx, ebp                             ; w pixels
+    rep movsd
+    pop rdx
+    mov eax, [rsp + 24]
+    add r13, rax                             ; next src row
+    mov eax, [rsp + 28]
+    add r10, rax                             ; next dst row (tight)
+    dec edx
+    jmp .sgi_row
+.sgi_done_copy:
+    ; --- reply: depth @1, visual @8, size @12 ---
+    lea rdi, [reply_buf]
+    xor eax, eax
+    mov [rdi], rax
+    mov [rdi + 8], rax
+    mov [rdi + 16], rax
+    mov [rdi + 24], rax
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 24                   ; depth
+    mov rax, [rsp]
+    mov ecx, [rax + 8]
+    mov [rdi + 2], cx                        ; seq
+    mov dword [rdi + 8], X_ROOT_VISUAL_24    ; visual
+    mov eax, [rsp + 28]
+    imul eax, dword [rsp + 16]
+    mov [rdi + 12], eax                      ; size (bytes written)
+    mov rax, [rsp]
+    mov edi, [rax]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov edx, 32
+    syscall
+    jmp .sgi_out
+.sgi_err:
+    ; BadMatch error so the client unblocks instead of hanging.
+    lea rdi, [reply_buf]
+    xor eax, eax
+    mov [rdi], rax
+    mov [rdi + 8], rax
+    mov [rdi + 16], rax
+    mov [rdi + 24], rax
+    mov byte [rdi + 0], 0                    ; Error
+    mov byte [rdi + 1], 8                    ; BadMatch
+    mov rax, [rsp]
+    mov ecx, [rax + 8]
+    mov [rdi + 2], cx                        ; seq
+    mov rax, [rsp]
+    mov edi, [rax]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov edx, 32
+    syscall
+.sgi_out:
+    add rsp, 40
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; shm_seg_lookup — edi = shmseg id. Returns rax = attached address (0 if not
 ; found), rdx = segment size. Clobbers rcx.
 shm_seg_lookup:
@@ -4997,7 +5259,7 @@ shm_seg_lookup:
 .ssl_find:
     cmp ecx, SHM_SEG_MAX
     jge .ssl_none
-    imul eax, ecx, 24
+    imul eax, ecx, 32
     cmp [shm_segs + rax], edi
     je .ssl_hit
     inc ecx
@@ -6938,6 +7200,8 @@ handle_xinput:
     mov [ptr_grab_slot], ebx
     mov dword [ptr_grab_mask], 0xFFFF        ; grab wants everything
     mov byte [ptr_grab_xi2], 1
+    mov byte [ptr_grab_owner], 1             ; XI2 grabs keep the deep pick
+                                             ; (GTK menu-item selection)
     cmp eax, 2
     jbe .xgd_maybe_both                      ; 0/1 = all devices → kbd too
     jmp .xgd_reply
@@ -7750,6 +8014,149 @@ handle_list_installed_colormaps:
     mov rdx, 36
     syscall
 
+    pop r12
+    pop rbx
+    ret
+
+; handle_alloc_color — edi = slot, rsi = req. AllocColor (84): TrueColor →
+; pixel is just the 8-bit-truncated RGB; nothing to allocate.
+;   req: cmap@4, red@8 (u16), green@10, blue@12
+;   reply: red/green/blue@8,10,12 (echo), pixel@16
+handle_alloc_color:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov r12, rsi
+    mov eax, ebx
+    call client_meta_addr
+    push rax
+    lea rdi, [reply_buf]
+    xor eax, eax
+    mov [rdi], rax
+    mov [rdi + 8], rax
+    mov [rdi + 16], rax
+    mov [rdi + 24], rax
+    mov byte [rdi + 0], 1
+    pop rax
+    mov ecx, [rax + 8]
+    mov [rdi + 2], cx                        ; seq
+    push rax
+    movzx ecx, word [r12 + 8]                ; red
+    mov [rdi + 8], cx
+    movzx edx, word [r12 + 10]               ; green
+    mov [rdi + 10], dx
+    movzx esi, word [r12 + 12]               ; blue
+    mov [rdi + 12], si
+    shr ecx, 8
+    shl ecx, 16
+    mov eax, edx
+    shr eax, 8
+    shl eax, 8
+    or ecx, eax
+    shr esi, 8
+    or ecx, esi
+    mov [rdi + 16], ecx                      ; pixel = RRGGBB
+    pop rax
+    mov edi, [rax]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov edx, 32
+    syscall
+    pop r12
+    pop rbx
+    ret
+
+; handle_alloc_named_color — edi = slot, rsi = req. AllocNamedColor (85):
+;   req: cmap@4, nameLen@8 (u16), name@12
+;   reply: pixel@8, exactR/G/B@12,14,16, visualR/G/B@18,20,22
+; Small name table (X11 rgb.txt values); unknown names resolve to white —
+; a wrong colour beats a hung client (scrot -s asks for "gray").
+handle_alloc_named_color:
+    push rbx
+    push r12
+    push r13
+    mov ebx, edi
+    mov r12, rsi
+    movzx ecx, word [r12 + 8]                ; name length
+    lea rsi, [r12 + 12]                      ; name bytes
+    lea rdi, [color_names]
+    xor r13d, r13d                           ; default: white (table entry 0 fallback)
+    mov r13d, 0xFFFFFF
+.anc_scan:
+    movzx eax, byte [rdi]                    ; table entry name length (0 = end)
+    test eax, eax
+    jz .anc_have
+    cmp eax, ecx
+    jne .anc_skip
+    push rcx
+    push rsi
+    push rdi
+    inc rdi
+.anc_cmp:
+    mov dl, [rsi]
+    or dl, 0x20                              ; case-insensitive (names are ascii)
+    cmp dl, [rdi]
+    jne .anc_miss
+    inc rsi
+    inc rdi
+    dec ecx
+    jnz .anc_cmp
+    pop rdi
+    pop rsi
+    pop rcx
+    movzx eax, byte [rdi]
+    lea rdi, [rdi + rax + 1]
+    mov r13d, [rdi]                          ; the RGB dword after the name
+    jmp .anc_have
+.anc_miss:
+    pop rdi
+    pop rsi
+    pop rcx
+.anc_skip:
+    movzx eax, byte [rdi]
+    lea rdi, [rdi + rax + 1 + 4]             ; skip name + rgb dword
+    jmp .anc_scan
+.anc_have:
+    mov eax, ebx
+    call client_meta_addr
+    push rax
+    lea rdi, [reply_buf]
+    xor eax, eax
+    mov [rdi], rax
+    mov [rdi + 8], rax
+    mov [rdi + 16], rax
+    mov [rdi + 24], rax
+    mov byte [rdi + 0], 1
+    pop rax
+    mov ecx, [rax + 8]
+    mov [rdi + 2], cx
+    push rax
+    mov [rdi + 8], r13d                      ; pixel
+    ; 16-bit channel values = 8-bit << 8 (echoed as both exact and visual)
+    mov ecx, r13d
+    shr ecx, 16
+    and ecx, 0xFF
+    mov ch, cl                               ; r*0x101 ≈ r<<8|r
+    mov [rdi + 12], cx                       ; exactRed
+    mov [rdi + 18], cx                       ; visualRed
+    mov ecx, r13d
+    shr ecx, 8
+    and ecx, 0xFF
+    mov ch, cl
+    mov [rdi + 14], cx                       ; exactGreen
+    mov [rdi + 20], cx                       ; visualGreen
+    mov ecx, r13d
+    and ecx, 0xFF
+    mov ch, cl
+    mov [rdi + 16], cx                       ; exactBlue
+    mov [rdi + 22], cx                       ; visualBlue
+    pop rax
+    mov edi, [rax]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov edx, 32
+    syscall
+    pop r13
     pop r12
     pop rbx
     ret
@@ -8923,6 +9330,48 @@ handle_destroy_window:
 .hd_noumap:
     mov rdi, r13                             ; Expose the region it was covering
     call expose_under_window
+    ; DestroyNotify to the window's own StructureNotify selector (owner)...
+    mov eax, [r13 + 24]
+    test eax, EM_STRUCTURE_NOTIFY
+    jz .hd_nodn
+    mov eax, [r13]
+    cmp eax, X_RID_BASE
+    jb .hd_nodn
+    sub eax, X_RID_BASE
+    shr eax, 21
+    cmp eax, MAX_CLIENTS
+    jae .hd_nodn
+    mov edi, eax
+    mov esi, [r13]                           ; event window = the window
+    mov edx, [r13]
+    call send_destroy_notify
+.hd_nodn:
+    ; ...and to the parent's SubstructureNotify subscriber (root → the WM's
+    ; redirect owner; other parents → the parent's owner client).
+    mov edi, [r13 + 4]                       ; parent xid
+    call window_lookup
+    test rax, rax
+    jz .hd_clear
+    test dword [rax + 24], EM_SUBSTRUCTURE_NOTIFY
+    jz .hd_clear
+    cmp dword [rax], X_ROOT_WINDOW
+    jne .hd_dn_owner
+    movsx edi, byte [rax + 30]               ; redirect owner (the WM)
+    cmp edi, 0
+    jl .hd_clear
+    jmp .hd_dn_send
+.hd_dn_owner:
+    mov edi, [rax]
+    sub edi, X_RID_BASE
+    shr edi, 21
+    cmp edi, MAX_CLIENTS
+    jae .hd_clear
+.hd_dn_send:
+    cmp edi, ebx                             ; requester destroyed its own child
+    je .hd_clear                             ; under itself: skip the echo
+    mov esi, [rax]                           ; event window = parent
+    mov edx, [r13]                           ; window
+    call send_destroy_notify
 .hd_clear:
     mov edi, r12d
     call window_destroy
@@ -9017,6 +9466,26 @@ handle_map_window:
     mov rsi, r12                                ; window record
     call send_configure_notify
 .mw_check_sub:
+    ; Newly viewable + ExposureMask selected → the window's owner gets a
+    ; full-window Expose (X semantics: paint now). scrot -s re-maps its
+    ; shaped overlay and BLOCKS waiting for exactly this event.
+    test dword [r12 + 24], 0x8000               ; ExposureMask
+    jz .mw_no_expose
+    mov eax, [r12]
+    cmp eax, X_RID_BASE
+    jb .mw_no_expose
+    sub eax, X_RID_BASE
+    shr eax, 21
+    cmp eax, MAX_CLIENTS
+    jae .mw_no_expose
+    mov edi, eax                                ; owner slot
+    mov esi, [r12]                              ; window
+    xor edx, edx                                ; x
+    xor ecx, ecx                                ; y
+    movzx r8d, word [r12 + 12]                  ; width
+    movzx r9d, word [r12 + 14]                  ; height
+    call send_expose
+.mw_no_expose:
     ; If parent has SubstructureNotify, notify the redirect-owner subscriber.
     test r13, r13
     jz .mw_done
@@ -11050,6 +11519,8 @@ handle_grab_pointer:
     mov [ptr_grab_mask], eax
     mov [ptr_grab_slot], edi                  ; who holds it (death cleanup)
     mov byte [ptr_grab_xi2], 0                ; core grab → core events
+    movzx eax, byte [rsi + 1]                 ; owner-events (X: False → all
+    mov [ptr_grab_owner], al                  ; events report the grab window)
     push rbx
     push r12
     mov ebx, edi
@@ -12075,6 +12546,24 @@ window_at_point_deep:
 ; the grab's client, otherwise the grab window itself. Returns the record ptr
 ; in rax; wapd_abs_x/wapd_abs_y hold the target's absolute origin either way.
 ; ----------------------------------------------------------------------------
+; grab_owner_target — owner-events=False active grab: rax = the GRAB window's
+; record (0 if gone) and wapd_abs_x/y = its absolute origin, so the shared
+; delivery code emits the event against the grab window with grab-relative
+; coordinates — X semantics for owner_events=False (scrot -s relies on it).
+grab_owner_target:
+    mov edi, [ptr_grab_win]
+    call window_lookup
+    test rax, rax
+    jz .got_ret
+    push rax
+    mov edi, [ptr_grab_win]
+    call window_abs_xy                       ; r10d/r11d = absolute origin
+    mov [wapd_abs_x], r10d
+    mov [wapd_abs_y], r11d
+    pop rax
+.got_ret:
+    ret
+
 grab_pointer_target:
     push rbx
     call window_at_point_deep                 ; rax = deepest record (or 0)
@@ -12338,6 +12827,17 @@ deliver_pointer_motion:
     push rbx
     cmp dword [ptr_grab_win], 0              ; pointer grabbed?
     je .dpm_point
+    cmp byte [ptr_grab_owner], 0             ; owner-events False → report
+    jne .dpm_gdeep                           ; against the grab window
+    call grab_owner_target
+    test rax, rax
+    jz .dpm_done
+    mov rbx, rax
+    mov eax, [ptr_grab_mask]                 ; gate on the grab's mask only
+    call core_motion_wanted                  ; (scrot -s: ButtonMotionMask)
+    jz .dpm_done
+    jmp .dpm_gdeliver
+.dpm_gdeep:
     call grab_pointer_target                 ; deepest client window, else grab win
     test rax, rax
     jz .dpm_done
@@ -12429,6 +12929,21 @@ deliver_pointer_button:
     mov r13d, esi                            ; button
     cmp dword [ptr_grab_win], 0              ; pointer grabbed? (open menu, DND...)
     je .dpb_point
+    cmp byte [ptr_grab_owner], 0             ; owner-events False → the event
+    jne .dpb_gdeep                           ; window IS the grab window (scrot -s
+    call grab_owner_target                   ; does XWindowEvent(root, ...))
+    test rax, rax
+    jz .dpb_done
+    mov rbx, rax
+    mov ecx, 0x04
+    cmp r12d, 4
+    je .dpb_gomask
+    mov ecx, 0x08
+.dpb_gomask:
+    test [ptr_grab_mask], ecx                ; gate on the grab's mask only
+    jz .dpb_done
+    jmp .dpb_gdeliver
+.dpb_gdeep:
     call grab_pointer_target                 ; deepest client window, else grab win
     test rax, rax
     jz .dpb_done
@@ -13248,6 +13763,36 @@ send_configure_notify:
     mov edi, ebx
     lea rsi, [reply_buf]
     call send_event_to_slot
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; send_destroy_notify — edi = client slot, esi = event window, edx = window.
+; DestroyNotify (17). Clients that select StructureNotify on their own
+; window and destroy it BLOCK until this arrives (scrot -s waits for its
+; selection overlay to be really gone before grabbing the screen).
+; ----------------------------------------------------------------------------
+send_destroy_notify:
+    push rbx
+    push r12
+    push r13
+    mov ebx, edi
+    mov r12d, esi
+    mov r13d, edx
+    lea rdi, [reply_buf]
+    xor eax, eax
+    mov [rdi], rax
+    mov [rdi + 8], rax
+    mov [rdi + 16], rax
+    mov [rdi + 24], rax
+    mov byte [rdi + 0], 17                   ; DestroyNotify
+    mov [rdi + 4], r12d                      ; event
+    mov [rdi + 8], r13d                      ; window
+    mov edi, ebx
+    lea rsi, [reply_buf]
+    call send_event_to_slot
+    pop r13
     pop r12
     pop rbx
     ret
