@@ -43,6 +43,10 @@ DEFAULT REL
     xor r8d, r8d
     xor r9d, r9d
     syscall
+    cmp rax, -11                 ; EAGAIN: client socket full, event dropped —
+    jne %%ok                     ; count it (SIGUSR1 FBSTATE line reports it;
+    inc dword [ev_dropped]       ; diagnosing "client went stale" reports)
+%%ok:
 %endmacro
 %define SYS_OPEN        2
 %define SYS_CLOSE       3
@@ -359,8 +363,9 @@ clients_bufs:       resb MAX_CLIENTS * CLIENT_BUF_SIZE
 ; MAX_INPUTS evdev devices. Rebuilt each poll iteration; ~1.2 KB of
 ; writes at full census, sub-microsecond. MAX_INPUTS is defined further
 ; down (16) — total = 1 + 128 + 16 = 145 entries.
-pollfd_buf:         resb (MAX_CLIENTS + 1 + 16 + 2) * 8   ; +1: drm_fd (flip events)
+pollfd_buf:         resb (MAX_CLIENTS + 1 + 16 + 3) * 8   ; +1: drm_fd (flip events)
                                                           ; +1: uevent_fd (hotplug)
+                                                          ; +1: vtactive_fd (VT watch)
 
 ; Atom interning table. Atom 0 = None. Atoms 1..predef_count_max are
 ; X11's predefined set (PRIMARY, ATOM, STRING, WM_NAME, ...).
@@ -726,6 +731,11 @@ hotplug_pending:    resb 1                 ; uevent arrived; re-probe next cycle
 rr_evwins:          resd MAX_CLIENTS       ; RRSelectInput window per client
 uevent_buf:         resb 4096
 nl_addr:            resb 12                ; sockaddr_nl for the uevent bind
+own_vt:             resd 1                 ; frame's VT (from tty0/active)
+ev_dropped:         resd 1                 ; events dropped on full sockets
+vt_away:            resb 1                 ; 1 = display released, VT switched
+vtactive_fd:        resd 1                 ; /sys/class/tty/tty0/active fd
+vtact_buf:          resb 16
 
 ; drm_mode_fb_dirty_cmd (24 bytes) for kicking the panel after a
 ; framebuffer update. fb_id at +0, flags at +4, color at +8,
@@ -931,6 +941,9 @@ log_unblank:        db "frame: panel on (input)", 10
 log_unblank_len     equ $ - log_unblank
 log_hotplug:        db "frame: display hotplug — outputs reconfigured", 10
 log_hotplug_len     equ $ - log_hotplug
+log_vtback:         db "frame: VT reacquired", 10
+log_vtback_len      equ $ - log_vtback
+str_vtactive:       db "/sys/class/tty/tty0/active", 0
 log_comp_pre:       db "compositor: mode ", 0
 log_comp_pre_len    equ $ - log_comp_pre - 1
 log_comp_x:         db "x"
@@ -1019,6 +1032,7 @@ dump_prefix:        db "/tmp/frame_win_", 0
 dump_fb0_path:      db "/tmp/frame_fbA.raw", 0
 dump_fb1_path:      db "/tmp/frame_fbB.raw", 0
 dbg_fbstate:        db "FBSTATE back=", 0
+dbg_evdrop:         db " evdrop=", 0
 dbg_pxblit:         db " blit=", 0
 dbg_pxfill:         db " fill=", 0
 dbg_pxflush:        db " flush=", 0
@@ -3760,7 +3774,7 @@ serve_loop:
     mov [pollfd_buf + rax], edx
     mov word [pollfd_buf + rax + 4], 1       ; POLLIN
     mov word [pollfd_buf + rax + 6], 0
-    ; --- Very last slot: the netlink uevent socket (display hotplug).
+    ; --- Next slot: the netlink uevent socket (display hotplug).
     ; -1 when unavailable — poll ignores negative fds, zero idle cost.
     mov edx, [uevent_fd]
     mov eax, MAX_CLIENTS + 1 + MAX_INPUTS + 1
@@ -3768,10 +3782,19 @@ serve_loop:
     mov [pollfd_buf + rax], edx
     mov word [pollfd_buf + rax + 4], 1       ; POLLIN
     mov word [pollfd_buf + rax + 6], 0
+    ; --- Very last slot: the VT-active sysfs attr. POLLPRI fires on any
+    ; VT switch; that's how frame re-acquires the display when its VT
+    ; comes back (Ctrl+Alt+Fn away and back no longer kills the session).
+    mov edx, [vtactive_fd]
+    mov eax, MAX_CLIENTS + 1 + MAX_INPUTS + 2
+    shl eax, 3
+    mov [pollfd_buf + rax], edx
+    mov word [pollfd_buf + rax + 4], 2       ; POLLPRI
+    mov word [pollfd_buf + rax + 6], 0
 .sl_poll:
     mov rax, SYS_POLL
     lea rdi, [pollfd_buf]
-    mov esi, MAX_CLIENTS + 1 + MAX_INPUTS + 2
+    mov esi, MAX_CLIENTS + 1 + MAX_INPUTS + 3
     mov edx, -1                              ; infinite timeout when idle (no
     cmp byte [flip_pending], 0               ; wakeups → battery). But while a
     jne .sl_poll_flip                        ; PAGE_FLIP is in flight, cap at
@@ -3790,6 +3813,8 @@ serve_loop:
     je .sl_poll_go
     cmp byte [fbtest_mode], 0                ; no panel to power off — and
     jne .sl_poll_go                          ; last_input_mono is never armed
+    cmp byte [vt_away], 0                    ; console owns the display
+    jne .sl_poll_go
     cmp byte [blank_state], 0
     jne .sl_poll_go
     mov eax, [cfg_blank_ms]
@@ -3814,7 +3839,7 @@ serve_loop:
     ; re-load the poll registers — the blank-deadline path clobbers them
     mov rax, SYS_POLL
     lea rdi, [pollfd_buf]
-    mov esi, MAX_CLIENTS + 1 + MAX_INPUTS + 2
+    mov esi, MAX_CLIENTS + 1 + MAX_INPUTS + 3
     syscall                                  ; (timeout in edx)
     test rax, rax
     jz .sl_poll_timeout
@@ -3902,6 +3927,21 @@ serve_loop:
     jmp .sl_iw
 
 .sl_flush:
+    ; --- VT watch: POLLPRI on tty0/active = a VT switch happened. Re-read
+    ; the attr (rearms the poll) and re-acquire the display if it's ours.
+    mov eax, MAX_CLIENTS + 1 + MAX_INPUTS + 2
+    shl eax, 3
+    movzx eax, word [pollfd_buf + rax + 6]   ; revents
+    test eax, 0x0A                           ; POLLPRI|POLLERR (sysfs style)
+    jz .sl_no_vtev
+    call vt_read_active                      ; eax = active VT (also rearms)
+    cmp byte [vt_away], 0
+    je .sl_no_vtev
+    cmp eax, [own_vt]
+    jne .sl_no_vtev
+    call vt_reacquire
+.sl_no_vtev:
+
     ; --- Display hotplug: drain the uevent socket; any DRM change event
     ; schedules a reconfigure (run below once no flip is in flight).
     mov eax, MAX_CLIENTS + 1 + MAX_INPUTS + 1
@@ -3939,6 +3979,8 @@ serve_loop:
     je .sl_no_hotplug
     cmp byte [flip_pending], 0               ; wait until in-flight flips land
     jne .sl_no_hotplug
+    cmp byte [vt_away], 0                    ; deferred until the VT is ours
+    jne .sl_no_hotplug                       ; again (flag survives)
     mov byte [hotplug_pending], 0
     call compositor_reconfigure
 .sl_no_hotplug:
@@ -3991,6 +4033,11 @@ serve_loop:
     ; comp_dirty + damage rects rather than repainting per request.
     cmp byte [comp_dirty], 0
     je .sl_iter
+    cmp byte [vt_away], 0                    ; switched away: the console owns
+    je .sl_vt_here                           ; the display — swallow the dirt,
+    mov byte [comp_dirty], 0                 ; reacquire repaints everything
+    jmp .sl_iter
+.sl_vt_here:
     cmp byte [blank_state], 0                ; panel dark: swallow the dirt —
     je .sl_blank_ok                          ; compositing (and flipping on a
     mov byte [comp_dirty], 0                 ; disabled CRTC) is pure waste, and
@@ -11046,6 +11093,8 @@ dispatch_input_event:
     push r12
     push r13
     mov rbx, rdi
+    cmp byte [vt_away], 0                    ; switched away: these keystrokes
+    jne .die_done                            ; belong to the console, not X
     ; Derive the X server time (ms) from this event's own kernel timestamp —
     ; input_event = { tv_sec@0 (8), tv_usec@8 (8), type@16, code@18, value@20 }.
     ; No extra syscall: the timestamp is already in the record. Low 32 bits
@@ -11148,17 +11197,20 @@ dispatch_input_event:
     cmp r12d, 68
     ja .die_chk_f11
     lea edi, [r12d - 58]
-    call switch_vt                           ; does not return
+    call switch_vt                           ; returns: display released, the
+    jmp .die_done                            ; serve loop keeps running
 .die_chk_f11:
     cmp r12d, 87                             ; F11 → VT 11
     jne .die_chk_f12
     mov edi, 11
     call switch_vt
+    jmp .die_done
 .die_chk_f12:
     cmp r12d, 88                             ; F12 → VT 12
     jne .die_nozap
     mov edi, 12
     call switch_vt
+    jmp .die_done
 .die_nozap:
     ; x11_keycode = evdev_code + 8 (kept in r12d from here on).
     add r12d, 8
@@ -13749,10 +13801,24 @@ compositor_program_crtcs:
 ; ----------------------------------------------------------------------------
 init_uevent_socket:
     mov dword [uevent_fd], -1
+    mov dword [vtactive_fd], -1
     cmp byte [compositor_active], 0
     je .ius_done
     cmp byte [fbtest_mode], 0
     jne .ius_done
+    ; --- VT watcher: open tty0/active; the first read arms the sysfs
+    ; POLLPRI AND records which VT is ours (frame starts on its own VT).
+    mov rax, SYS_OPEN
+    lea rdi, [str_vtactive]
+    xor esi, esi                             ; O_RDONLY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .ius_netlink
+    mov [vtactive_fd], eax
+    call vt_read_active
+    mov [own_vt], eax
+.ius_netlink:
     mov rax, SYS_SOCKET
     mov edi, 16                              ; AF_NETLINK
     mov esi, 2 | 0x800 | 0x80000             ; DGRAM | NONBLOCK | CLOEXEC
@@ -15123,6 +15189,32 @@ exit_handler:
 ; ----------------------------------------------------------------------------
 switch_vt:
     mov [pending_vt], edi
+    cmp dword [vtactive_fd], 0               ; no VT watcher (open failed) →
+    jl .sv_legacy                            ; legacy behavior: clean exit
+    cmp byte [vt_away], 0
+    jne .sv_act                              ; already away: just re-activate
+    mov byte [vt_away], 1
+    call vt_release_display
+.sv_act:
+    mov rax, SYS_OPEN
+    lea rdi, [str_dev_tty0]
+    mov esi, 2                               ; O_RDWR
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .sv_done
+    push rax
+    mov rdi, rax
+    mov rax, SYS_IOCTL
+    mov esi, 0x5606                          ; VT_ACTIVATE
+    mov edx, [pending_vt]
+    syscall
+    pop rdi
+    mov rax, SYS_CLOSE
+    syscall
+.sv_done:
+    ret
+.sv_legacy:
     call compositor_shutdown
     mov rax, SYS_OPEN
     lea rdi, [str_dev_tty0]
@@ -15140,6 +15232,162 @@ switch_vt:
     mov rax, SYS_EXIT
     xor edi, edi
     syscall
+
+; ----------------------------------------------------------------------------
+; vt_release_display — hand the display to the console: external CRTC off,
+; console CRTC restored, DRM master dropped (fbcon can then repaint the
+; target VT), all evdev grabs released (the console gets the keyboard),
+; input state reset (keys held across the switch would otherwise stick).
+; The serve loop keeps running — clients are served while we're away.
+; ----------------------------------------------------------------------------
+vt_release_display:
+    push rbx
+    cmp byte [compositor_active], 0
+    je .vrd_done
+    cmp byte [fbtest_mode], 0
+    jne .vrd_done
+    mov byte [blank_state], 0                ; console owns the panel now
+    mov byte [flip_pending], 0
+    cmp byte [ext_active], 0
+    je .vrd_ext_done
+    lea rdi, [blank_crtc_cmd]
+    xor eax, eax
+    mov ecx, 13
+    rep stosq
+    mov eax, [ext_crtc]
+    mov [blank_crtc_cmd + 12], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_SETCRTC
+    lea rdx, [blank_crtc_cmd]
+    syscall
+.vrd_ext_done:
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_SETCRTC
+    lea rdx, [drm_crtc_save]                 ; console's saved CRTC state
+    syscall
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_DROP_MASTER
+    xor edx, edx
+    syscall
+    ; ungrab every input fd + reset input state
+    xor ebx, ebx
+.vrd_ungrab:
+    cmp ebx, [input_fd_count]
+    jge .vrd_input_done
+    mov edi, [input_fds + rbx*4]
+    test edi, edi
+    js .vrd_next
+    mov rax, SYS_IOCTL
+    mov esi, 0x40044590                      ; EVIOCGRAB
+    xor edx, edx                             ; 0 = release
+    syscall
+.vrd_next:
+    inc ebx
+    jmp .vrd_ungrab
+.vrd_input_done:
+    mov dword [mod_state], 0                 ; keys held across the switch
+    mov dword [button_state], 0              ; must not stick
+    lea rdi, [keys_down]
+    xor eax, eax
+    mov ecx, 4
+    rep stosq
+.vrd_done:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; vt_reacquire — our VT is active again: take DRM master back, re-grab
+; input, reprogram both CRTCs, re-seat the cursor, full repaint.
+; ----------------------------------------------------------------------------
+vt_reacquire:
+    push rbx
+    cmp byte [compositor_active], 0
+    je .vra_done
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_SET_MASTER
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .vra_done                             ; master busy: stay away, the next
+    mov byte [vt_away], 0                    ; VT event retries
+    xor ebx, ebx
+.vra_grab:
+    cmp ebx, [input_fd_count]
+    jge .vra_grabbed
+    mov edi, [input_fds + rbx*4]
+    test edi, edi
+    js .vra_next
+    call maybe_grab_input                    ; keyboard/pointer check + EVIOCGRAB
+.vra_next:
+    inc ebx
+    jmp .vra_grab
+.vra_grabbed:
+    call compositor_program_crtcs
+    cmp dword [cursor_ready], 0
+    je .vra_nocur
+    mov edi, [drm_chosen_crtc]
+    mov esi, [cursor_handle]
+    call cursor_set_bo
+    mov eax, [drm_chosen_crtc]
+    mov [cursor_crtc], eax
+    call cursor_move_hw
+.vra_nocur:
+    call now_mono_ms                         ; re-arm the blank clock
+    mov [last_input_mono], rax
+    mov dword [dmg_count0], -1
+    mov dword [dmg_count1], -1
+    mov byte [comp_dirty], 1
+    mov rsi, log_vtback
+    mov rdx, log_vtback_len
+    call write_stderr
+.vra_done:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; vt_read_active — lseek(0) + read tty0/active ("ttyN\n"), eax = N (0 on
+; error). Reading also re-arms the sysfs POLLPRI.
+; ----------------------------------------------------------------------------
+vt_read_active:
+    mov edi, [vtactive_fd]
+    test edi, edi
+    js .vra_zero
+    mov rax, SYS_LSEEK
+    xor esi, esi
+    xor edx, edx
+    syscall
+    mov rax, SYS_READ
+    mov edi, [vtactive_fd]
+    lea rsi, [vtact_buf]
+    mov rdx, 15
+    syscall
+    test rax, rax
+    jle .vra_zero
+    ; parse the digits after "tty"
+    xor eax, eax
+    xor ecx, ecx
+.vrd_digit:
+    cmp ecx, 15
+    jge .vra_ret
+    movzx edx, byte [vtact_buf + rcx]
+    sub edx, '0'
+    cmp edx, 9
+    ja .vrd_skip
+    imul eax, eax, 10
+    add eax, edx
+.vrd_skip:
+    cmp byte [vtact_buf + rcx], 10           ; newline ends it
+    je .vra_ret
+    inc ecx
+    jmp .vrd_digit
+.vra_zero:
+    xor eax, eax
+.vra_ret:
+    ret
 
 ; ----------------------------------------------------------------------------
 ; compositor_shutdown — restore the saved CRTC (text console), drop
@@ -19563,6 +19811,10 @@ dump_handler:
     lea rsi, [dbg_pxflush]
     call write_str_stderr
     mov rax, [comp_px_flush]
+    call write_u64_stderr
+    lea rsi, [dbg_evdrop]
+    call write_str_stderr
+    mov eax, [ev_dropped]
     call write_u64_stderr
     lea rsi, [probe_conn_nl]
     mov edx, 1
