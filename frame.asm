@@ -274,6 +274,22 @@ mouse_sens:         resd 1                 ; pointer sensitivity %, ~/.framerc (
 cursor_rgb:         resd 1                 ; cursor fill colour 0xRRGGBB (def white)
 cursor_transp:      resd 1                 ; cursor % transparent (def 50)
 cursor_argb:        resd 1                 ; computed premultiplied interior pixel
+; Cursor shapes (client-assigned per-window/grab cursors → baked sprites).
+; Sprites: 0 arrow, 1 accent arrow (pressables — hand1/hand2), 2 I-beam
+; (text fields — xterm), 3 crosshair (scrot -s), 4 blank (typing hides it).
+%define MAX_CURSORS  128
+%define CUR_ARROW    0
+%define CUR_ACCENT   1
+%define CUR_IBEAM    2
+%define CUR_CROSS    3
+%define CUR_BLANK    4
+cursor_tab:         resb MAX_CURSORS * 8   ; +0 cursor xid, +4 sprite id
+cursor_tab_next:    resd 1                 ; rotating evict index when full
+cur_shape:          resd 1                 ; sprite currently in the BO
+cur_hot_x:          resd 1                 ; hotspot of that sprite
+cur_hot_y:          resd 1
+cfg_cursor_accent:  resd 1                 ; ~/.framerc cursor_accent RRGGBB
+ptr_grab_cursor:    resd 1                 ; GrabPointer's cursor arg (scrot)
 ; ~/.framerc `background = <path>`: a pre-decoded BGRX buffer at panel
 ; resolution (screen_w*screen_h*4). frame blits it as the compositor
 ; background instead of the solid COMP_BG_COLOR. No image decoder in the
@@ -416,8 +432,13 @@ xkb_getmap_present: resd 1               ; GetMap reply present mask (echoes req
 ;   +40 backing_w (u16)      — backing buffer width (= stride, pixels)
 ;   +42 backing_h (u16)      — backing buffer height
 ;   +44 back_pixel (u32)     — CW_BACK_PIXEL; backing init colour
+;   +48 stk (u32)            — z-order
+;   +52 xi2_mask (u32)       — XI2 event selection bits
+;   +56 border_pixel (u32)   — CW_BORDER_PIXEL; drawn by the compositor
+;                              when border_width (+16) > 0 (tile's focus ring)
+;   +60 cursor (u32)         — CW_CURSOR; cursor xid shown over this window
 %define MAX_WINDOWS      512
-%define WINDOW_REC_SIZE  56          ; was 48; +48 stk (u32) z-order, +52 pad
+%define WINDOW_REC_SIZE  64          ; was 56; +56 border_pixel, +60 cursor
 windows:            resb MAX_WINDOWS * WINDOW_REC_SIZE
 win_stk_next:       resd 1               ; monotonic z-order; ++ on each map/raise
 rs_last_stk:        resd 1               ; recomposite: stk of last window drawn
@@ -3347,6 +3368,7 @@ client_cleanup_resources:
     cmp [ptr_grab_slot], r12d
     jne .ccr_grab_ok
     mov dword [ptr_grab_win], 0
+    mov dword [ptr_grab_cursor], 0
     mov byte [ptr_grab_xi2], 0               ; stale XI2 routing wedges menus
 .ccr_grab_ok:
     ; Keyboard grab held by the dying client → release (a crashed rofi
@@ -4462,6 +4484,18 @@ dispatch_request:
     jbe .dr_done
     cmp eax, 95
     je .dr_done
+    cmp eax, 94                              ; CreateGlyphCursor
+    jne .dr_not_gcur
+    mov rsi, r12
+    call handle_create_glyph_cursor
+    jmp .dr_done
+.dr_not_gcur:
+    cmp eax, 93                              ; CreatePixmapCursor
+    jne .dr_not_pcur
+    mov rsi, r12
+    call handle_create_pixmap_cursor
+    jmp .dr_done
+.dr_not_pcur:
     ; Unhandled — log it (the only requests still logged; each one is a
     ; protocol gap worth knowing about).
     push rax
@@ -4730,6 +4764,8 @@ dispatch_request:
 
 .dr_ungrab_pointer:
     mov dword [ptr_grab_win], 0              ; release the pointer grab
+    mov dword [ptr_grab_cursor], 0
+    call cursor_sync                         ; back to the window's cursor
     jmp .dr_done
 
 .dr_grab_keyboard:
@@ -7245,6 +7281,10 @@ handle_xinput:
     mov byte [ptr_grab_xi2], 1
     mov byte [ptr_grab_owner], 1             ; XI2 grabs keep the deep pick
                                              ; (GTK menu-item selection)
+    mov eax, [r12 + 12]                      ; XIGrabDevice cursor field
+    mov [ptr_grab_cursor], eax
+    call cursor_sync
+    movzx eax, word [r12 + 16]               ; re-derive deviceid (clobbered)
     cmp eax, 2
     jbe .xgd_maybe_both                      ; 0/1 = all devices → kbd too
     jmp .xgd_reply
@@ -7276,7 +7316,13 @@ handle_xinput:
     cmp [ptr_grab_slot], edi                 ; we own the pointer grab?
     jne .xud_chk_kbd
     mov dword [ptr_grab_win], 0
+    mov dword [ptr_grab_cursor], 0
     mov byte [ptr_grab_xi2], 0
+    push rax
+    push rdi
+    call cursor_sync
+    pop rdi
+    pop rax
 .xud_chk_kbd:
     cmp eax, 2
     jae .xud_done                            ; 2 = pointer only
@@ -9103,10 +9149,14 @@ apply_cw_values:
     jz .av_back_pixmap
     cmp r14d, 1                              ; CW_BACK_PIXEL bit pos
     je .av_back_pixel
+    cmp r14d, 3                              ; CW_BORDER_PIXEL bit pos
+    je .av_border_pixel
     cmp r14d, 9                              ; CW_OVERRIDE_REDIRECT bit pos
     je .av_override
     cmp r14d, 11                             ; CW_EVENT_MASK bit pos
     je .av_event_mask
+    cmp r14d, 14                             ; CW_CURSOR bit pos
+    je .av_cursor
     jmp .av_advance
 .av_back_pixmap:
     ; Background pixmap: materialise it straight into the window backing
@@ -9121,11 +9171,20 @@ apply_cw_values:
 .av_back_pixel:
     mov [r13 + 44], eax                      ; back_pixel
     jmp .av_advance
+.av_border_pixel:
+    mov [r13 + 56], eax                      ; border_pixel (tile's focus ring
+    mov rdi, r13                             ; recolours it per focus change)
+    call border_damage                       ; preserves rbx/r12/r13/r14
+    jmp .av_advance
 .av_override:
     mov [r13 + 29], al                       ; u8 boolean
     jmp .av_advance
 .av_event_mask:
     mov [r13 + 24], eax
+    jmp .av_advance
+.av_cursor:
+    mov [r13 + 60], eax                      ; cursor xid (None = 0 clears)
+    call cursor_sync                         ; window may be under the pointer
 .av_advance:
     add r12, 4
 .av_skip_bit:
@@ -9205,6 +9264,8 @@ handle_create_window:
     mov qword [r13 + 32], 0                  ; backing_ptr
     mov dword [r13 + 40], 0                  ; backing_cap
     mov dword [r13 + 44], 0                  ; back_pixel (default black)
+    mov dword [r13 + 56], 0                  ; border_pixel (default black)
+    mov dword [r13 + 60], 0                  ; cursor (None)
 
     ; Walk CW value-mask.
     mov ecx, [r12 + 28]
@@ -9341,6 +9402,7 @@ handle_destroy_window:
     cmp ecx, [ptr_grab_win]
     jne .hd_nograb
     mov dword [ptr_grab_win], 0
+    mov dword [ptr_grab_cursor], 0
     mov byte [ptr_grab_xi2], 0
 .hd_nograb:
     ; A dying window holding the KEYBOARD grab wedged all key input (GTK
@@ -9598,6 +9660,7 @@ handle_unmap_window:
     cmp eax, [ptr_grab_win]
     jne .uw_nograb
     mov dword [ptr_grab_win], 0
+    mov dword [ptr_grab_cursor], 0
     mov byte [ptr_grab_xi2], 0
 .uw_nograb:
     mov eax, [r12]                            ; keyboard grab too (GTK menus
@@ -9828,6 +9891,11 @@ handle_configure_window:
     shr rax, 16
     movzx r8d, ax                             ; h
     mov eax, r9d                              ; x
+    movzx esi, word [r13 + 16]                ; include the border ring
+    sub eax, esi
+    sub edx, esi
+    lea ecx, [rcx + rsi*2]
+    lea r8d, [r8 + rsi*2]
     call damage_add
     mov rdi, r13                              ; ...and the NEW rect
     call damage_add_window
@@ -10469,6 +10537,7 @@ read_framerc:
     mov dword [mouse_sens], 100               ; defaults before parsing
     mov dword [cursor_rgb], 0xFFFFFF
     mov dword [cursor_transp], 50
+    mov dword [cfg_cursor_accent], 0xFF00C800 ; pressable-item arrow fill (green)
     ; --- locate HOME in envp ---
     mov rsi, [envp]
     test rsi, rsi
@@ -10711,13 +10780,15 @@ parse_framerc:
     mov [mouse_sens], eax
     jmp .pf_next_line
 .pf_chk_cursor:
-    ; cursor_color = RRGGBB  /  cursor_transparency = N
+    ; cursor_color = RRGGBB / cursor_transparency = N / cursor_accent = RRGGBB
     mov eax, [rsi]
     cmp eax, 'curs'
     jne .pf_chk_blank
-    mov al, [rsi + 7]                          ; cursor_[c]olor / [t]ransparency
+    mov al, [rsi + 7]                          ; cursor_[c]olor / [t]ransp / [a]ccent
     cmp al, 'c'
     je .pf_cur_color
+    cmp al, 'a'
+    je .pf_cur_accent
     cmp al, 't'
     jne .pf_next_line
     call pf_to_value
@@ -10728,6 +10799,12 @@ parse_framerc:
     call pf_to_value
     call pf_parse_hex
     mov [cursor_rgb], eax
+    jmp .pf_next_line
+.pf_cur_accent:
+    call pf_to_value
+    call pf_parse_hex
+    or  eax, 0xFF000000                        ; opaque (premult = itself)
+    mov [cfg_cursor_accent], eax
     jmp .pf_next_line
 .pf_chk_blank:
     ; blank_timeout = N (seconds of idle before the panel powers off;
@@ -11611,9 +11688,12 @@ handle_grab_pointer:
     mov byte [ptr_grab_xi2], 0                ; core grab → core events
     movzx eax, byte [rsi + 1]                 ; owner-events (X: False → all
     mov [ptr_grab_owner], al                  ; events report the grab window)
+    mov eax, [rsi + 16]                       ; grab cursor (scrot's crosshair)
+    mov [ptr_grab_cursor], eax
     push rbx
     push r12
     mov ebx, edi
+    call cursor_sync
     mov eax, ebx
     call client_meta_addr
     mov r12, rax
@@ -12861,6 +12941,7 @@ pointer_crossings:
     mov rsi, rbx
     mov edx, r9d
     call send_crossing
+    call cursor_sync                         ; new window may define a cursor
 .pc_done:
     pop r11
     pop r10
@@ -12886,10 +12967,179 @@ sync_pointer_window:
     push rbx
     call window_at_point
     test rax, rax
-    jz .spw_done
+    jz .spw_cur
     mov rbx, rax
     call pointer_crossings
-.spw_done:
+.spw_cur:
+    call cursor_sync                         ; window/grab cursor may differ now
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; border_damage — rdi = window record. Damage the window rect expanded by
+; border_width (the ring lives OUTSIDE w×h; tile recolours it per focus
+; change via CWBorderPixel). No-op when unmapped or borderless.
+; Preserves all registers the CW value walker relies on.
+; ----------------------------------------------------------------------------
+border_damage:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    movzx r9d, word [rdi + 16]               ; border width
+    test r9d, r9d
+    jz .bdm_out
+    cmp byte [rdi + 28], 0                   ; mapped?
+    je .bdm_out
+    mov eax, r9d
+    neg eax                                  ; local x = -bw
+    mov edx, eax                             ; local y = -bw
+    movzx ecx, word [rdi + 12]
+    lea ecx, [rcx + r9*2]                    ; w + 2bw
+    movzx r8d, word [rdi + 14]
+    lea r8d, [r8 + r9*2]                     ; h + 2bw
+    call damage_add_local
+    mov byte [comp_dirty], 1
+.bdm_out:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; ----------------------------------------------------------------------------
+; brd_fill — eax = x, esi = y, edi = w, ecx = h (screen coords), edx =
+; colour. Solid fill clipped to bw_clip (which is itself screen-clipped).
+; ----------------------------------------------------------------------------
+brd_fill:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push rbp
+    mov ebp, edx                             ; colour
+    mov r12d, eax
+    add r12d, edi                            ; x2
+    mov r13d, esi
+    add r13d, ecx                            ; y2
+    cmp eax, [bw_clip_x1]
+    jge .bf_x1
+    mov eax, [bw_clip_x1]
+.bf_x1:
+    cmp esi, [bw_clip_y1]
+    jge .bf_y1
+    mov esi, [bw_clip_y1]
+.bf_y1:
+    cmp r12d, [bw_clip_x2]
+    jle .bf_x2
+    mov r12d, [bw_clip_x2]
+.bf_x2:
+    cmp r13d, [bw_clip_y2]
+    jle .bf_y2
+    mov r13d, [bw_clip_y2]
+.bf_y2:
+    sub r12d, eax                            ; w after clip
+    jle .bf_out
+    sub r13d, esi                            ; h after clip
+    jle .bf_out
+    mov ebx, eax                             ; x
+    mov r14, [drm_dumb_addr]
+.bf_row:
+    mov eax, esi
+    imul eax, [drm_dumb_pitch]
+    mov rdi, r14
+    add rdi, rax
+    mov eax, ebx
+    lea rdi, [rdi + rax*4]
+    mov eax, ebp
+    mov ecx, r12d
+    rep stosd
+    inc esi
+    dec r13d
+    jnz .bf_row
+.bf_out:
+    pop rbp
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; border_draw — rdi = window record. Paint the X border ring (border_width
+; > 0) in border_pixel around the w×h geometry, clipped to bw_clip. tile
+; insets tiled clients by the border so the ring lands exactly on the cell
+; edge; the focused window's ring is brighter (tile recolours per focus).
+; ----------------------------------------------------------------------------
+border_draw:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rdi
+    movzx r15d, word [rbx + 16]              ; border width
+    test r15d, r15d
+    jz .brd_out
+    cmp byte [rbx + 19], 2                   ; InputOnly → no border
+    je .brd_out
+    mov edi, [rbx]
+    call window_abs_xy                       ; r10d/r11d = abs origin
+    mov r12d, r10d                           ; x
+    mov r13d, r11d                           ; y
+    mov eax, [rbx + 56]                      ; border_pixel
+    or  eax, 0xFF000000
+    movzx r14d, word [rbx + 12]              ; w
+    movzx ebx, word [rbx + 14]               ; h (record ptr done)
+    push rax                                 ; colour at [rsp]
+    ; top: (x-bw, y-bw, w+2bw, bw)
+    mov eax, r12d
+    sub eax, r15d
+    mov esi, r13d
+    sub esi, r15d
+    lea edi, [r14 + r15*2]
+    mov ecx, r15d
+    mov edx, [rsp]
+    call brd_fill
+    ; bottom: (x-bw, y+h, w+2bw, bw)
+    mov eax, r12d
+    sub eax, r15d
+    lea esi, [r13 + rbx]
+    lea edi, [r14 + r15*2]
+    mov ecx, r15d
+    mov edx, [rsp]
+    call brd_fill
+    ; left: (x-bw, y, bw, h)
+    mov eax, r12d
+    sub eax, r15d
+    mov esi, r13d
+    mov edi, r15d
+    mov ecx, ebx
+    mov edx, [rsp]
+    call brd_fill
+    ; right: (x+w, y, bw, h)
+    lea eax, [r12 + r14]
+    mov esi, r13d
+    mov edi, r15d
+    mov ecx, ebx
+    mov edx, [rsp]
+    call brd_fill
+    pop rax
+.brd_out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
     pop rbx
     ret
 
@@ -14935,7 +15185,12 @@ init_hw_cursor:
     cmp rax, -4096
     ja .ihc_fail
     mov [cursor_fb_addr], rax
+    call cursor_clear_bo
+    mov esi, [cursor_argb]
     call draw_cursor_arrow
+    mov dword [cur_shape], CUR_ARROW         ; re-sync picks the real shape on
+    mov dword [cur_hot_x], 0                 ; the next crossing
+    mov dword [cur_hot_y], 0
     ; CURSOR ioctl — set the BO.
     lea rdi, [drm_cursor]
     xor eax, eax
@@ -14964,8 +15219,20 @@ init_hw_cursor:
     ret
 
 ; ----------------------------------------------------------------------------
-; draw_cursor_arrow — paint a white arrow with a black outline (tip/hotspot
-; at 0,0) into the cursor BO. Background stays transparent (alpha 0).
+; cursor_clear_bo — zero the cursor BO (fully transparent).
+; ----------------------------------------------------------------------------
+cursor_clear_bo:
+    mov rdi, [cursor_fb_addr]
+    xor eax, eax
+    mov ecx, [drm_cursor_create + 20]        ; pitch
+    shl ecx, 4                               ; * 64 / 4 = dwords
+    rep stosd
+    ret
+
+; ----------------------------------------------------------------------------
+; draw_cursor_arrow — paint the arrow (tip/hotspot at 0,0) into the cursor
+; BO. esi = interior fill (premultiplied ARGB); outline is opaque black.
+; The BO must be cleared first (cursor_clear_bo).
 ; ----------------------------------------------------------------------------
 draw_cursor_arrow:
     push r12
@@ -14974,12 +15241,6 @@ draw_cursor_arrow:
     push r15
     mov r15, [cursor_fb_addr]
     mov r14d, [drm_cursor_create + 20]       ; pitch (bytes/row)
-    ; Zero the whole BO (transparent). dwords = pitch*64/4 = pitch*16.
-    mov rdi, r15
-    xor eax, eax
-    mov ecx, r14d
-    shl ecx, 4
-    rep stosd
     xor r13d, r13d                           ; y
 .dca_row:
     cmp r13d, 15                             ; ARROW_H (slightly smaller)
@@ -14988,9 +15249,8 @@ draw_cursor_arrow:
 .dca_col:
     cmp r12d, r13d                           ; while x <= y
     jg .dca_row_next
-    mov eax, [cursor_argb]                    ; interior: premultiplied fill from
-                                             ; ~/.framerc cursor_color/_transparency
-                                             ; (default 0x80808080 = 50% white)
+    mov eax, esi                             ; interior fill (arrow: framerc
+                                             ; cursor_color; accent: cursor_accent)
     test r12d, r12d
     jz .dca_black                            ; left edge
     cmp r12d, r13d
@@ -15016,6 +15276,295 @@ draw_cursor_arrow:
     pop r13
     pop r12
     ret
+
+; ----------------------------------------------------------------------------
+; cursor_hline — plot pixels [eax..edx) on row ecx of the cursor BO,
+; offset by r8d on both axes, colour r9d. Clips to the 64x64 BO.
+; ----------------------------------------------------------------------------
+cursor_hline:
+    push rax
+    push rcx
+    push r10
+    push r11
+    add ecx, r8d
+    add eax, r8d
+    add edx, r8d
+    cmp ecx, 63
+    jg .chl_out
+    mov r10d, ecx
+    imul r10d, [drm_cursor_create + 20]      ; y * pitch
+    add r10, [cursor_fb_addr]
+.chl_px:
+    cmp eax, edx
+    jge .chl_out
+    cmp eax, 63
+    jg .chl_out
+    mov r11d, eax
+    mov [r10 + r11*4], r9d
+    inc eax
+    jmp .chl_px
+.chl_out:
+    pop r11
+    pop r10
+    pop rcx
+    pop rax
+    ret
+
+; ----------------------------------------------------------------------------
+; draw_cursor_ibeam — text caret: 2px bar with serifs, white over a 1px
+; black drop shadow. Hotspot centre (8,8).
+; ----------------------------------------------------------------------------
+draw_cursor_ibeam:
+    mov r9d, 0xFF000000
+    mov r8d, 1                               ; shadow pass, offset (+1,+1)
+    call cursor_ibeam_pass
+    mov r9d, 0xFFFFFFFF
+    xor r8d, r8d                             ; main pass
+    ; fall through
+cursor_ibeam_pass:
+    push rcx
+    xor ecx, ecx                             ; row
+.cib_row:
+    cmp ecx, 16
+    jge .cib_done
+    mov eax, 7                               ; bar columns [7..9)
+    mov edx, 9
+    cmp ecx, 2
+    jl .cib_serif
+    cmp ecx, 14
+    jl .cib_plot
+.cib_serif:
+    mov eax, 4                               ; serif columns [4..12)
+    mov edx, 12
+.cib_plot:
+    call cursor_hline
+    inc ecx
+    jmp .cib_row
+.cib_done:
+    pop rcx
+    ret
+
+; ----------------------------------------------------------------------------
+; draw_cursor_cross — crosshair (scrot -s region select): 2px cross,
+; white over a 1px black drop shadow. Hotspot centre (8,8).
+; ----------------------------------------------------------------------------
+draw_cursor_cross:
+    mov r9d, 0xFF000000
+    mov r8d, 1
+    call cursor_cross_pass
+    mov r9d, 0xFFFFFFFF
+    xor r8d, r8d
+    ; fall through
+cursor_cross_pass:
+    push rcx
+    xor ecx, ecx
+.ccx_row:
+    cmp ecx, 17
+    jge .ccx_done
+    mov eax, 7                               ; vertical stroke [7..9)
+    mov edx, 9
+    cmp ecx, 7
+    jl .ccx_plot
+    cmp ecx, 9
+    jge .ccx_plot
+    xor eax, eax                             ; horizontal stroke rows: [0..17)
+    mov edx, 17
+.ccx_plot:
+    call cursor_hline
+    inc ecx
+    jmp .ccx_row
+.ccx_done:
+    pop rcx
+    ret
+
+; ----------------------------------------------------------------------------
+; draw_cursor_shape — edi = sprite id. Sets the hotspot and repaints the
+; cursor BO. State-only (no draw) when the sprite isn't up (fbtest).
+; ----------------------------------------------------------------------------
+draw_cursor_shape:
+    push rbx
+    mov ebx, edi
+    mov dword [cur_hot_x], 0
+    mov dword [cur_hot_y], 0
+    cmp dword [cursor_ready], 0
+    je .dcs_out
+    call cursor_clear_bo
+    cmp ebx, CUR_BLANK
+    je .dcs_out
+    cmp ebx, CUR_IBEAM
+    je .dcs_ibeam
+    cmp ebx, CUR_CROSS
+    je .dcs_cross
+    mov esi, [cursor_argb]
+    cmp ebx, CUR_ACCENT
+    jne .dcs_arrow
+    mov esi, [cfg_cursor_accent]
+.dcs_arrow:
+    call draw_cursor_arrow
+    jmp .dcs_out
+.dcs_ibeam:
+    mov dword [cur_hot_x], 8
+    mov dword [cur_hot_y], 8
+    call draw_cursor_ibeam
+    jmp .dcs_out
+.dcs_cross:
+    mov dword [cur_hot_x], 8
+    mov dword [cur_hot_y], 8
+    call draw_cursor_cross
+.dcs_out:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; cursor_register — edi = cursor xid, esi = sprite id. Reuses the xid's
+; slot, else first empty, else a rotating evictee.
+; ----------------------------------------------------------------------------
+cursor_register:
+    push rbx
+    xor ecx, ecx
+.creg_scan:
+    cmp ecx, MAX_CURSORS
+    jge .creg_evict
+    lea rbx, [cursor_tab + rcx*8]
+    mov eax, [rbx]
+    cmp eax, edi
+    je .creg_store
+    test eax, eax
+    jz .creg_store
+    inc ecx
+    jmp .creg_scan
+.creg_evict:
+    mov ecx, [cursor_tab_next]
+    inc dword [cursor_tab_next]
+    and ecx, MAX_CURSORS - 1
+    lea rbx, [cursor_tab + rcx*8]
+.creg_store:
+    mov [rbx], edi
+    mov [rbx + 4], esi
+    pop rbx
+    ret
+
+; cursor_shape_of — edi = cursor xid → eax = sprite id, or -1 unknown/None.
+cursor_shape_of:
+    test edi, edi
+    jz .cso_none
+    xor ecx, ecx
+.cso_scan:
+    cmp ecx, MAX_CURSORS
+    jge .cso_none
+    cmp [cursor_tab + rcx*8], edi
+    je .cso_hit
+    inc ecx
+    jmp .cso_scan
+.cso_hit:
+    mov eax, [cursor_tab + rcx*8 + 4]
+    ret
+.cso_none:
+    mov eax, -1
+    ret
+
+; ----------------------------------------------------------------------------
+; cursor_sync — resolve the effective cursor (active grab's cursor →
+; window-ancestor chain under the pointer → arrow) and repaint the sprite
+; if the shape changed. Event-driven only: crossings, grab changes,
+; CWCursor changes. Zero idle cost; repaint only on actual shape change.
+; ----------------------------------------------------------------------------
+cursor_sync:
+    push rbx
+    push r12
+    cmp dword [ptr_grab_win], 0
+    je .csy_window
+    mov edi, [ptr_grab_cursor]
+    test edi, edi
+    jz .csy_window
+    call cursor_shape_of
+    cmp eax, -1
+    jne .csy_have
+.csy_window:
+    mov ebx, [last_enter_win]
+.csy_walk:
+    test ebx, ebx
+    jz .csy_arrow
+    mov edi, ebx
+    call window_lookup
+    test rax, rax
+    jz .csy_arrow
+    mov r12, rax
+    mov edi, [rax + 60]                      ; window's cursor attribute
+    test edi, edi
+    jz .csy_up
+    call cursor_shape_of
+    cmp eax, -1
+    jne .csy_have
+.csy_up:
+    cmp dword [r12], X_ROOT_WINDOW
+    je .csy_arrow
+    mov ebx, [r12 + 4]                       ; walk to parent
+    jmp .csy_walk
+.csy_arrow:
+    xor eax, eax                             ; CUR_ARROW
+.csy_have:
+    cmp eax, [cur_shape]
+    je .csy_out
+    mov [cur_shape], eax
+    mov edi, eax
+    call draw_cursor_shape
+    call cursor_move_hw                      ; hotspot may have shifted
+.csy_out:
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; handle_create_glyph_cursor — CreateGlyphCursor (94). rsi = req:
+;   +4 cid  +8 src font  +12 mask font  +16 source char u16
+; Classify the standard cursor-font glyph onto a baked sprite. Toolkits
+; reach this path with XCURSOR_CORE=1 (session env) — theme cursors
+; would otherwise arrive as unclassifiable RENDER images.
+; ----------------------------------------------------------------------------
+handle_create_glyph_cursor:
+    mov edi, [rsi + 4]                       ; cid
+    movzx eax, word [rsi + 16]               ; cursor-font glyph
+    mov esi, CUR_IBEAM
+    cmp eax, 152                             ; XC_xterm (text)
+    je .cgc_reg
+    mov esi, CUR_CROSS
+    cmp eax, 34                              ; XC_crosshair (scrot -s)
+    je .cgc_reg
+    cmp eax, 33                              ; XC_cross
+    je .cgc_reg
+    cmp eax, 130                             ; XC_tcross
+    je .cgc_reg
+    mov esi, CUR_ACCENT
+    cmp eax, 58                              ; XC_hand1 (pressable)
+    je .cgc_reg
+    cmp eax, 60                              ; XC_hand2 (links/buttons)
+    je .cgc_reg
+    mov esi, CUR_ARROW
+.cgc_reg:
+    jmp cursor_register
+
+; ----------------------------------------------------------------------------
+; handle_create_pixmap_cursor — CreatePixmapCursor (93). rsi = req:
+;   +4 cid  +8 source pixmap. GDK's blank cursor is a 1x1 pixmap cursor
+; (firefox hides the pointer while typing) — tiny pixmaps map to the
+; blank sprite, anything else to the arrow.
+; ----------------------------------------------------------------------------
+handle_create_pixmap_cursor:
+    mov edi, [rsi + 8]                       ; source pixmap
+    push qword [rsi + 4]                     ; cid (req ptr freed of duty)
+    call pixmap_lookup
+    pop rdi                                  ; cid
+    mov esi, CUR_ARROW
+    test rax, rax
+    jz .cpc_reg
+    cmp word [rax + 4], 4                    ; w ≤ 4 and h ≤ 4 → blank
+    ja .cpc_reg
+    cmp word [rax + 6], 4
+    ja .cpc_reg
+    mov esi, CUR_BLANK
+.cpc_reg:
+    jmp cursor_register
 
 ; ----------------------------------------------------------------------------
 ; cursor_move_hw — move the cursor sprite to (cursor_x, cursor_y) via one
@@ -15054,8 +15603,10 @@ cursor_move_hw:
 .cmh_move:
     mov dword [drm_cursor + 0], DRM_MODE_CURSOR_MOVE
     mov [drm_cursor + 4], ecx                ; crtc_id
+    sub edx, [cur_hot_x]                     ; hotspot (I-beam/cross centre)
     mov [drm_cursor + 8], edx                ; x (crtc-local)
     mov eax, [cursor_y]
+    sub eax, [cur_hot_y]
     mov [drm_cursor + 12], eax               ; y
     mov rax, SYS_IOCTL
     mov rdi, [drm_fd]
@@ -15384,6 +15935,11 @@ damage_add_window:
     jge .daw_h
     mov r8d, r9d
 .daw_h:
+    movzx r9d, word [rdi + 16]                ; border ring is part of the
+    sub eax, r9d                              ; window's screen footprint
+    sub edx, r9d
+    lea ecx, [rcx + r9*2]
+    lea r8d, [r8 + r9*2]
     call damage_add
     pop r11
     pop r10
@@ -15668,6 +16224,8 @@ rs_composite_children:
     test r14, r14
     jz .rcc_done
     mov r13d, r15d                            ; advance last-drawn stk
+    mov rdi, r14                              ; border ring first (it lives
+    call border_draw                          ; outside w×h; early-out bw=0)
     cmp byte [r14 + 31], 0                    ; has backing? blit it (a backless
     je .rcc_recurse                          ; container still needs its kids)
     mov rdi, r14

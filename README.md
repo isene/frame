@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.107-blue)
+![Version](https://img.shields.io/badge/version-0.0.108-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -226,6 +226,7 @@ keymap = no                # keyboard layout: us (default) or no (Norwegian)
 sensitivity = 75           # pointer speed, percent of raw (default 100)
 cursor_color = ffffff      # cursor fill colour, RRGGBB hex (default ffffff)
 cursor_transparency = 50   # cursor % transparent: 0 solid .. 100 invisible (default 50)
+cursor_accent = 00c800     # arrow fill over pressable items, RRGGBB (default green)
 background = ~/.framebg    # desktop wallpaper: a raw BGRX file at panel res
 blank_timeout = 600        # idle seconds before the panel powers off (0 = never)
 blank_key = Mod4+Escape    # hotkey that powers the panel off NOW (none = off)
@@ -245,6 +246,13 @@ client (glass, xterm, …) picks it up.
 see-through it is. The black outline is always kept for contrast. Colour
 is `RRGGBB` hex; transparency `0` is solid, `100` fully invisible. Free
 alpha — the DRM cursor plane blends it in hardware.
+
+`cursor_accent`: apps set a "hand" cursor over links and buttons; frame
+shows the same arrow with this fill instead of swapping shapes. Text
+fields get a real I-beam, `scrot -s` a crosshair, and the pointer hides
+while you type (the blank cursor). All sprite swaps happen only on
+crossings — zero idle cost. Sessions should export `XCURSOR_CORE=1` so
+toolkits ask for classic cursor-font glyphs frame can classify.
 
 `blank_timeout`: screen auto-off, like `xset dpms` on Xorg. After this many
 seconds without keyboard/mouse/touchpad input the compositor disables the
