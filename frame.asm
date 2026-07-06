@@ -16706,16 +16706,28 @@ switch_vt:
     xor edx, edx
     syscall
     test rax, rax
-    js .sv_done
+    js .sv_fail
     push rax
     mov rdi, rax
     mov rax, SYS_IOCTL
     mov esi, 0x5606                          ; VT_ACTIVATE
     mov edx, [pending_vt]
     syscall
+    mov rdx, rax                             ; ioctl result (survives close)
     pop rdi
     mov rax, SYS_CLOSE
     syscall
+    test rdx, rdx
+    jns .sv_done
+.sv_fail:
+    ; The kernel REFUSED the switch (EINVAL: target gone, or this VT is
+    ; KD_GRAPHICS under VT_AUTO). We already released the display and
+    ; gated input on vt_away — staying away now means a dead session
+    ; (frozen screen, ignored input, even the zap gated) until reboot.
+    ; Take the display straight back instead: the switch simply no-ops.
+    cmp byte [vt_away], 0
+    je .sv_done
+    call vt_reacquire
 .sv_done:
     ret
 .sv_legacy:
