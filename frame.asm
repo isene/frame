@@ -3381,7 +3381,7 @@ client_cleanup_resources:
     jae .ccr_win_next
     ; Live in-band window. If mapped: damage + expose + tell the WM.
     cmp byte [r15 + 28], 0
-    je .ccr_win_destroy
+    je .ccr_win_unmapped
     mov byte [r15 + 28], 0
     mov byte [comp_dirty], 1
     mov byte [defer_bg_composite], 1         ; app closed → hold one cycle so the
@@ -3419,7 +3419,48 @@ client_cleanup_resources:
     je .ccr_win_destroy
     mov esi, [rax]                           ; event window = parent
     mov edx, [r15]                           ; window
+    push rax
+    push rdi
     call send_unmap_notify
+    pop rdi
+    pop rax
+    ; DestroyNotify too: a WM that unmaps windows itself (tile hides
+    ; whole workspaces) cannot treat UnmapNotify as client-gone — it
+    ; untracks on DestroyNotify only. Without this, a killed client
+    ; left a ghost slot in tile's workspace forever.
+    mov esi, [rax]
+    mov edx, [r15]
+    call send_destroy_notify
+    jmp .ccr_win_destroy
+
+.ccr_win_unmapped:
+    ; Unmapped in-band window (killed while WS-hidden: the WM unmapped
+    ; it, but still tracks it): no unmap/damage needed, but the WM must
+    ; still hear DestroyNotify or the client ghosts in its tables.
+    mov edi, [r15 + 4]                       ; parent
+    call window_lookup
+    test rax, rax
+    jz .ccr_win_destroy
+    test dword [rax + 24], EM_SUBSTRUCTURE_NOTIFY
+    jz .ccr_win_destroy
+    cmp dword [rax], X_ROOT_WINDOW
+    jne .ccr_win_uowner
+    movsx edi, byte [rax + 30]               ; root → redirect owner (the WM)
+    cmp edi, 0
+    jl .ccr_win_destroy
+    jmp .ccr_win_uhave
+.ccr_win_uowner:
+    mov edi, [rax]
+    sub edi, X_RID_BASE
+    shr edi, 21                              ; parent's owner slot
+    cmp edi, MAX_CLIENTS
+    jae .ccr_win_destroy
+.ccr_win_uhave:
+    cmp edi, r12d                            ; the dead client itself
+    je .ccr_win_destroy
+    mov esi, [rax]                           ; event window = parent
+    mov edx, [r15]                           ; window
+    call send_destroy_notify
 .ccr_win_destroy:
     mov edi, [r15]
     call window_destroy                      ; munmaps backing, recurses children
