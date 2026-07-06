@@ -18610,25 +18610,29 @@ handle_render:
     pop rax
     jmp .hr_done
 
-; --- QueryPictFormats: report 3 standard formats (ARGB32, RGB24, A8) and
-;     one screen mapping our depth-24 + depth-32 visuals to formats.
-;     libXrender BLOCKS on this during setup, so it must reply. 160-byte
-;     reply (32 fixed + 128 variable).
+; --- QueryPictFormats: report the 5 standard formats (ARGB32, RGB24, A8,
+;     A4, A1) and one screen mapping our depth-24 + depth-32 visuals to
+;     formats. libXrender BLOCKS on this during setup, so it must reply.
+;     ALL FIVE standard formats are required: cairo trusts the advertised
+;     RENDER version and feeds XRenderFindStandardFormat() results into
+;     XRenderCreatePicture with no null check — a missing A1 crashed
+;     firefox (GDK's blank cursor paints a 1x1 depth-1 bitmap via cairo).
+;     216-byte reply (32 fixed + 184 variable).
 .hr_query_pict_formats:
     mov eax, ebx
     call client_meta_addr
     mov r12, rax                             ; meta (req ptr no longer needed)
-    ; Zero the 160-byte reply region.
+    ; Zero the 216-byte reply region.
     lea rdi, [reply_buf]
     xor eax, eax
-    mov ecx, 20
+    mov ecx, 27
     rep stosq
     ; --- fixed reply header ---
     mov byte  [reply_buf + 0], 1             ; reply
     mov ecx, [r12 + 8]                       ; seq
     mov [reply_buf + 2], cx
-    mov dword [reply_buf + 4], 32            ; reply length (variable 4-byte units)
-    mov dword [reply_buf + 8], 3             ; numFormats
+    mov dword [reply_buf + 4], 46            ; reply length (variable 4-byte units)
+    mov dword [reply_buf + 8], 5             ; numFormats
     mov dword [reply_buf + 12], 1            ; numScreens
     mov dword [reply_buf + 16], 2            ; numDepths
     mov dword [reply_buf + 20], 2            ; numVisuals
@@ -18663,24 +18667,36 @@ handle_render:
     ; rgb shifts/masks @ 96..107 stay 0
     mov word  [reply_buf + 108], 0           ; alpha shift
     mov word  [reply_buf + 110], 0xff        ; alpha mask
-    ; --- PICTSCREEN 0 @ 116 ---
-    mov dword [reply_buf + 116], 2           ; numDepths
-    mov dword [reply_buf + 120], 0x31        ; fallback format (RGB24)
-    ; PICTDEPTH depth 24 @ 124
-    mov byte  [reply_buf + 124], 24          ; depth
-    mov word  [reply_buf + 126], 1           ; numVisuals
-    mov dword [reply_buf + 132], 0x20        ; visual id (depth-24)
-    mov dword [reply_buf + 136], 0x31        ; → RGB24
-    ; PICTDEPTH depth 32 @ 140
-    mov byte  [reply_buf + 140], 32
-    mov word  [reply_buf + 142], 1
-    mov dword [reply_buf + 148], 0x21        ; visual id (depth-32)
-    mov dword [reply_buf + 152], 0x30        ; → ARGB32
-    ; --- subpixel order @ 156 (SubPixelUnknown = 0) stays 0 ---
+    ; --- PICTFORMINFO A4 @ 116 (id 0x33, depth 4, alpha only) ---
+    mov dword [reply_buf + 116], 0x33
+    mov byte  [reply_buf + 120], 1
+    mov byte  [reply_buf + 121], 4
+    ; rgb shifts/masks @ 124..135 stay 0; alpha shift @ 136 stays 0
+    mov word  [reply_buf + 138], 0x0f        ; alpha mask
+    ; --- PICTFORMINFO A1 @ 144 (id 0x34, depth 1, alpha only) ---
+    mov dword [reply_buf + 144], 0x34
+    mov byte  [reply_buf + 148], 1
+    mov byte  [reply_buf + 149], 1
+    ; rgb shifts/masks @ 152..163 stay 0; alpha shift @ 164 stays 0
+    mov word  [reply_buf + 166], 0x01        ; alpha mask
+    ; --- PICTSCREEN 0 @ 172 ---
+    mov dword [reply_buf + 172], 2           ; numDepths
+    mov dword [reply_buf + 176], 0x31        ; fallback format (RGB24)
+    ; PICTDEPTH depth 24 @ 180
+    mov byte  [reply_buf + 180], 24          ; depth
+    mov word  [reply_buf + 182], 1           ; numVisuals
+    mov dword [reply_buf + 188], 0x20        ; visual id (depth-24)
+    mov dword [reply_buf + 192], 0x31        ; → RGB24
+    ; PICTDEPTH depth 32 @ 196
+    mov byte  [reply_buf + 196], 32
+    mov word  [reply_buf + 198], 1
+    mov dword [reply_buf + 204], 0x21        ; visual id (depth-32)
+    mov dword [reply_buf + 208], 0x30        ; → ARGB32
+    ; --- subpixel order @ 212 (SubPixelUnknown = 0) stays 0 ---
     mov edi, [r12]                           ; fd
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
-    mov rdx, 160
+    mov rdx, 216
     syscall
 .hr_done:
     pop r12
