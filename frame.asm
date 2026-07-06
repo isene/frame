@@ -16750,8 +16750,9 @@ switch_vt:
 .sv_act:
     mov rax, SYS_OPEN
     lea rdi, [str_dev_tty0]
-    mov esi, 2                               ; O_RDWR
-    xor edx, edx
+    mov esi, 1                               ; O_WRONLY — tty0 is root:tty 0620;
+    xor edx, edx                             ; rootless frame (tty group) has
+                                             ; write only. ioctls don't need read.
     syscall
     test rax, rax
     js .sv_fail
@@ -16782,7 +16783,7 @@ switch_vt:
     call compositor_shutdown
     mov rax, SYS_OPEN
     lea rdi, [str_dev_tty0]
-    mov esi, 2                               ; O_RDWR
+    mov esi, 1                               ; O_WRONLY (see .sv_act)
     xor edx, edx
     syscall
     test rax, rax
