@@ -290,6 +290,7 @@ cur_hot_x:          resd 1                 ; hotspot of that sprite
 cur_hot_y:          resd 1
 cfg_cursor_accent:  resd 1                 ; ~/.framerc cursor_accent RRGGBB
 ptr_grab_cursor:    resd 1                 ; GrabPointer's cursor arg (scrot)
+netwm_cm_atom_srv:  resd 1                 ; _NET_WM_CM_S0 (frame = compositor)
 ; ~/.framerc `background = <path>`: a pre-decoded BGRX buffer at panel
 ; resolution (screen_w*screen_h*4). frame blits it as the compositor
 ; background instead of the solid COMP_BG_COLOR. No image decoder in the
@@ -842,6 +843,7 @@ SECTION .rodata
 x11_sock_dir:       db "/tmp/.X11-unix/X", 0
 str_framerc:        db "/.framerc", 0
 str_dev_tty0:       db "/dev/tty0", 0
+str_netwm_cm:       db "_NET_WM_CM_S0"      ; compositor-manager selection
 const_100:          dd 100
 vendor_str:         db "frame"
 
@@ -1487,6 +1489,14 @@ _start:
     test rax, rax
     js .die_bind
     call init_atoms
+    ; Claim the compositor-manager selection: glass (and GTK) only use the
+    ; ARGB visual for real transparency when _NET_WM_CM_S0 has an owner.
+    ; frame IS the compositor, so it owns the selection itself (the atom is
+    ; interned now; GetSelectionOwner answers root for it).
+    lea rdi, [str_netwm_cm]
+    mov esi, 13
+    call atom_create
+    mov [netwm_cm_atom_srv], eax
     call init_clients
     call init_windows
     call init_gcs
@@ -18252,6 +18262,10 @@ blit_window:
     mov eax, [screen_h]
     mov [rsp + 48], eax
     mov r15d, [screen_w]
+    xor eax, eax                           ; depth-32 (ARGB visual) windows
+    cmp byte [r13 + 18], 32                ; blend instead of copy — real
+    sete al                                ; transparency (glass opacity)
+    mov [rsp + 56], al
 
     ; X clip. win x in r14d.
     xor r8d, r8d                           ; src_x0
@@ -18324,10 +18338,82 @@ blit_window:
     lea rsi, [rbx + rax*4]
     mov ecx, [rsp + 40]                     ; copy_w
     add [comp_px_blit], rcx                 ; PERF counter
+    cmp byte [rsp + 56], 0
+    jne .bw_blend
     rep movsd
 .bw_row_next:
     inc r12d
     jmp .bw_row
+
+    ; --- ARGB row: STRAIGHT-alpha src-over (glass writes A=opacity with
+    ; unscaled RGB; its text cells are opaque, so the a=255 fast path
+    ; covers glyphs and only the translucent background pays the blend;
+    ; for premultiplied toolkit pixels a=255 regions are identical).
+.bw_blend:
+    mov eax, [rsi]
+    mov edx, eax
+    shr edx, 24                             ; a
+    cmp edx, 255
+    je .bw_bl_store
+    test edx, edx
+    jz .bw_bl_next
+    mov ebp, 255
+    sub ebp, edx                            ; na = 255 - a
+    mov r8d, [rdi]                          ; dst pixel
+    ; blue
+    movzx r9d, al
+    imul r9d, edx
+    movzx r10d, r8b
+    imul r10d, ebp
+    add r9d, r10d
+    mov r10d, r9d                           ; /255 ≈ (t + (t>>8) + 1) >> 8
+    shr r10d, 8
+    lea r9d, [r9 + r10 + 1]
+    shr r9d, 8
+    mov r11d, r9d
+    ; green
+    mov r9d, eax
+    shr r9d, 8
+    and r9d, 0xFF
+    imul r9d, edx
+    mov r10d, r8d
+    shr r10d, 8
+    and r10d, 0xFF
+    imul r10d, ebp
+    add r9d, r10d
+    mov r10d, r9d
+    shr r10d, 8
+    lea r9d, [r9 + r10 + 1]
+    shr r9d, 8
+    shl r9d, 8
+    or  r11d, r9d
+    ; red
+    mov r9d, eax
+    shr r9d, 16
+    and r9d, 0xFF
+    imul r9d, edx
+    mov r10d, r8d
+    shr r10d, 16
+    and r10d, 0xFF
+    imul r10d, ebp
+    add r9d, r10d
+    mov r10d, r9d
+    shr r10d, 8
+    lea r9d, [r9 + r10 + 1]
+    shr r9d, 8
+    shl r9d, 16
+    or  r11d, r9d
+    or  r11d, 0xFF000000                    ; fb stays opaque
+    mov [rdi], r11d
+    jmp .bw_bl_next
+.bw_bl_store:
+    mov [rdi], eax
+.bw_bl_next:
+    add rsi, 4
+    add rdi, 4
+    dec ecx
+    jnz .bw_blend
+    jmp .bw_row_next
 .bw_done:
     add rsp, 64
     pop rbp
@@ -20997,6 +21083,12 @@ handle_get_selection_owner:
     inc edx
     jmp .gso_find
 .gso_have:
+    test ecx, ecx                             ; unowned _NET_WM_CM_S0 → frame
+    jnz .gso_reply                            ; itself is the compositor: answer
+    cmp r12d, [netwm_cm_atom_srv]             ; root so ARGB clients (glass
+    jne .gso_reply                            ; opacity) take the real-alpha path
+    mov ecx, X_ROOT_WINDOW
+.gso_reply:
     push rcx                                  ; owner
     mov eax, ebx
     call client_meta_addr
