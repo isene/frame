@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.116-blue)
+![Version](https://img.shields.io/badge/version-0.0.117-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -15,7 +15,7 @@ syscalls, the X11 wire protocol on a Unix socket, and the kernel's
 DRM/KMS + evdev interfaces.
 
 Long-range goal: serve enough of the X11 wire protocol (core + SHAPE +
-RENDER + XKB + COMPOSITE + DAMAGE + RANDR + MIT-SHM + XInput2) to host
+RENDER + XKB + COMPOSITE + DAMAGE + RANDR + MIT-SHM + XInput2 + XVideo) to host
 the whole [CHasm](https://github.com/isene/chasm) desktop plus
 arbitrary X clients — Firefox, VS Code, GIMP, Inkscape — all
 software-rendered, all on a stack written end-to-end in asm.

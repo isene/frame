@@ -249,6 +249,14 @@ DEFAULT REL
 %define SHM_ERROR_BASE       156         ; BadShmSeg
 
 %define XTEST_MAJOR          128         ; XTEST (copyq paste, xdotool)
+%define XV_MAJOR             141         ; XVideo (mpv --vo=xv → DRM overlay plane)
+%define XV_EVENT_BASE        90          ; XvVideoNotify / XvPortNotify (unused)
+%define XV_ERROR_BASE        150         ; XvBadPort / XvBadEncoding / XvBadControl
+%define XV_VERSION_MAJOR     2
+%define XV_VERSION_MINOR     2
+%define XV_PORT_BASE         0x00000f00  ; our one video port's id
+%define XV_ADAPTOR_BASE      0x00000f00  ; adaptor base_id == port id (1 port)
+%define XV_ENCODING_ID       0x00000f10  ; the single XV_IMAGE encoding
 %define SHAPE_MAJOR          129         ; SHAPE (spot's dim-with-hole overlays)
 %define SHAPE_EVENT_BASE     92          ; ShapeNotify = base+0 (never sent yet)
 %define SHAPE_MAX_SLOTS      8           ; shaped windows are rare (spot = 1)
@@ -291,6 +299,9 @@ cur_hot_y:          resd 1
 cfg_cursor_accent:  resd 1                 ; ~/.framerc cursor_accent RRGGBB
 ptr_grab_cursor:    resd 1                 ; GrabPointer's cursor arg (scrot)
 netwm_cm_atom_srv:  resd 1                 ; _NET_WM_CM_S0 (frame = compositor)
+; XVideo (mpv --vo=xv). One adaptor, one port.
+xv_port_client:     resd 1                 ; slot holding the port (-1 = free)
+xv_port_draw:       resd 1                 ; drawable the port last drew to
 ; ~/.framerc `background = <path>`: a pre-decoded BGRX buffer at panel
 ; resolution (screen_w*screen_h*4). frame blits it as the compositor
 ; background instead of the solid COMP_BG_COLOR. No image decoder in the
@@ -1013,6 +1024,35 @@ str_xfixes:         db "XFIXES"
 str_shm:            db "MIT-SHM"
 str_shape:          db "SHAPE"
 str_xtest:          db "XTEST"
+str_xvideo:         db "XVideo"          ; len 6 (mpv --vo=xv)
+dbg_xv:             db "XV minor="
+dbg_xv_len equ $ - dbg_xv
+xv_adaptor_name:    db "frame", 0, 0, 0   ; 5 chars, padded to 8
+xv_encoding_name:   db "XV_IMAGE"          ; 8 chars (multiple of 4)
+; xvImageFormatInfo for YV12 (planar YUV 4:2:0, plane order Y,V,U), 128 bytes.
+; mpv's find_xv_format(IMGFMT_420P) returns YV12 (first fmt_table entry), so
+; the server MUST advertise YV12 or reconfig fails to match (vo_xv.c:488).
+align 4
+xv_fmt_yv12:
+    dd 0x32315659                            ; id = 'YV12'
+    db 1                                     ; type = XvYUV
+    db 0                                     ; byte_order = LSBFirst
+    db 0, 0                                  ; pad
+    db 'Y','V','1','2', 0,0,0x10,0, 0x80,0,0,0xAA, 0,0x38,0x9B,0x71  ; guid
+    db 12                                    ; bpp
+    db 3                                     ; num_planes
+    db 0, 0                                  ; pad
+    db 0                                     ; depth
+    db 0, 0, 0                               ; pad
+    dd 0, 0, 0                               ; red/green/blue mask
+    db 1                                     ; format = Planar
+    db 8, 8, 8                               ; y/u/v sample bits
+    dd 1, 2, 2                               ; horz y/u/v period
+    dd 1, 2, 2                               ; vert y/u/v period
+    db 'Y','V','U', 0,0,0,0,0, 0,0,0,0,0,0,0,0  ; comp_order[32]
+    db 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0
+    db 0                                     ; scanline_order = TopToBottom
+    times 23 db 0                            ; pad to 128
 str_xi_pointer:     db "Virtual core pointer"      ; 20 bytes
 str_xi_keyboard:    db "Virtual core keyboard"     ; 21 bytes
 str_rel_x:          db "Rel X"
@@ -4469,6 +4509,8 @@ dispatch_request:
     je .dr_get_modifier_mapping
     cmp eax, RENDER_MAJOR
     je .dr_render
+    cmp eax, XV_MAJOR
+    je .dr_xvideo
     cmp eax, XKB_MAJOR
     je .dr_xkb
     cmp eax, RR_MAJOR
@@ -4528,6 +4570,13 @@ dispatch_request:
     mov rsi, r12
     mov edx, r13d
     call handle_render
+    jmp .dr_done
+
+.dr_xvideo:
+    mov edi, ebx
+    mov rsi, r12
+    mov edx, r13d
+    call handle_xvideo
     jmp .dr_done
 
 .dr_xkb:
@@ -5553,7 +5602,7 @@ handle_query_extension:
 .qe_cmp_xf:
     mov dl, [rsi]
     cmp dl, [rdi]
-    jne .qe_send
+    jne .qe_try_xvideo                        ; len 6 but not XFIXES → try XVideo
     inc rsi
     inc rdi
     dec ecx
@@ -5563,6 +5612,24 @@ handle_query_extension:
     mov byte [rdi + 9], XFIXES_MAJOR
     mov byte [rdi + 10], XFIXES_EVENT_BASE
     mov byte [rdi + 11], XFIXES_ERROR_BASE
+    jmp .qe_send
+.qe_try_xvideo:
+    lea rsi, [r13 + 8]
+    lea rdi, [str_xvideo]
+    mov ecx, 6
+.qe_cmp_xv:
+    mov dl, [rsi]
+    cmp dl, [rdi]
+    jne .qe_send
+    inc rsi
+    inc rdi
+    dec ecx
+    jnz .qe_cmp_xv
+    lea rdi, [reply_buf]
+    mov byte [rdi + 8], 1                    ; present = True
+    mov byte [rdi + 9], XV_MAJOR
+    mov byte [rdi + 10], XV_EVENT_BASE
+    mov byte [rdi + 11], XV_ERROR_BASE
     jmp .qe_send
 .qe_try_xkb:
     cmp eax, 9
@@ -19681,6 +19748,636 @@ handle_render:
     mov rdx, 216
     syscall
 .hr_done:
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_xvideo — XVideo (Xv) extension. edi = slot, rsi = req, edx = size.
+; Backs mpv --vo=xv. Phase 1 (current): one YV12 image port, software
+; YUV→RGB blit into the drawable backing. Phase 2: DRM overlay plane.
+; ============================================================================
+handle_xvideo:
+    push rbx
+    push r12
+    mov ebx, edi                              ; slot
+    mov r12, rsi                              ; req ptr
+    movzx eax, byte [r12 + 1]                 ; minor opcode
+    cmp eax, 0
+    je .xv_query_extension
+    cmp eax, 1
+    je .xv_query_adaptors
+    cmp eax, 2
+    je .xv_query_encodings
+    cmp eax, 3
+    je .xv_grab_port
+    cmp eax, 4
+    je .xv_ungrab_port
+    cmp eax, 9
+    je .xv_stop_video
+    cmp eax, 12
+    je .xv_query_best_size
+    cmp eax, 13
+    je .xv_set_port_attribute
+    cmp eax, 14
+    je .xv_get_port_attribute
+    cmp eax, 15
+    je .xv_query_port_attributes
+    cmp eax, 16
+    je .xv_list_image_formats
+    cmp eax, 17
+    je .xv_query_image_attributes
+    cmp eax, 18
+    je .xv_put_image
+    cmp eax, 19
+    je .xv_shm_put_image
+    ; Unhandled — log it.
+    push rax
+    lea rsi, [dbg_xv]
+    mov edx, dbg_xv_len
+    call write_stderr
+    pop rax
+    call write_u64_stderr
+    lea rsi, [probe_conn_nl]
+    mov edx, 1
+    call write_stderr
+    jmp .xv_done
+
+.xv_query_extension:
+    ; reply: +8 version_major u16, +10 version_minor u16
+    mov eax, ebx
+    call client_meta_addr
+    lea rdi, [reply_buf]
+    xor ecx, ecx
+    mov [rdi + 0], byte 1                     ; reply
+    mov ecx, [rax + 8]
+    mov [rdi + 2], cx                         ; seq
+    mov dword [rdi + 4], 0                    ; length
+    mov word [rdi + 8], XV_VERSION_MAJOR
+    mov word [rdi + 10], XV_VERSION_MINOR
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+    mov edi, [rax]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+    jmp .xv_done
+
+.xv_query_adaptors:
+    ; One image adaptor: base_id=XV_PORT_BASE, 1 port, 1 format, name "frame".
+    ; variable = adaptorInfo(12) + name(8) + format(8) = 28 bytes.
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+    lea rdi, [reply_buf]
+    xor eax, eax
+    mov ecx, 12
+    push rdi
+    rep stosq                                 ; zero 96 bytes (enough)
+    pop rdi
+    mov byte [rdi + 0], 1                     ; reply
+    mov ecx, [r12 + 8]
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 7                    ; length = 28/4
+    mov word [rdi + 8], 1                     ; num_adaptors
+    ; adaptorInfo @32
+    mov dword [rdi + 32], XV_ADAPTOR_BASE     ; base_id
+    mov word [rdi + 36], 5                    ; name_size
+    mov word [rdi + 38], 1                    ; num_ports
+    mov word [rdi + 40], 1                    ; num_formats
+    mov byte [rdi + 42], 0x11                 ; type = XvInputMask(0x01)|XvImageMask(0x10)
+    mov byte [rdi + 43], 0                    ; pad
+    ; name "frame" @44, padded to 8
+    mov eax, [xv_adaptor_name]
+    mov [rdi + 44], eax
+    mov eax, [xv_adaptor_name + 4]
+    mov [rdi + 48], eax
+    ; format @52 (xvFormat wire order: visual CARD32 FIRST, then depth CARD8)
+    mov dword [rdi + 52], X_ROOT_VISUAL_24    ; visual
+    mov byte [rdi + 56], 24                    ; depth
+    mov byte [rdi + 57], 0
+    mov word [rdi + 58], 0
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 60
+    syscall
+    jmp .xv_done
+
+.xv_query_encodings:
+    ; One XV_IMAGE encoding. variable = encodingInfo(20) + name(8) = 28.
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+    lea rdi, [reply_buf]
+    xor eax, eax
+    mov ecx, 12
+    push rdi
+    rep stosq
+    pop rdi
+    mov byte [rdi + 0], 1
+    mov ecx, [r12 + 8]
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 7                    ; 28/4
+    mov word [rdi + 8], 1                     ; num_encodings
+    ; encodingInfo @32
+    mov dword [rdi + 32], XV_ENCODING_ID
+    mov word [rdi + 36], 8                    ; name_size
+    mov word [rdi + 38], 2048                 ; width
+    mov word [rdi + 40], 2048                 ; height
+    mov word [rdi + 42], 0                    ; pad
+    mov dword [rdi + 44], 1                   ; rate numerator
+    mov dword [rdi + 48], 1                   ; rate denominator
+    mov eax, [xv_encoding_name]
+    mov [rdi + 52], eax
+    mov eax, [xv_encoding_name + 4]
+    mov [rdi + 56], eax
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 60
+    syscall
+    jmp .xv_done
+
+.xv_grab_port:
+    ; request: +4 port, +8 time. reply: result(u8) @1.
+    mov eax, ebx
+    call client_meta_addr
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov byte [rdi + 1], 0                     ; result = Success (0)
+    mov ecx, [rax + 8]
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 0
+    mov dword [rdi + 8], 0
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+    mov [xv_port_client], ebx                 ; remember who holds it
+    mov edi, [rax]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+    jmp .xv_done
+
+.xv_ungrab_port:
+    mov dword [xv_port_client], -1
+    call xv_plane_off                         ; stop showing video
+    jmp .xv_done
+
+.xv_stop_video:
+    call xv_plane_off
+    jmp .xv_done
+
+.xv_query_best_size:
+    ; request: +4 port +8 vid_w +10 vid_h +12 drw_w +14 drw_h +16 motion.
+    ; reply: actual_width @8, actual_height @10 = the requested drw size.
+    mov eax, ebx
+    call client_meta_addr
+    mov rcx, rax
+    movzx edx, word [r12 + 12]                ; drw_w
+    movzx r8d, word [r12 + 14]                ; drw_h
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov eax, [rcx + 8]
+    mov [rdi + 2], ax
+    mov dword [rdi + 4], 0
+    mov [rdi + 8], dx                          ; actual_width
+    mov [rdi + 10], r8w                        ; actual_height
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+    mov edi, [rcx]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+    jmp .xv_done
+
+.xv_set_port_attribute:
+    jmp .xv_done                              ; no attributes → accept & ignore
+
+.xv_get_port_attribute:
+    ; reply: value(s32) @8 = 0.
+    mov eax, ebx
+    call client_meta_addr
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov ecx, [rax + 8]
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 0
+    mov dword [rdi + 8], 0                     ; value = 0
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+    mov edi, [rax]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+    jmp .xv_done
+
+.xv_query_port_attributes:
+    ; reply: num_attributes @8 = 0, text_size @12 = 0. No variable data.
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov ecx, [r12 + 8]
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 0
+    mov dword [rdi + 8], 0                     ; num_attributes
+    mov dword [rdi + 12], 0                    ; text_size
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
+    jmp .xv_done
+
+.xv_list_image_formats:
+    ; reply: num_formats @8 = 1, then one 128-byte xvImageFormatInfo (YV12).
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+    lea rdi, [reply_buf]
+    xor eax, eax
+    mov [rdi + 0], byte 1
+    mov ecx, [r12 + 8]
+    mov [rdi + 2], cx
+    mov dword [rdi + 4], 32                    ; length = 128/4
+    mov dword [rdi + 8], 1                     ; num_formats
+    mov dword [rdi + 12], 0
+    mov dword [rdi + 16], 0
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+    ; copy the 128-byte YV12 template to reply_buf+32
+    lea rdi, [reply_buf + 32]
+    lea rsi, [xv_fmt_yv12]
+    mov ecx, 16
+    rep movsq
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 160                              ; 32 + 128
+    syscall
+    jmp .xv_done
+
+.xv_query_image_attributes:
+    ; request (r12): +12 width u16, +14 height u16. Reply: YV12 plane layout.
+    movzx eax, word [r12 + 12]                ; width
+    movzx ecx, word [r12 + 14]                ; height
+    lea edx, [eax + 3]
+    and edx, 0xFFFFFFFC                        ; pitch_y
+    mov r8d, eax
+    inc r8d
+    shr r8d, 1
+    add r8d, 3
+    and r8d, 0xFFFFFFFC                        ; pitch_uv
+    mov r9d, ecx
+    inc r9d
+    shr r9d, 1                                ; h2 = ceil(height/2)
+    mov r10d, edx
+    imul r10d, ecx                            ; o_u = pitch_y * height
+    mov r11d, r8d
+    imul r11d, r9d                            ; uv_size = pitch_uv * h2
+    push rax                                  ; width
+    push rcx                                  ; height
+    push rdx                                  ; pitch_y
+    push r8                                   ; pitch_uv
+    push r10                                  ; o_u
+    push r11                                  ; uv_size
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax                              ; meta
+    pop r11
+    pop r10
+    pop r8
+    pop rdx
+    pop rcx
+    pop rax
+    lea rdi, [reply_buf]
+    mov byte [rdi + 0], 1
+    mov esi, [r12 + 8]
+    mov [rdi + 2], si
+    mov dword [rdi + 4], 6                     ; length = 24/4
+    mov dword [rdi + 8], 3                     ; num_planes
+    mov esi, r10d
+    add esi, r11d
+    add esi, r11d
+    mov [rdi + 12], esi                        ; data_size = o_u + 2*uv_size
+    mov [rdi + 16], ax                         ; width
+    mov [rdi + 18], cx                         ; height
+    mov dword [rdi + 20], 0
+    mov dword [rdi + 24], 0
+    mov dword [rdi + 28], 0
+    mov [rdi + 32], edx                        ; pitch Y
+    mov [rdi + 36], r8d                        ; pitch U
+    mov [rdi + 40], r8d                        ; pitch V
+    mov dword [rdi + 44], 0                    ; offset Y
+    mov [rdi + 48], r10d                       ; offset U
+    mov esi, r10d
+    add esi, r11d
+    mov [rdi + 52], esi                        ; offset V = o_u + uv_size
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 56
+    syscall
+    jmp .xv_done
+
+.xv_put_image:
+    ; XvPutImage (image data inline). Rare with mpv (it uses SHM); accept
+    ; and ignore for now. TODO: software blit if a client uses it.
+    jmp .xv_done
+
+.xv_shm_put_image:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_xv_shm_put_image
+    jmp .xv_done
+.xv_done:
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; xv_plane_off — disable the video overlay plane (phase 2). No-op stub; the
+; software blit path needs no teardown.
+; ----------------------------------------------------------------------------
+xv_plane_off:
+    ret
+
+; ----------------------------------------------------------------------------
+; handle_xv_shm_put_image — edi = slot, rsi = req. XvShmPutImage: a YV12
+; frame in a client SHM segment, nearest-neighbour scaled + BT.601 YUV→RGB
+; into the drawable backing. PHASE 1 software path (proves the pipeline,
+; works headless). Phase 2 replaces this with a DRM overlay plane.
+;   req: +8 drawable +16 shmseg +24 offset +28 src_x +30 src_y +32 src_w
+;        +34 src_h +36 drw_x +38 drw_y +40 drw_w +42 drw_h +44 width
+;        +46 height +48 send_event
+;   stack: 0 pitch_y 8 pitch_uv 16 y_base 24 u_base 32 v_base 40 dst_base
+;          48 dst_stride 56 x_ratio 64 y_ratio 72 drw_w 80 drw_h 88 drw_x
+;          96 drw_y 104 src_x 112 src_y 120 req
+; ----------------------------------------------------------------------------
+handle_xv_shm_put_image:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 128
+    mov [rsp + 120], rsi
+    mov r15d, edi
+    movzx eax, word [rsi + 44]
+    movzx ecx, word [rsi + 46]
+    lea edx, [eax + 3]
+    and edx, 0xFFFFFFFC
+    mov [rsp + 0], edx                         ; pitch_y
+    mov r8d, eax
+    inc r8d
+    shr r8d, 1
+    add r8d, 3
+    and r8d, 0xFFFFFFFC
+    mov [rsp + 8], r8d                         ; pitch_uv
+    mov r9d, ecx
+    inc r9d
+    shr r9d, 1                                 ; h2
+    mov [rsp + 16], ecx                         ; stash height (shm_seg_lookup clobbers ecx)
+    mov edi, [rsi + 16]
+    call shm_seg_lookup
+    test rax, rax
+    jz .xvp_ret
+    mov ecx, [rsp + 16]                         ; restore height
+    mov rsi, [rsp + 120]
+    mov r10d, [rsi + 24]
+    add rax, r10
+    mov [rsp + 16], rax                         ; Y base
+    mov edx, [rsp + 0]
+    imul edx, ecx
+    lea rbx, [rax + rdx]
+    mov [rsp + 32], rbx                         ; V base (YV12: first chroma plane)
+    mov edx, [rsp + 8]
+    imul edx, r9d
+    lea rbx, [rbx + rdx]
+    mov [rsp + 24], rbx                         ; U base (YV12: second chroma plane)
+    mov edi, [rsi + 8]
+    call drawable_get_backing
+    test rax, rax
+    jz .xvp_ret
+    mov [rsp + 40], rax
+    mov [rsp + 48], edx
+    mov r13d, ecx                              ; dst h
+    mov rsi, [rsp + 120]
+    movzx eax, word [rsi + 40]
+    mov [rsp + 72], eax                         ; drw_w
+    movzx ecx, word [rsi + 42]
+    mov [rsp + 80], ecx                         ; drw_h
+    movsx eax, word [rsi + 36]
+    mov [rsp + 88], eax                         ; drw_x
+    movsx eax, word [rsi + 38]
+    mov [rsp + 96], eax                         ; drw_y
+    movsx eax, word [rsi + 28]
+    mov [rsp + 104], eax                        ; src_x
+    movsx eax, word [rsi + 30]
+    mov [rsp + 112], eax                        ; src_y
+    movzx eax, word [rsi + 32]
+    shl eax, 16
+    xor edx, edx
+    mov ecx, [rsp + 72]
+    test ecx, ecx
+    jz .xvp_ret
+    div ecx
+    mov [rsp + 56], eax                         ; x_ratio
+    movzx eax, word [rsi + 34]
+    shl eax, 16
+    xor edx, edx
+    mov ecx, [rsp + 80]
+    test ecx, ecx
+    jz .xvp_ret
+    div ecx
+    mov [rsp + 64], eax                         ; y_ratio
+    xor r14d, r14d                             ; dy
+.xvp_row:
+    mov eax, [rsp + 80]
+    cmp r14d, eax
+    jge .xvp_present
+    mov ebp, [rsp + 96]
+    add ebp, r14d                              ; dst_y
+    js .xvp_row_next
+    cmp ebp, r13d
+    jge .xvp_present
+    mov eax, r14d
+    imul eax, [rsp + 64]
+    shr eax, 16
+    add eax, [rsp + 112]                       ; sy
+    mov r11d, eax
+    mov ebx, eax
+    shr ebx, 1                                 ; sy/2
+    mov eax, ebp
+    imul eax, [rsp + 48]
+    mov rdi, [rsp + 40]
+    lea rdi, [rdi + rax*4]                      ; dst row
+    mov eax, r11d
+    imul eax, [rsp + 0]
+    mov r8, [rsp + 16]
+    add r8, rax                                ; Y row
+    mov eax, ebx
+    imul eax, [rsp + 8]
+    mov r9, [rsp + 24]
+    add r9, rax                                ; U row
+    mov r10, [rsp + 32]
+    add r10, rax                               ; V row
+    xor r12d, r12d                             ; dx
+.xvp_col:
+    mov eax, [rsp + 72]
+    cmp r12d, eax
+    jge .xvp_row_next
+    mov ecx, [rsp + 88]
+    add ecx, r12d                              ; dst_x
+    js .xvp_col_next
+    cmp ecx, [rsp + 48]
+    jge .xvp_row_next
+    mov eax, r12d
+    imul eax, [rsp + 56]
+    shr eax, 16
+    add eax, [rsp + 104]                       ; sx
+    mov esi, eax
+    movzx eax, byte [r8 + rsi]                  ; Y
+    shr esi, 1
+    movzx edx, byte [r9 + rsi]                  ; U
+    movzx ebp, byte [r10 + rsi]                 ; V
+    sub eax, 16
+    imul eax, 298                              ; 298*C
+    sub edx, 128                               ; D
+    sub ebp, 128                               ; E
+    ; B → esi
+    mov esi, edx
+    imul esi, 516
+    add esi, eax
+    add esi, 128
+    sar esi, 8
+    cmp esi, 0
+    jge .xvp_b1
+    xor esi, esi
+.xvp_b1:
+    cmp esi, 255
+    jle .xvp_b2
+    mov esi, 255
+.xvp_b2:
+    ; G → ecx
+    mov ecx, eax
+    mov r11d, edx
+    imul r11d, 100
+    sub ecx, r11d
+    mov r11d, ebp
+    imul r11d, 208
+    sub ecx, r11d
+    add ecx, 128
+    sar ecx, 8
+    cmp ecx, 0
+    jge .xvp_g1
+    xor ecx, ecx
+.xvp_g1:
+    cmp ecx, 255
+    jle .xvp_g2
+    mov ecx, 255
+.xvp_g2:
+    ; R → r11d
+    mov r11d, ebp
+    imul r11d, 409
+    add r11d, eax
+    add r11d, 128
+    sar r11d, 8
+    cmp r11d, 0
+    jge .xvp_r1
+    xor r11d, r11d
+.xvp_r1:
+    cmp r11d, 255
+    jle .xvp_r2
+    mov r11d, 255
+.xvp_r2:
+    ; pack 0xFFRRGGBB
+    mov eax, r11d
+    shl eax, 16
+    mov r11d, ecx
+    shl r11d, 8
+    or eax, r11d
+    or eax, esi
+    or eax, 0xFF000000
+    mov ecx, [rsp + 88]
+    add ecx, r12d
+    mov [rdi + rcx*4], eax
+.xvp_col_next:
+    inc r12d
+    jmp .xvp_col
+.xvp_row_next:
+    inc r14d
+    jmp .xvp_row
+.xvp_present:
+    mov rsi, [rsp + 120]
+    mov edi, [rsi + 8]
+    call window_lookup
+    test rax, rax
+    jz .xvp_complete
+    mov byte [comp_dirty], 1
+    mov rdi, rax
+    mov eax, [rsp + 88]
+    mov edx, [rsp + 96]
+    mov ecx, [rsp + 72]
+    mov r8d, [rsp + 80]
+    call damage_add_local
+.xvp_complete:
+    mov rsi, [rsp + 120]
+    cmp byte [rsi + 48], 0
+    je .xvp_ret
+    lea rdi, [xi2_buf]
+    xor eax, eax
+    mov ecx, 4
+    push rdi
+    rep stosq
+    pop rdi
+    mov byte [rdi + 0], SHM_EVENT_BASE
+    mov eax, [rsi + 8]
+    mov [rdi + 4], eax
+    mov word [rdi + 8], 19
+    mov byte [rdi + 10], SHM_MAJOR
+    mov eax, [rsi + 16]
+    mov [rdi + 12], eax
+    mov eax, [rsi + 24]
+    mov [rdi + 16], eax
+    mov eax, r15d
+    call client_meta_addr
+    mov ecx, [rax + 8]
+    mov [xi2_buf + 2], cx
+    mov edi, [rax]
+    lea rsi, [xi2_buf]
+    mov edx, 32
+    EV_SEND
+.xvp_ret:
+    add rsp, 128
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
     pop r12
     pop rbx
     ret
