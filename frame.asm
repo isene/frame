@@ -764,6 +764,7 @@ own_vt:             resd 1                 ; frame's VT (from tty0/active)
 ev_dropped:         resd 1                 ; events dropped on full sockets
 vt_away:            resb 1                 ; 1 = display released, VT switched
 vtactive_fd:        resd 1                 ; /sys/class/tty/tty0/active fd
+vt_dev_path:        resb 16                ; "/dev/tty<own_vt>" for VT ioctls
 vtact_buf:          resb 16
 
 ; drm_mode_fb_dirty_cmd (24 bytes) for kicking the panel after a
@@ -16748,12 +16749,7 @@ switch_vt:
     mov byte [vt_away], 1
     call vt_release_display
 .sv_act:
-    mov rax, SYS_OPEN
-    lea rdi, [str_dev_tty0]
-    mov esi, 1                               ; O_WRONLY — tty0 is root:tty 0620;
-    xor edx, edx                             ; rootless frame (tty group) has
-                                             ; write only. ioctls don't need read.
-    syscall
+    call vt_console_open
     test rax, rax
     js .sv_fail
     push rax
@@ -16781,11 +16777,7 @@ switch_vt:
     ret
 .sv_legacy:
     call compositor_shutdown
-    mov rax, SYS_OPEN
-    lea rdi, [str_dev_tty0]
-    mov esi, 1                               ; O_WRONLY (see .sv_act)
-    xor edx, edx
-    syscall
+    call vt_console_open
     test rax, rax
     js .sv_exit
     mov rdi, rax                             ; /dev/tty0 fd
@@ -16797,6 +16789,49 @@ switch_vt:
     mov rax, SYS_EXIT
     xor edi, edi
     syscall
+
+; ----------------------------------------------------------------------------
+; vt_console_open — open the console for VT ioctls. Rootless frame cannot
+; open /dev/tty0 (root-only 0600); the launcher chowns the session VT to
+; geir, so open /dev/tty<own_vt> when known, /dev/tty0 otherwise (root /
+; legacy). O_WRONLY: ioctls need no read mode. rax = fd (negative on fail).
+; ----------------------------------------------------------------------------
+vt_console_open:
+    mov eax, [own_vt]
+    test eax, eax
+    jz .vco_tty0
+    mov rcx, '/dev/tty'                      ; 8 bytes exactly
+    mov [vt_dev_path], rcx
+    lea rdi, [vt_dev_path + 8]
+    cmp eax, 9
+    jle .vco_1dig
+    mov ecx, 10
+    xor edx, edx
+    div ecx                                  ; eax = tens, edx = ones
+    add eax, '0'
+    mov [rdi], al
+    add edx, '0'
+    mov [rdi + 1], dl
+    mov byte [rdi + 2], 0
+    jmp .vco_open
+.vco_1dig:
+    add eax, '0'
+    mov [rdi], al
+    mov byte [rdi + 1], 0
+.vco_open:
+    mov rax, SYS_OPEN
+    lea rdi, [vt_dev_path]
+    mov esi, 1                               ; O_WRONLY
+    xor edx, edx
+    syscall
+    ret
+.vco_tty0:
+    mov rax, SYS_OPEN
+    lea rdi, [str_dev_tty0]
+    mov esi, 1
+    xor edx, edx
+    syscall
+    ret
 
 ; ----------------------------------------------------------------------------
 ; vt_release_display — hand the display to the console: external CRTC off,
