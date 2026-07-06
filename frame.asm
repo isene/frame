@@ -9561,6 +9561,14 @@ handle_map_window:
     jmp .mw_done
 .mw_just_map:
     mov byte [r12 + 28], 1
+    ; A freshly mapped window must show its BACKGROUND immediately (X
+    ; semantics) — backless windows let the wallpaper shine through until
+    ; the client's first draw (bg flash on every glass launch).
+    cmp byte [r12 + 19], 2                     ; InputOnly: nothing to paint
+    je .mw_no_backing
+    mov rdi, r12
+    call window_ensure_backing                 ; no-op if already backed
+.mw_no_backing:
     mov byte [comp_dirty], 1
     mov rdi, r12
     call damage_add_window
@@ -9864,28 +9872,68 @@ handle_configure_window:
     mov rdi, r13                              ; raise reveals the whole window
     call damage_add_window
 .cfgw_apply_done:
-    ; If the window resized and has a backing buffer at the old size,
-    ; drop it — the client will re-create it at the new size on its
-    ; next draw (standard resize → repaint flow).
+    ; If the window resized and has a backing at the old size, REPLACE it
+    ; with a fresh back_pixel-filled one and copy the old content's
+    ; overlap in. Dropping the backing outright (old behaviour) let the
+    ; WALLPAPER shine through every re-tiled window until its client
+    ; repainted — a background flash on each new-window launch.
     cmp byte [r13 + 31], 0
     je .cfgw_recomp
     movzx eax, word [r13 + 40]               ; backing_w
     cmp ax, [r13 + 12]                        ; width
-    jne .cfgw_drop_backing
+    jne .cfgw_resize_backing
     movzx eax, word [r13 + 42]               ; backing_h
     cmp ax, [r13 + 14]                        ; height
     je .cfgw_recomp
-.cfgw_drop_backing:
-    mov rax, SYS_MUNMAP
+.cfgw_resize_backing:
+    push qword [r13 + 32]                     ; old ptr
+    movzx eax, word [r13 + 40]
+    push rax                                  ; old w
+    movzx eax, word [r13 + 42]
+    push rax                                  ; old h
+    mov byte [r13 + 31], 0                    ; force a fresh allocation
+    mov qword [r13 + 32], 0
+    mov rdi, r13
+    call window_ensure_backing                ; new size, back_pixel-filled
+    test rax, rax
+    jz .cfgw_rz_free                          ; alloc failed → just drop old
+    mov edx, [rsp + 8]                        ; copy cols = min(old w, new w)
+    movzx eax, word [r13 + 40]
+    cmp edx, eax
+    cmovg edx, eax
+    mov ecx, [rsp]                            ; copy rows = min(old h, new h)
+    movzx eax, word [r13 + 42]
+    cmp ecx, eax
+    cmovg ecx, eax
+    test edx, edx
+    jz .cfgw_rz_free
+    mov r14, [rsp + 16]                       ; old base
+    mov r15d, [rsp + 8]                       ; old stride (px)
+    xor ebx, ebx                              ; row
+.cfgw_rz_row:
+    cmp ebx, ecx
+    jge .cfgw_rz_free
+    mov eax, ebx
+    imul eax, r15d
+    lea rsi, [r14 + rax*4]                    ; old row
+    movzx eax, word [r13 + 40]
+    imul eax, ebx
     mov rdi, [r13 + 32]
-    movzx esi, word [r13 + 40]
-    movzx ecx, word [r13 + 42]
-    imul esi, ecx
+    lea rdi, [rdi + rax*4]                    ; new row
+    push rcx
+    mov ecx, edx
+    rep movsd
+    pop rcx
+    inc ebx
+    jmp .cfgw_rz_row
+.cfgw_rz_free:
+    mov rax, SYS_MUNMAP
+    mov rdi, [rsp + 16]                       ; old ptr
+    mov esi, [rsp + 8]
+    imul esi, [rsp]                           ; old w * old h
     shl esi, 2
     syscall
-    mov byte [r13 + 31], 0
-    mov qword [r13 + 32], 0
-    mov dword [r13 + 40], 0
+    add rsp, 24
 .cfgw_recomp:
     mov byte [comp_dirty], 1
     mov edi, [r13 + 4]                        ; parent's abs origin (old x/y are
