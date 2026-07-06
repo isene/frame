@@ -7202,6 +7202,8 @@ handle_xinput:
     je .xi_get_client_pointer
     cmp eax, 40                              ; XIQueryPointer (GIMP blocks on it)
     je .xi_query_pointer
+    cmp eax, 42                              ; XIChangeCursor — GTK's set_cursor
+    je .xi_change_cursor                     ; (XI2 mode never sends core CWA)
     ; --- DIAG (temp): log unhandled XI minor opcode ---
     push rax
     mov rsi, log_xi_minor
@@ -7212,6 +7214,22 @@ handle_xinput:
     mov rsi, qext_nl
     mov edx, 1
     call write_stderr
+    ret
+
+.xi_change_cursor:
+    ; XIChangeCursor (42, void): +4 window, +8 cursor, +12 deviceid u16.
+    ; Same store as core CWA CWCursor — frame has one pointer, so the
+    ; per-device distinction collapses to the window's cursor attribute.
+    push rsi
+    mov edi, [rsi + 4]
+    call window_lookup
+    pop rsi
+    test rax, rax
+    jz .xi_chc_done
+    mov ecx, [rsi + 8]
+    mov [rax + 60], ecx
+    call cursor_sync                         ; may be under the pointer now
+.xi_chc_done:
     ret
 
 .xi_get_ext_version:
@@ -19354,7 +19372,21 @@ handle_render:
     je .hr_set_pic_clip
     cmp eax, 28
     je .hr_set_pic_transform
+    cmp eax, 27
+    je .hr_create_cursor
     ; Unhandled minor — leave it (logged by the generic request logger).
+    jmp .hr_done
+
+.hr_create_cursor:
+    ; RENDER CreateCursor (27): +4 cid, +8 source picture, +12/+14 hotspot.
+    ; In this setup the ONLY image cursor any client can load is the
+    ; one-file theme frame ships (test/xcursors: just "hand" — GDK maps
+    ; the CSS "pointer" to it), so a RENDER cursor IS the pressable-item
+    ; cursor: register it as the accent sprite. Names never cross the
+    ; wire, which is why the image itself can't be classified.
+    mov edi, [r12 + 4]                       ; cid
+    mov esi, CUR_ACCENT
+    call cursor_register
     jmp .hr_done
 
 .hr_set_pic_transform:
