@@ -15489,6 +15489,20 @@ draw_cursor_shape:
     mov dword [cur_hot_y], 8
     call draw_cursor_cross
 .dcs_out:
+    ; Re-latch the BO onto the plane. The pixels were just rewritten in
+    ; place, but i915 only re-scans the cursor buffer on a CURSOR_BO
+    ; ioctl — a bare CURSOR_MOVE (and worse, a MOVE to the same
+    ; coordinates, which is exactly what a hover-driven CWA produces)
+    ; leaves the OLD sprite on screen. That was the "I-beam won't
+    ; release" bug: frame's state flipped but the panel kept the old
+    ; image. Invisible under --fbtest (no cursor plane), hence caught
+    ; only on the panel.
+    cmp dword [cursor_ready], 0
+    je .dcs_ret
+    mov edi, [cursor_crtc]
+    mov esi, [cursor_handle]
+    call cursor_set_bo
+.dcs_ret:
     pop rbx
     ret
 
