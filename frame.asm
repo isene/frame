@@ -1084,6 +1084,11 @@ dump_prefix:        db "/tmp/frame_win_", 0
 dump_fb0_path:      db "/tmp/frame_fbA.raw", 0
 dump_fb1_path:      db "/tmp/frame_fbB.raw", 0
 dbg_fbstate:        db "FBSTATE back=", 0
+dbg_curstate:       db "CURSTATE shape=", 0
+dbg_cs_gw:          db " grabwin=", 0
+dbg_cs_gc:          db " grabcur=", 0
+dbg_cs_en:          db " enter=", 0
+dbg_cs_ec:          db " entercur=", 0
 dbg_evdrop:         db " evdrop=", 0
 dbg_pxblit:         db " blit=", 0
 dbg_pxfill:         db " fill=", 0
@@ -6638,23 +6643,116 @@ xkb_reply_zero:
 ; ever maps a window (the cause of "GTK maps nothing on frame").
 ; ============================================================================
 handle_query_pointer:
+    push rbx
+    push r12
+    push r13
+    mov r13d, edi                             ; slot
+    mov ebx, [rsi + 4]                         ; queried window
+    ; child = the topmost mapped direct child of the queried window under the
+    ; pointer. Stubbing this to None broke firefox: its content process polls
+    ; QueryPointer(root) and reads .child to learn which toplevel the pointer
+    ; is over; None ("over nothing") froze its cursor updates after a click.
+    mov edi, ebx
+    call child_of_under_pointer               ; eax = child xid (0 = none)
+    mov r12d, eax
+    mov edi, ebx                              ; queried window's absolute origin
+    call window_abs_xy                        ; r10d/r11d (winX/Y are window-local)
+    push r10
+    push r11
+    mov edi, r13d                             ; slot
     mov esi, 32
-    call xkb_reply_zero                       ; rdi=reply, r15d=fd, r8d=total
+    call xkb_reply_zero                       ; rdi=reply, r15d=fd
+    pop r11
+    pop r10
     mov byte [rdi + 1], 1                      ; sameScreen = True
     mov dword [rdi + 8], X_ROOT_WINDOW         ; root
-    mov dword [rdi + 12], 0                    ; child = None (no mapped window yet)
+    mov [rdi + 12], r12d                       ; child
     mov eax, [cursor_x]
     mov [rdi + 16], ax                         ; rootX
-    mov [rdi + 20], ax                         ; winX (queried window is the root)
+    sub eax, r10d
+    mov [rdi + 20], ax                         ; winX (window-relative)
     mov eax, [cursor_y]
     mov [rdi + 18], ax                         ; rootY
+    sub eax, r11d
     mov [rdi + 22], ax                         ; winY
-    ; mask (+24) = 0: no buttons / modifiers held
+    mov eax, [button_state]
+    movzx ecx, byte [mod_state]
+    or eax, ecx
+    mov [rdi + 24], ax                         ; mask (buttons + modifiers)
     lea rsi, [reply_buf]
     mov edi, r15d
-    mov edx, r8d
+    mov edx, 32
     mov eax, SYS_WRITE
     syscall
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; child_of_under_pointer — edi = parent xid. Returns eax = the topmost (by
+; stk) mapped DIRECT child of `parent` whose absolute rect contains
+; (cursor_x, cursor_y), or 0. For QueryPointer's `child` field.
+; ----------------------------------------------------------------------------
+child_of_under_pointer:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r15d, edi                            ; parent xid
+    call window_abs_xy                       ; r10d/r11d = parent abs origin
+    mov r13d, r10d
+    mov r14d, r11d
+    xor ebx, ebx                             ; slot
+    xor r12d, r12d                           ; best stk
+    xor r8d, r8d                             ; best xid (result)
+.cup_loop:
+    cmp ebx, MAX_WINDOWS
+    jge .cup_done
+    mov rax, rbx
+    imul rax, WINDOW_REC_SIZE
+    lea rax, [windows + rax]
+    mov ecx, [rax]                           ; xid
+    test ecx, ecx
+    jz .cup_next
+    cmp ecx, X_ROOT_WINDOW
+    je .cup_next
+    cmp [rax + 4], r15d                       ; direct child of parent?
+    jne .cup_next
+    cmp byte [rax + 28], 0                    ; mapped?
+    je .cup_next
+    mov edx, [rax + 48]                       ; stk
+    cmp edx, r12d
+    jbe .cup_next                            ; not the topmost so far
+    movsx edi, word [rax + 8]                 ; abs x = parent_abs_x + child.x
+    add edi, r13d
+    mov ecx, [cursor_x]
+    sub ecx, edi
+    js .cup_next
+    movzx esi, word [rax + 12]                ; w
+    cmp ecx, esi
+    jge .cup_next
+    movsx edi, word [rax + 10]                ; abs y
+    add edi, r14d
+    mov ecx, [cursor_y]
+    sub ecx, edi
+    js .cup_next
+    movzx esi, word [rax + 14]                ; h
+    cmp ecx, esi
+    jge .cup_next
+    mov r12d, edx                            ; new topmost
+    mov r8d, [rax]
+.cup_next:
+    inc ebx
+    jmp .cup_loop
+.cup_done:
+    mov eax, r8d
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; ============================================================================
@@ -21426,6 +21524,39 @@ dump_handler:
     call write_stderr
     lea rsi, [probe_conn_nl]
     mov rdx, 1
+    call write_stderr
+    ; --- cursor state (for the "stuck I-beam" hunt) ---
+    lea rsi, [dbg_curstate]
+    call write_str_stderr
+    mov eax, [cur_shape]
+    call write_u64_stderr
+    lea rsi, [dbg_cs_gw]
+    call write_str_stderr
+    mov eax, [ptr_grab_win]
+    call write_u64_stderr
+    lea rsi, [dbg_cs_gc]
+    call write_str_stderr
+    mov eax, [ptr_grab_cursor]
+    call write_u64_stderr
+    lea rsi, [dbg_cs_en]
+    call write_str_stderr
+    mov eax, [last_enter_win]
+    call write_u64_stderr
+    lea rsi, [dbg_cs_ec]
+    call write_str_stderr
+    mov edi, [last_enter_win]                  ; resolved cursor xid up the tree
+    call window_lookup
+    test rax, rax
+    jz .dh_cs_noenter
+    mov eax, [rax + 60]
+    call write_u64_stderr
+    jmp .dh_cs_nl
+.dh_cs_noenter:
+    xor eax, eax
+    call write_u64_stderr
+.dh_cs_nl:
+    lea rsi, [probe_conn_nl]
+    mov edx, 1
     call write_stderr
     xor ebx, ebx
 .dh_find:
