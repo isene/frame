@@ -17308,6 +17308,7 @@ handle_shm_put_image:
     push r15
     push rbp
     sub rsp, 80
+    mov [rsp + 76], edi                      ; slot (for ShmCompletion)
     mov r13, rsi                             ; req ptr
 
     cmp byte [r13 + 29], 2                    ; format ZPixmap?
@@ -17484,6 +17485,36 @@ handle_shm_put_image:
     movzx r8d, word [r13 + 22]             ; srcHeight
     call damage_add_local
 .spi_ret:
+    ; ShmCompletion (sendEvent flag +30): Chromium's software presenter
+    ; throttles on this event — without it the UI freezes after two
+    ; frames (the FortiClient white window). Sent on every exit: the
+    ; semantic is "server is done with the segment", success or not.
+    cmp byte [r13 + 30], 0
+    je .spi_out
+    lea rdi, [xi2_buf]                       ; event scratch (single-threaded)
+    xor eax, eax
+    mov ecx, 4
+    push rdi
+    rep stosq
+    pop rdi
+    mov byte [rdi + 0], SHM_EVENT_BASE       ; ShmCompletion
+    mov eax, [r13 + 4]
+    mov [rdi + 4], eax                       ; drawable
+    mov word [rdi + 8], 3                    ; minorEvent = ShmPutImage
+    mov byte [rdi + 10], SHM_MAJOR           ; majorEvent
+    mov eax, [r13 + 32]
+    mov [rdi + 12], eax                      ; shmseg
+    mov eax, [r13 + 36]
+    mov [rdi + 16], eax                      ; offset
+    mov eax, [rsp + 76]                      ; slot
+    call client_meta_addr
+    mov ecx, [rax + 8]                       ; seq
+    mov [xi2_buf + 2], cx
+    mov edi, [rax]                           ; fd
+    lea rsi, [xi2_buf]
+    mov edx, 32
+    EV_SEND
+.spi_out:
     add rsp, 80
     pop rbp
     pop r15
