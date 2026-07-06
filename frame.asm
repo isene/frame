@@ -3590,7 +3590,8 @@ client_cleanup_resources:
     inc ebx
     jmp .ccr_rd
 .ccr_rd_done:
-    pop r15
+    call sync_pointer_window                 ; dead client's windows are gone —
+    pop r15                                  ; re-crossing under the pointer
     pop r14
     pop r13
     pop r12
@@ -9377,6 +9378,7 @@ handle_destroy_window:
     mov edi, r12d
     call window_destroy
     mov byte [comp_dirty], 1
+    call sync_pointer_window
     pop r13
     pop r12
     pop rbx
@@ -9523,6 +9525,7 @@ handle_map_window:
     mov edx, [r12]                             ; child xid
     call send_map_notify
 .mw_done:
+    call sync_pointer_window
     pop r14
     pop r13
     pop r12
@@ -9614,6 +9617,7 @@ handle_unmap_window:
     mov edx, [r12]
     call send_unmap_notify
 .uw_done:
+    call sync_pointer_window
     pop r14
     pop r13
     pop r12
@@ -9807,6 +9811,7 @@ handle_configure_window:
     mov rsi, r13
     call send_configure_notify
 .cfgw_done:
+    call sync_pointer_window
     pop r15
     pop r14
     pop r13
@@ -12828,6 +12833,26 @@ pointer_crossings:
     ret
 
 ; ----------------------------------------------------------------------------
+; sync_pointer_window — recompute the window under the (stationary) pointer
+; and emit Enter/Leave if it changed. Real servers send crossings whenever
+; the window under the pointer changes for ANY reason — map, unmap,
+; configure, destroy, reparent — not just motion. GDK silently drops wheel
+; button events for windows it never got an Enter for (clicks survive),
+; so a window mapped under a parked cursor (tile workspace switch) had
+; dead two-finger scrolling in firefox until the pointer moved.
+; ----------------------------------------------------------------------------
+sync_pointer_window:
+    push rbx
+    call window_at_point
+    test rax, rax
+    jz .spw_done
+    mov rbx, rax
+    call pointer_crossings
+.spw_done:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
 ; core_motion_wanted — eax = a core event mask. Returns ZF=0 (jnz) if a
 ; MotionNotify should be delivered for the current button_state:
 ;   PointerMotionMask   (0x40)          → always
@@ -13451,6 +13476,7 @@ handle_reparent_window:
     mov ecx, [r12 + 4]
     call send_reparent_notify
 .rp_done:
+    call sync_pointer_window
     pop r14
     pop r13
     pop r12
