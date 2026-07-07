@@ -7810,9 +7810,30 @@ handle_get_property:
     mov r13, rax                             ; record ptr
 
     ; ---- found: emit value reply ----
+    ; Honour long_offset / long_length (X11 spec): I = 4*long_offset,
+    ; L = min(T - I, 4*long_length), bytes_after = T - (I + L). Qt
+    ; probes every property with long_length=0 and trusts bytes_after
+    ; for the real size; the old always-return-everything reply with
+    ; bytes_after=0 made Qt parse every property as EMPTY -- dead
+    ; copyq capture, dead clipboard reads in every Qt app.
     movzx r9d, byte [r13 + 12]               ; format (8/16/32)
-    mov r8d, [r13 + 16]                      ; nbytes
-    mov ecx, r8d
+    mov r8d, [r13 + 16]                      ; T = value size in bytes
+    mov eax, [r14 + 16]                      ; long_offset (4-byte units)
+    shl rax, 2                               ; I (64-bit, cannot overflow)
+    cmp rax, r8
+    jbe .gp_off_ok
+    mov rax, r8                              ; clamp I to T (spec: BadValue)
+.gp_off_ok:
+    mov r10, rax                             ; I
+    mov ecx, [r14 + 20]                      ; long_length (4-byte units)
+    shl rcx, 2                               ; requested bytes (64-bit)
+    mov r11, r8
+    sub r11, r10                             ; available = T - I
+    cmp rcx, r11
+    jae .gp_len_ok
+    mov r11, rcx                             ; L = min(available, requested)
+.gp_len_ok:
+    mov ecx, r11d
     add ecx, 3
     shr ecx, 2                               ; reply length in 4u
     lea rdi, [reply_buf]
@@ -7823,9 +7844,12 @@ handle_get_property:
     mov [rdi + 4], ecx
     mov eax, [r13 + 8]
     mov [rdi + 8], eax                       ; type
-    mov dword [rdi + 12], 0                  ; bytes-after = 0
-    ; length in format-units
     mov eax, r8d
+    sub eax, r10d
+    sub eax, r11d
+    mov [rdi + 12], eax                      ; bytes-after = T - I - L
+    ; length in format-units (of the L bytes actually returned)
+    mov eax, r11d
     cmp r9d, 16
     je .gp_units16
     cmp r9d, 32
@@ -7842,19 +7866,20 @@ handle_get_property:
     mov dword [rdi + 24], 0
     mov dword [rdi + 28], 0
 
-    ; Copy the value into reply_buf + 32.
+    ; Copy the windowed value into reply_buf + 32.
     mov eax, [r13 + 20]                      ; value offset in pool
     lea rsi, [property_values + rax]
+    add rsi, r10                             ; + I
     lea rdi, [reply_buf + 32]
-    mov ecx, r8d                             ; nbytes
+    mov ecx, r11d                            ; L
     rep movsb
 
     ; Pad to 4-byte boundary.
-    mov ecx, r8d
+    mov ecx, r11d
     add ecx, 3
     and ecx, ~3
     mov r10d, ecx                            ; padded body bytes
-    sub ecx, r8d
+    sub ecx, r11d
     xor eax, eax
     rep stosb
 
@@ -7866,9 +7891,13 @@ handle_get_property:
     add edx, 32
     syscall
 
-    ; Delete-on-read?
+    ; Delete-on-read? Only when this read consumed to the end
+    ; (bytes_after == 0) -- a chunked reader keeps the property
+    ; alive until its final chunk (X11 spec).
     cmp byte [r14 + 1], 0
     je .gp_done
+    cmp dword [reply_buf + 12], 0
+    jne .gp_done
     mov edi, [r13]                           ; window (grab before zeroing)
     mov esi, [r13 + 4]                       ; atom
     mov dword [r13], 0                       ; xid = 0 → empty
