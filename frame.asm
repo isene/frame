@@ -828,6 +828,10 @@ flip_pending:       resb 1               ; PAGE_FLIP in flight; don't composite
 drm_poll_dead:      resb 1               ; drm fd hit POLLERR/POLLHUP: stop
                                          ; polling it, flips fire-and-forget
 testinput_path:     resq 1               ; --testinput PATH (0 = off)
+noinput_mode:       resb 1               ; --noinput: skip the real evdev scan
+                                         ; (headless tests must NOT grab the
+                                         ; developer's live keyboard; FIFO
+                                         ; injection via --testinput still works)
 fbtest_mode:        resb 1               ; --fbtest: composite into plain
                                          ; memory, no DRM (headless testing)
 comp_px_blit:       resq 1               ; PERF counters (SIGUSR1 report):
@@ -1511,7 +1515,17 @@ _start:
 .flag_fbtest_on:
     mov byte [fbtest_mode], 1
     jmp .flag_scan_next
+    jmp .flag_scan_next
 .flag_not_fbtest:
+    cmp dword [rdi], '--no'                  ; --noinput: never open real evdev
+    jne .flag_not_noinput                    ; (headless tests must not grab the
+    cmp dword [rdi + 4], 'inpu'              ; developer's live keyboard)
+    jne .flag_not_noinput
+    cmp word [rdi + 8], 't'                  ; 't' + NUL
+    jne .flag_not_noinput
+    mov byte [noinput_mode], 1
+    jmp .flag_scan_next
+.flag_not_noinput:
     cmp dword [rdi], '--te'                  ; --testinput PATH: extra input fd
     jne .flag_not_testinput                  ; (FIFO) feeding synthetic evdev
     cmp dword [rdi + 4], 'stin'              ; records into the normal input
@@ -1614,6 +1628,13 @@ _start:
 .skip_testinput:
     cmp byte [compositor_requested], 0
     je .skip_compositor
+    ; --fbtest provides the compositor in plain memory. NEVER fall through
+    ; to init_compositor: it opens /dev/dri/cardN and takes DRM master,
+    ; which SUCCEEDS when no session holds it (user at a bare console) and
+    ; modesets the panel away — froze the desktop 2026-07-07 during
+    ; headless paste testing.
+    cmp byte [fbtest_mode], 0
+    jne .skip_compositor
     call init_compositor
     call load_wallpaper                       ; ~/.framerc background → wallpaper_ptr
 .skip_compositor:
@@ -11832,7 +11853,9 @@ init_input:
     mov dword [input_fd_count], 0
 
     ; Walk event0..event31; stash openable fds.
-    xor ebx, ebx
+    cmp byte [noinput_mode], 0               ; --noinput: skip the real evdev
+    jnz .ii_done                             ; scan (headless testing; the
+    xor ebx, ebx                             ; --testinput FIFO still attaches)
 .ii_loop:
     cmp ebx, INPUT_DEV_MAX
     jge .ii_done
