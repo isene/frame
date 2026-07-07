@@ -5937,8 +5937,30 @@ handle_xtest:
     movsx edx, word [r12 + 26]               ; rootY
     cmp r13d, 0
     jne .xt_mot_rel
-    sub eax, [cursor_x]
-    sub edx, [cursor_y]
+    ; Absolute: land EXACTLY on the target. The old delta conversion fed
+    ; the EV_REL path, whose sensitivity scaling meant xdotool mousemove
+    ; and every XTEST-driven test never hit the pixel it asked for.
+    test eax, eax
+    jns .xt_abs_x_lo
+    xor eax, eax
+.xt_abs_x_lo:
+    mov ecx, [screen_w]
+    dec ecx
+    cmp eax, ecx
+    cmovg eax, ecx
+    mov [cursor_x], eax
+    test edx, edx
+    jns .xt_abs_y_lo
+    xor edx, edx
+.xt_abs_y_lo:
+    mov ecx, [screen_h]
+    dec ecx
+    cmp edx, ecx
+    cmovg edx, ecx
+    mov [cursor_y], edx
+    call cursor_move_hw
+    call deliver_pointer_motion
+    jmp .xt_out
 .xt_mot_rel:
     push rdx
     test eax, eax
@@ -12906,6 +12928,79 @@ expose_under_window:
     pop rbx
     ret
 
+; ----------------------------------------------------------------------------
+; event_propagate_up — X-style upward event propagation. Firefox's content
+; lives in a nested child that selects nothing; the topmost-by-stk pick
+; used to swallow its events outright (dead live text selection, dead drag
+; motion, GDK cursor updates dead after a click — the reason FF fell back
+; to QueryPointer polling). Walk the ancestor chain to the nearest window
+; that selected the event, adjusting the caller's absolute-origin pair so
+; event coordinates stay window-local.
+;   rbx = picked window record        esi = event code (4/5/6, = XI2 bit)
+;   edx = core mask bit for press/release (0x04/0x08; unused for motion)
+;   r10 = pointer to the abs-origin pair (abs_x dd, abs_y dd)
+; Returns rbx = selecting window record, or 0 if nothing selects.
+; Preserves esi, edx, r10; clobbers eax, edi.
+; ----------------------------------------------------------------------------
+event_propagate_up:
+.epu_check:
+    bt dword [rbx + 52], esi                 ; XI2 selection for this evtype?
+    jc .epu_found
+    cmp esi, 6
+    jne .epu_core_btn
+    mov eax, [rbx + 24]
+    call core_motion_wanted                  ; clobbers eax only
+    jnz .epu_found
+    jmp .epu_climb
+.epu_core_btn:
+    test [rbx + 24], edx
+    jnz .epu_found
+.epu_climb:
+    cmp dword [rbx], X_ROOT_WINDOW           ; root didn't select → nobody does
+    je .epu_none
+    movsx eax, word [rbx + 8]                ; abs(parent) = abs(child) - child.xy
+    sub [r10], eax
+    movsx eax, word [rbx + 10]
+    sub [r10 + 4], eax
+    mov edi, [rbx + 4]                       ; parent xid
+    call window_lookup                       ; clobbers rax only
+    test rax, rax
+    jz .epu_none
+    mov rbx, rax
+    jmp .epu_check
+.epu_none:
+    xor ebx, ebx
+.epu_found:
+    ret
+
+; ----------------------------------------------------------------------------
+; window_abs_origin — rbx = window record. Writes the window's absolute
+; origin into wapd_abs_x/y (the grab-path coordinate pair). Used when a
+; grab delivery falls back to the grab window itself. Preserves rbx.
+; ----------------------------------------------------------------------------
+window_abs_origin:
+    push rbx
+    xor ecx, ecx
+    xor edx, edx
+.wao_loop:
+    movsx eax, word [rbx + 8]
+    add ecx, eax
+    movsx eax, word [rbx + 10]
+    add edx, eax
+    cmp dword [rbx], X_ROOT_WINDOW
+    je .wao_done
+    mov edi, [rbx + 4]
+    call window_lookup
+    test rax, rax
+    jz .wao_done
+    mov rbx, rax
+    jmp .wao_loop
+.wao_done:
+    mov [wapd_abs_x], ecx
+    mov [wapd_abs_y], edx
+    pop rbx
+    ret
+
 window_at_point:
     ; Absolute-aware pick: a window counts only if its WHOLE ancestor chain
     ; is mapped, and its rect is tested at its ABSOLUTE origin (child x/y
@@ -13590,19 +13685,26 @@ deliver_pointer_motion:
     jz .dpm_done
     mov rbx, rax
     call pointer_crossings                   ; Enter/Leave BEFORE motion gating
-    ; owner_events: motion over a client window is reported per THAT window's
-    ; mask, not the grab's. GTK grabs the toplevel with a mask that may omit
-    ; PointerMotion, but the menu window selects it — without honouring the
-    ; target's mask, motion is dropped, so menu items never highlight/select
-    ; and a click has no selected item to activate.
-    test dword [rbx + 52], 0x40             ; XI2 Motion selected → skip core gate
+    ; owner_events: propagate up from the deep pick to the nearest window
+    ; that selected motion (XI2 or core) — its xid becomes the event window
+    ; (GTK menus select on the menu window; FF selects on its toplevel while
+    ; the nested content child selects nothing). If nothing up the chain
+    ; selects, the grab's own mask decides and the event reports against
+    ; the GRAB window (scrot -s: ButtonMotionMask while dragging).
+    mov esi, 6
+    lea r10, [wapd_abs_x]
+    call event_propagate_up
+    test rbx, rbx
     jnz .dpm_gdeliver
-    mov eax, [rbx + 24]                     ; target window's core mask wants motion?
+    mov eax, [ptr_grab_mask]
     call core_motion_wanted
-    jnz .dpm_gdeliver
-    mov eax, [ptr_grab_mask]                ; else the grab's mask (scrot -s: Button
-    call core_motion_wanted                 ; MotionMask while dragging → deliver)
     jz .dpm_done
+    mov edi, [ptr_grab_win]
+    call window_lookup
+    test rax, rax
+    jz .dpm_done
+    mov rbx, rax
+    call window_abs_origin
 .dpm_gdeliver:
     mov r8d, [cursor_x]
     sub r8d, [wapd_abs_x]                    ; event-x (absolute-aware)
@@ -13620,10 +13722,10 @@ deliver_pointer_motion:
     jz .dpm_done
     mov rbx, rax
     call pointer_crossings                   ; Enter/Leave BEFORE motion gating
-    test dword [rbx + 52], 0x40              ; XI2 Motion selected?
-    jnz .dpm_calc
-    mov eax, [rbx + 24]                      ; core mask (Pointer/Button motion)
-    call core_motion_wanted
+    mov esi, 6                               ; propagate up to the nearest
+    lea r10, [wap_abs_x]                     ; window selecting motion
+    call event_propagate_up
+    test rbx, rbx
     jz .dpm_done
 .dpm_calc:
     mov r8d, [cursor_x]
@@ -13695,17 +13797,29 @@ deliver_pointer_button:
     test rax, rax
     jz .dpb_done
     mov rbx, rax
-    mov ecx, 0x04                            ; press vs release mask bit
+    mov edx, 0x04                            ; press vs release core mask bit
     cmp r12d, 4
-    je .dpb_gmask
+    je .dpb_gprop
+    mov edx, 0x08
+.dpb_gprop:
+    mov esi, r12d                            ; propagate to the nearest selector
+    lea r10, [wapd_abs_x]
+    call event_propagate_up
+    test rbx, rbx
+    jnz .dpb_gdeliver                        ; ancestor owns it → its window
+    mov ecx, 0x04                            ; nothing selects → the grab's own
+    cmp r12d, 4                              ; mask decides, event window = the
+    je .dpb_gm2                              ; GRAB window (owner-events fallback)
     mov ecx, 0x08
-.dpb_gmask:
-    bt dword [rbx + 52], r12d                ; XI2 press/release selected →
-    jc .dpb_gdeliver                         ; skip the core-mask gate
-    test [rbx + 24], ecx                     ; owner_events: target window wants it?
-    jnz .dpb_gdeliver
-    test [ptr_grab_mask], ecx                ; else the grab itself wants it?
+.dpb_gm2:
+    test [ptr_grab_mask], ecx
     jz .dpb_done
+    mov edi, [ptr_grab_win]
+    call window_lookup
+    test rax, rax
+    jz .dpb_done
+    mov rbx, rax
+    call window_abs_origin
 .dpb_gdeliver:
     mov r8d, [cursor_x]
     sub r8d, [wapd_abs_x]                    ; event-x (absolute-aware)
@@ -13725,14 +13839,15 @@ deliver_pointer_button:
     test rax, rax
     jz .dpb_done
     mov rbx, rax
-    mov ecx, 0x04                            ; ButtonPressMask
+    mov edx, 0x04                            ; ButtonPressMask
     cmp r12d, 4
-    je .dpb_mask
-    mov ecx, 0x08                            ; ButtonReleaseMask
-.dpb_mask:
-    bt dword [rbx + 52], r12d                ; XI2 selected → skip core gate
-    jc .dpb_calc
-    test [rbx + 24], ecx
+    je .dpb_prop
+    mov edx, 0x08                            ; ButtonReleaseMask
+.dpb_prop:
+    mov esi, r12d                            ; propagate to the nearest selector
+    lea r10, [wap_abs_x]
+    call event_propagate_up
+    test rbx, rbx
     jz .dpb_done
 .dpb_calc:
     mov r8d, [cursor_x]
@@ -15882,7 +15997,16 @@ cursor_sync:
     cmp eax, -1
     jne .csy_have
 .csy_window:
-    mov ebx, [last_enter_win]
+    ; Walk up from the DEEPEST window under the pointer (X semantics),
+    ; not from the shallow crossing target. Firefox blanks the cursor on
+    ; a parent (GDK hides the pointer on click-into-text) and restores it
+    ; on the nested content child it found via QueryPointer polling; the
+    ; shallow walk never saw the restore and the cursor stayed invisible
+    ; until a crossing onto the FF chrome re-synced it.
+    call window_at_point_deep
+    test rax, rax
+    jz .csy_arrow
+    mov ebx, [rax]
 .csy_walk:
     test ebx, ebx
     jz .csy_arrow
