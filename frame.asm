@@ -569,10 +569,15 @@ ag_log_count:       resd 1               ; debug: limit AddGlyphs dumps
 
 ; ---- Phase 4c property table ----------------------------------------------
 ; properties[1024] — flat list of (window, atom) → value records. xid = 0
-; marks an empty slot. Value bytes live in a separate append-only pool
+; marks an empty slot. Value bytes live in a separate bump pool
 ; (property_values); each record references its value via (offset,
-; nbytes). ChangeProperty.Replace re-appends rather than re-using the
-; old slot — simpler, costs some pool space but pool is 256 KB.
+; nbytes). Same-size Replace overwrites in place (covers the CARD32
+; churners: _NET_WM_USER_TIME on every click, _NET_CURRENT_DESKTOP,
+; _TILE_BAR_STATE...). Grow/shrink still appends and leaks the old
+; bytes; when the pool fills, property_compact packs all live values
+; into the shadow pool and swings back — an 11-hour firefox session
+; once exhausted the append-only pool and every paste + EWMH update
+; on the desktop silently died (v0.0.118 fix).
 ;
 ; Layout (24 B):
 ;   +0  xid (u32)          0 = empty
@@ -587,6 +592,7 @@ ag_log_count:       resd 1               ; debug: limit AddGlyphs dumps
 %define PROPERTY_VALUES_CAP   262144
 properties:         resb MAX_PROPERTIES * PROPERTY_REC_SIZE
 property_values:    resb PROPERTY_VALUES_CAP
+property_values2:   resb PROPERTY_VALUES_CAP  ; compaction shadow (cold; pages untouched until first compact)
 property_values_used: resd 1
 
 ; ---- Phase 4d input state -------------------------------------------------
@@ -1133,6 +1139,8 @@ dbg_evdrop:         db " evdrop=", 0
 dbg_pxblit:         db " blit=", 0
 dbg_pxfill:         db " fill=", 0
 dbg_pxflush:        db " flush=", 0
+log_prop_compact:   db "frame: property pool full, compacted", 10
+log_prop_compact_len equ $ - log_prop_compact
 log_fbtest:         db "frame: fbtest compositor 1920x1080 (no DRM)", 10
 log_fbtest_len equ $ - log_fbtest
 dbg_spX:            db " "
@@ -10175,12 +10183,14 @@ handle_configure_window:
 ; PHASE 4c — property storage.
 ; ============================================================================
 ; Per-window properties keyed by (xid, atom). Records held in a flat
-; 1024-slot table; value bytes appended to a 256 KB pool. The pool is
-; append-only: ChangeProperty.Replace allocates new pool space and
-; leaks the old. A full session of tile + glass + firefox usually
-; settles below 100 KB of property storage; if a long-running session
-; ever fills the pool, ChangeProperty silently drops new sets (real
-; X servers would generate BadAlloc; we'll add error events later).
+; 1024-slot table; value bytes in a 256 KB bump pool. Same-size Replace
+; overwrites in place; grow/shrink appends and leaks the old bytes until
+; property_compact reclaims them (triggered on pool-full, retried once).
+; History: the pool used to be pure append-only — an 11-hour firefox
+; session filled it and every ChangeProperty on the desktop silently
+; dropped: paste returned empty everywhere (selection data travels via a
+; property write) and strip's WS + title froze (tile's EWMH updates
+; stopped storing). v0.0.118.
 ; ============================================================================
 
 ; ----------------------------------------------------------------------------
@@ -10281,6 +10291,62 @@ property_value_alloc:
     mov eax, -1
     ret
 
+; ----------------------------------------------------------------------------
+; property_compact — pack every live record's value bytes into the shadow
+; pool (table order), rewrite each record's value_off, bulk-copy back and
+; drop the watermark. Reclaims everything leaked by grow-Replace and by
+; dead-window cleanup. Cold path: runs only when the 256 KB pool actually
+; fills (hours-to-days apart); callers retry the alloc once after it.
+; Preserves all registers.
+; ----------------------------------------------------------------------------
+property_compact:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    xor ebx, ebx                             ; record index
+    xor r8d, r8d                             ; new watermark
+.pc_loop:
+    cmp ebx, MAX_PROPERTIES
+    jge .pc_swap
+    mov rax, rbx
+    imul rax, PROPERTY_REC_SIZE
+    lea rax, [properties + rax]
+    cmp dword [rax], 0
+    je .pc_next
+    mov ecx, [rax + 16]                      ; nbytes
+    test ecx, ecx
+    jz .pc_next
+    mov esi, [rax + 20]                      ; old offset
+    lea rsi, [property_values + rsi]
+    lea rdi, [property_values2 + r8]
+    mov [rax + 20], r8d                      ; new offset
+    add r8d, ecx
+    rep movsb
+.pc_next:
+    inc ebx
+    jmp .pc_loop
+.pc_swap:
+    lea rsi, [property_values2]
+    lea rdi, [property_values]
+    mov ecx, r8d
+    rep movsb
+    mov [property_values_used], r8d
+    lea rsi, [log_prop_compact]
+    mov edx, log_prop_compact_len
+    call write_stderr
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
 ; ============================================================================
 ; handle_change_property — edi = slot, rsi = request ptr.
 ;
@@ -10339,9 +10405,16 @@ handle_change_property:
     add edi, r13d                            ; total
     push rax                                  ; mode
     call property_value_alloc
-    pop rcx                                   ; mode
     cmp eax, -1
-    je .cp_done
+    jne .cp_comb_have
+    call property_compact                    ; pool full → reclaim + retry once
+    call property_value_alloc                ; (edi preserved by both calls)
+    cmp eax, -1
+    jne .cp_comb_have
+    pop rcx
+    jmp .cp_done
+.cp_comb_have:
+    pop rcx                                   ; mode
     mov r15d, eax                            ; new value offset
     ; Compose at property_values + r15.
     lea rdi, [property_values + r15]
@@ -10376,11 +10449,30 @@ handle_change_property:
     jmp .cp_notify
 
 .cp_replace:
-    ; Allocate pool space and copy the new data.
+    ; Same-size Replace → overwrite the existing bytes in place, no pool
+    ; alloc. This is the hot case (CARD32 churners: _NET_WM_USER_TIME on
+    ; every click, _NET_ACTIVE_WINDOW, _TILE_BAR_STATE...) and what kept
+    ; the old append-only pool from surviving a long session.
+    mov ecx, [r14 + 16]                      ; old nbytes
+    cmp ecx, r13d
+    jne .cp_rep_alloc
+    mov eax, [r14 + 20]
+    lea rdi, [property_values + rax]
+    lea rsi, [r12 + 24]
+    rep movsb                                ; ecx = r13d already
+    jmp .cp_rep_meta
+.cp_rep_alloc:
+    ; Size changed → allocate fresh pool space (old bytes leak until the
+    ; next compaction reclaims them).
     mov edi, r13d
     call property_value_alloc
     cmp eax, -1
+    jne .cp_rep_have
+    call property_compact                    ; pool full → reclaim + retry once
+    call property_value_alloc                ; (edi preserved by both calls)
+    cmp eax, -1
     je .cp_done
+.cp_rep_have:
     mov r15d, eax                            ; offset
     lea rdi, [property_values + r15]
     lea rsi, [r12 + 24]
@@ -10388,6 +10480,7 @@ handle_change_property:
     rep movsb
     mov [r14 + 16], r13d                     ; nbytes
     mov [r14 + 20], r15d                     ; value_off
+.cp_rep_meta:
     mov ecx, [r12 + 12]
     mov [r14 + 8], ecx                       ; type
     movzx ecx, byte [r12 + 16]
