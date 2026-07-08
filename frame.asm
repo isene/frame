@@ -859,6 +859,7 @@ bw_clip_y1:         resd 1               ; rect currently being repainted
 bw_clip_x2:         resd 1
 bw_clip_y2:         resd 1
 cfgw_old_rect:      resq 1               ; configure: pre-change x,y,w,h latch
+cfgw_resized:       resb 1               ; configure changed w/h this call
 dmg_lat:            resd 4               ; per-handler damage rect latch
 cg_dmg:             resd 4               ; glyph-run damage bbox (x1,y1,x2,y2)
 flip_pending:       resb 1               ; PAGE_FLIP in flight; don't composite
@@ -10213,6 +10214,7 @@ handle_configure_window:
     mov rdi, r13                              ; raise reveals the whole window
     call damage_add_window
 .cfgw_apply_done:
+    mov byte [cfgw_resized], 0
     ; If the window resized and has a backing at the old size, REPLACE it
     ; with a fresh back_pixel-filled one and copy the old content's
     ; overlap in. Dropping the backing outright (old behaviour) let the
@@ -10227,6 +10229,7 @@ handle_configure_window:
     cmp ax, [r13 + 14]                        ; height
     je .cfgw_recomp
 .cfgw_resize_backing:
+    mov byte [cfgw_resized], 1
     push qword [r13 + 32]                     ; old ptr
     movzx eax, word [r13 + 40]
     push rax                                  ; old w
@@ -10318,6 +10321,26 @@ handle_configure_window:
     mov edi, eax
     mov rsi, r13
     call send_configure_notify
+    ; A resized window whose client paints on Expose (feh/imlib2 and other
+    ; simple XImage viewers) needs an Expose to repaint — frame keeps no
+    ; backing-store, so the enlarged area is back_pixel until the client
+    ; redraws. Without this, feh -B black went fully black after tile
+    ; retiled it. Deliver a full-window Expose to the owner.
+    cmp byte [cfgw_resized], 0
+    je .cfgw_done
+    mov eax, [r13]
+    sub eax, X_RID_BASE
+    jb .cfgw_done
+    shr eax, 21
+    cmp eax, MAX_CLIENTS
+    jae .cfgw_done
+    mov edi, eax
+    mov esi, [r13]
+    xor edx, edx
+    xor ecx, ecx
+    movzx r8d, word [r13 + 12]
+    movzx r9d, word [r13 + 14]
+    call send_expose
 .cfgw_done:
     call sync_pointer_window
     pop r15
