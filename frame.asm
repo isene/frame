@@ -17704,8 +17704,8 @@ gc_alloc:
     jmp .ga_loop
 .ga_take:
     mov [rax], r12d
-    mov dword [rax + 4], 0x00FFFFFF          ; default fg = white
-    mov dword [rax + 8], 0                    ; default bg = black
+    mov dword [rax + 4], 0                    ; default fg = black (X spec: fg=0)
+    mov dword [rax + 8], 0x00FFFFFF          ; default bg = white (X spec: bg=1)
     push rax                                  ; clear the slot's clip entry
     lea rcx, [gcs]
     sub rax, rcx
