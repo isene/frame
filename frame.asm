@@ -37,6 +37,16 @@ DEFAULT REL
 ; would-block the event is simply DROPPED; events are lossy by nature, so
 ; a missed motion/crossing is harmless and the client resyncs. Replies
 ; stay blocking (request-driven; the client IS waiting on them).
+%macro CRLOG 2
+    push rdi
+    push rsi
+    mov dil, %1
+    mov sil, %2
+    call cur_ring_log
+    pop rsi
+    pop rdi
+%endmacro
+
 %macro EV_SEND 0
     mov rax, SYS_SENDTO
     mov r10d, MSG_DONTWAIT
@@ -294,6 +304,19 @@ cursor_argb:        resd 1                 ; computed premultiplied interior pix
 cursor_tab:         resb MAX_CURSORS * 8   ; +0 cursor xid, +4 sprite id
 cursor_tab_next:    resd 1                 ; rotating evict index when full
 cur_shape:          resd 1                 ; sprite currently in the BO
+; --- cursor/drag diagnostic ring (SIGUSR1 dumps it) -------------------------
+; 128 x 2-byte entries [tag, val]. Event-driven, written only when the cursor
+; actually changes or a drag grab ends — a handful of writes per user action,
+; zero idle cost. Survives a VT switch, so the "invisible-until-I-switch-VT"
+; cursor bug and the flaky live-selection bug leave a readable trail.
+;   D shape  draw_cursor_shape drew this sprite
+;   S shape  cursor_sync resolved this shape (drew iff a 'D' follows)
+;   X shape  XIChangeCursor set a cursor resolving to this shape (0xFF=none)
+;   G 0      drag grab started (XIGrabDevice)
+;   U count  drag grab ended; count = motion events delivered during it
+cur_ring:           resb 256
+cur_ring_idx:       resd 1
+grab_motion_count:  resd 1
 cur_hot_x:          resd 1                 ; hotspot of that sprite
 cur_hot_y:          resd 1
 cfg_cursor_accent:  resd 1                 ; ~/.framerc cursor_accent RRGGBB
@@ -1135,6 +1158,7 @@ dump_fb0_path:      db "/tmp/frame_fbA.raw", 0
 dump_fb1_path:      db "/tmp/frame_fbB.raw", 0
 dbg_fbstate:        db "FBSTATE back=", 0
 dbg_curstate:       db "CURSTATE shape=", 0
+dbg_curring:        db "CURRING ", 0
 dbg_cs_gw:          db " grabwin=", 0
 dbg_cs_gc:          db " grabcur=", 0
 dbg_cs_en:          db " enter=", 0
@@ -7444,6 +7468,16 @@ handle_xinput:
     jz .xi_chc_done
     mov ecx, [rsi + 8]
     mov [rax + 60], ecx
+    push rsi
+    mov edi, ecx
+    call cursor_shape_of                     ; eax = shape, or -1 if unknown
+    mov cl, al
+    cmp eax, -1
+    jne .xi_chc_log
+    mov cl, 0xFF
+.xi_chc_log:
+    CRLOG 'X', cl
+    pop rsi
     call cursor_sync                         ; may be under the pointer now
 .xi_chc_done:
     ret
@@ -7524,6 +7558,10 @@ handle_xinput:
     mov [ptr_grab_slot], ebx
     mov dword [ptr_grab_mask], 0xFFFF        ; grab wants everything
     mov byte [ptr_grab_xi2], 1
+    mov dword [grab_motion_count], 0
+    push rax
+    CRLOG 'G', al
+    pop rax
     mov byte [ptr_grab_owner], 1             ; XI2 grabs keep the deep pick
                                              ; (GTK menu-item selection)
     mov eax, [r12 + 12]                      ; XIGrabDevice cursor field
@@ -7560,6 +7598,14 @@ handle_xinput:
     je .xud_kbd
     cmp [ptr_grab_slot], edi                 ; we own the pointer grab?
     jne .xud_chk_kbd
+    push rax
+    mov eax, [grab_motion_count]
+    cmp eax, 255
+    jbe .xud_cnt_ok
+    mov eax, 255
+.xud_cnt_ok:
+    CRLOG 'U', al
+    pop rax
     mov dword [ptr_grab_win], 0
     mov dword [ptr_grab_cursor], 0
     mov byte [ptr_grab_xi2], 0
@@ -13706,6 +13752,7 @@ deliver_pointer_motion:
     mov rbx, rax
     call window_abs_origin
 .dpm_gdeliver:
+    inc dword [grab_motion_count]
     mov r8d, [cursor_x]
     sub r8d, [wapd_abs_x]                    ; event-x (absolute-aware)
     mov r9d, [cursor_y]
@@ -15883,9 +15930,30 @@ cursor_cross_pass:
 ; draw_cursor_shape — edi = sprite id. Sets the hotspot and repaints the
 ; cursor BO. State-only (no draw) when the sprite isn't up (fbtest).
 ; ----------------------------------------------------------------------------
+; cur_ring_log — dil = tag, sil = val. Appends one entry. Fully transparent
+; (preserves every GP register AND flags) so it can drop in anywhere.
+cur_ring_log:
+    pushfq
+    push rax
+    push rbx
+    mov eax, [cur_ring_idx]
+    mov ebx, eax
+    add ebx, ebx
+    lea rbx, [cur_ring + rbx]
+    mov [rbx], dil
+    mov [rbx + 1], sil
+    inc eax
+    and eax, 127
+    mov [cur_ring_idx], eax
+    pop rbx
+    pop rax
+    popfq
+    ret
+
 draw_cursor_shape:
     push rbx
     mov ebx, edi
+    CRLOG 'D', bl
     mov dword [cur_hot_x], 0
     mov dword [cur_hot_y], 0
     cmp dword [cursor_ready], 0
@@ -16029,6 +16097,7 @@ cursor_sync:
 .csy_arrow:
     xor eax, eax                             ; CUR_ARROW
 .csy_have:
+    CRLOG 'S', al
     cmp eax, [cur_shape]
     je .csy_out
     mov [cur_shape], eax
@@ -22521,6 +22590,15 @@ dump_handler:
     xor eax, eax
     call write_u64_stderr
 .dh_cs_nl:
+    lea rsi, [probe_conn_nl]
+    mov edx, 1
+    call write_stderr
+    ; --- cursor/drag ring: oldest→newest from the write cursor ---
+    lea rsi, [dbg_curring]
+    call write_str_stderr
+    lea rsi, [cur_ring]                         ; raw ring: 128 x (tag,val) pairs
+    mov edx, 256
+    call write_stderr
     lea rsi, [probe_conn_nl]
     mov edx, 1
     call write_stderr
