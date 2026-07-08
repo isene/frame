@@ -475,6 +475,21 @@ xkb_getmap_present: resd 1               ; GetMap reply present mask (echoes req
 %define MAX_WINDOWS      512
 %define WINDOW_REC_SIZE  64          ; was 56; +56 border_pixel, +60 cursor
 windows:            resb MAX_WINDOWS * WINDOW_REC_SIZE
+win_bgpix:          resd MAX_WINDOWS      ; CW_BACK_PIXMAP xid per window slot
+                                          ; (0=none). ClearArea restores from it
+                                          ; instead of painting back_pixel.
+pl_backing:         resq 1                ; PolyLine draw scratch
+pl_stride:          resd 1
+pl_h:               resd 1
+pl_hw:              resd 1                ; line half-width
+pl_fg:              resd 1
+pl_px:              resd 1                ; previous point
+pl_py:              resd 1
+pls_dx:             resd 1
+pls_dy:             resd 1
+pls_sx:             resd 1
+pls_sy:             resd 1
+pls_err:            resd 1
 win_stk_next:       resd 1               ; monotonic z-order; ++ on each map/raise
 rs_last_stk:        resd 1               ; recomposite: stk of last window drawn
 rs_counter:         resd 1               ; DIAG: recomposite invocation count
@@ -4480,6 +4495,8 @@ dispatch_request:
     je .dr_clear_area
     cmp eax, 62
     je .dr_copy_area
+    cmp eax, 65
+    je .dr_poly_line
     cmp eax, 67
     je .dr_poly_rectangle
     cmp eax, 70
@@ -4779,6 +4796,12 @@ dispatch_request:
     call handle_copy_area
     jmp .dr_done
 
+.dr_poly_line:
+    mov edi, ebx
+    mov rsi, r12
+    mov edx, r13d
+    call handle_poly_line
+    jmp .dr_done
 .dr_poly_rectangle:
     mov rsi, r12
     mov edx, r13d
@@ -9416,6 +9439,7 @@ window_destroy:
     syscall
     pop rbx
 .wd_kill_clear:
+    mov dword [win_bgpix + rbx*4], 0         ; drop bg-pixmap ref (slot reuse)
     mov edi, [r13]                           ; free its property records too:
     call window_props_clear                  ; Xlib XID reuse is deterministic,
                                              ; so stale records would resurrect
@@ -9484,9 +9508,16 @@ apply_cw_values:
     ; draws). None (0) / ParentRelative (1) keep the back_pixel behaviour.
     cmp eax, 1
     jbe .av_advance
+    push rax
     mov rdi, r13
     mov esi, eax
     call window_apply_back_pixmap            ; preserves rbx/r12/r13/r14
+    pop rax
+    mov rcx, r13                             ; record the bg pixmap for ClearArea
+    lea rdx, [windows]
+    sub rcx, rdx
+    shr rcx, 6                               ; slot (WINDOW_REC_SIZE = 64)
+    mov [win_bgpix + rcx*4], eax
     jmp .av_advance
 .av_back_pixel:
     mov [r13 + 44], eax                      ; back_pixel
@@ -17695,8 +17726,13 @@ apply_gc_values:
     je .agv_fg
     cmp r14d, 3
     je .agv_bg
+    cmp r14d, 4
+    je .agv_lw
     cmp r14d, 19
     je .agv_clipmask
+    jmp .agv_adv
+.agv_lw:
+    mov [r13 + 12], eax                      ; line-width
     jmp .agv_adv
 .agv_fg:
     mov [r13 + 4], eax
@@ -19248,6 +19284,220 @@ handle_free_pixmap:
 ; Fills the region in the window's backing with its back_pixel. A w or h
 ; of 0 means "to the edge of the window". No reply.
 ; ----------------------------------------------------------------------------
+; ----------------------------------------------------------------------------
+; poly_plot — edi=x, esi=y. Fill a (2*pl_hw+1)^2 box of pl_fg at (x,y) into
+; pl_backing, clipped to pl_stride x pl_h. Preserves rbx,r12-r15.
+; ----------------------------------------------------------------------------
+poly_plot:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r14d, [pl_hw]
+    mov r15d, [pl_fg]
+    mov r12d, esi
+    sub r12d, r14d                            ; yy
+    mov r13d, esi
+    add r13d, r14d                            ; yy_end
+.pp_y:
+    cmp r12d, r13d
+    jg .pp_out
+    test r12d, r12d
+    js .pp_ynext
+    cmp r12d, [pl_h]
+    jge .pp_out
+    mov eax, r12d
+    imul eax, [pl_stride]
+    mov rbx, [pl_backing]
+    lea rbx, [rbx + rax*4]                    ; row base
+    mov ecx, edi
+    sub ecx, r14d                             ; xx
+    mov edx, edi
+    add edx, r14d                             ; xx_end
+.pp_x:
+    cmp ecx, edx
+    jg .pp_ynext
+    test ecx, ecx
+    js .pp_xnext
+    cmp ecx, [pl_stride]
+    jge .pp_ynext
+    mov [rbx + rcx*4], r15d
+.pp_xnext:
+    inc ecx
+    jmp .pp_x
+.pp_ynext:
+    inc r12d
+    jmp .pp_y
+.pp_out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; poly_line_seg — edi=x0, esi=y0, edx=x1, ecx=y1. Bresenham line, thick via
+; poly_plot. Preserves nothing important (caller-managed).
+; ----------------------------------------------------------------------------
+poly_line_seg:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov r12d, edi                             ; x
+    mov r13d, esi                             ; y
+    mov r14d, edx                             ; x1
+    mov r15d, ecx                             ; y1
+    mov eax, r14d
+    sub eax, r12d
+    mov ebx, 1
+    jns .pls_dxp
+    neg eax
+    mov ebx, -1
+.pls_dxp:
+    mov [pls_dx], eax
+    mov [pls_sx], ebx
+    mov eax, r15d
+    sub eax, r13d
+    mov ebp, 1
+    jns .pls_dyp
+    neg eax
+    mov ebp, -1
+.pls_dyp:
+    neg eax                                   ; dy stored negative
+    mov [pls_dy], eax
+    mov [pls_sy], ebp
+    mov eax, [pls_dx]
+    add eax, [pls_dy]
+    mov [pls_err], eax
+.pls_loop:
+    mov edi, r12d
+    mov esi, r13d
+    call poly_plot
+    cmp r12d, r14d
+    jne .pls_cont
+    cmp r13d, r15d
+    je .pls_out
+.pls_cont:
+    mov ecx, [pls_err]
+    add ecx, ecx                              ; e2
+    cmp ecx, [pls_dy]
+    jl .pls_skipx
+    mov eax, [pls_err]
+    add eax, [pls_dy]
+    mov [pls_err], eax
+    add r12d, [pls_sx]
+.pls_skipx:
+    cmp ecx, [pls_dx]
+    jg .pls_skipy
+    mov eax, [pls_err]
+    add eax, [pls_dx]
+    mov [pls_err], eax
+    add r13d, [pls_sy]
+.pls_skipy:
+    jmp .pls_loop
+.pls_out:
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; handle_poly_line — rsi = req, edx = req bytes. PolyLine (65).
+;   +1 coord-mode  +4 drawable  +8 gc  +12 points (x s16, y s16)...
+; Connected segments into the drawable backing, GC foreground + line-width.
+; ----------------------------------------------------------------------------
+handle_poly_line:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rsi
+    mov r15d, edx
+    mov edi, [rbx + 8]                        ; gc
+    call gc_lookup
+    test rax, rax
+    jz .plr_ret
+    mov ecx, [rax + 4]
+    mov [pl_fg], ecx
+    mov ecx, [rax + 12]                       ; line width (0 -> 1)
+    test ecx, ecx
+    jnz .plr_hw
+    mov ecx, 1
+.plr_hw:
+    shr ecx, 1
+    mov [pl_hw], ecx
+    mov edi, [rbx + 4]                        ; drawable
+    call drawable_get_backing
+    test rax, rax
+    jz .plr_ret
+    mov [pl_backing], rax
+    mov [pl_stride], edx
+    mov [pl_h], ecx
+    mov eax, r15d
+    sub eax, 12
+    jle .plr_ret
+    shr eax, 2                                ; npoints
+    cmp eax, 2
+    jl .plr_dmg
+    mov r12d, eax
+    lea r13, [rbx + 12]
+    movsx eax, word [r13]
+    mov [pl_px], eax
+    movsx eax, word [r13 + 2]
+    mov [pl_py], eax
+    add r13, 4
+    dec r12d
+.plr_seg:
+    test r12d, r12d
+    jz .plr_dmg
+    movsx edx, word [r13]
+    movsx ecx, word [r13 + 2]
+    cmp byte [rbx + 1], 0                     ; CoordMode Previous?
+    je .plr_abs
+    add edx, [pl_px]
+    add ecx, [pl_py]
+.plr_abs:
+    mov edi, [pl_px]
+    mov esi, [pl_py]
+    push rdx
+    push rcx
+    call poly_line_seg
+    pop rcx
+    pop rdx
+    mov [pl_px], edx
+    mov [pl_py], ecx
+    add r13, 4
+    dec r12d
+    jmp .plr_seg
+.plr_dmg:
+    mov byte [comp_dirty], 1
+    mov edi, [rbx + 4]                        ; damage only if a window drawable
+    call window_lookup
+    test rax, rax
+    jz .plr_ret
+    mov rdi, rax
+    xor eax, eax
+    xor edx, edx
+    movzx ecx, word [rdi + 12]
+    movzx r8d, word [rdi + 14]
+    call damage_add_local
+.plr_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 handle_clear_area:
     push rbx
     push r12
@@ -19286,6 +19536,24 @@ handle_clear_area:
     mov [dmg_lat + 4], r8d
     mov [dmg_lat + 8], r9d
     mov [dmg_lat + 12], r10d
+    ; If this window has a CW_BACK_PIXMAP, ClearArea restores that pixmap
+    ; (X semantics: a pixmap background is tiled back in), not a flat fill.
+    ; This is how spot's freehand strokes appear: it draws onto the pixmap
+    ; then ClearArea's the segment box to reveal it. Filling back_pixel
+    ; here (default 0) is what painted the fat BLACK trail.
+    mov rax, r12
+    lea rcx, [windows]
+    sub rax, rcx
+    shr rax, 6                               ; window slot
+    mov eax, [win_bgpix + rax*4]
+    test eax, eax
+    jz .ca_flatfill
+    mov byte [comp_dirty], 1
+    mov rdi, r12
+    mov esi, eax
+    call window_apply_back_pixmap            ; whole-window restore + damage
+    jmp .ca_done
+.ca_flatfill:
     mov rdi, r13
     movzx esi, word [r12 + 40]               ; backing_w (stride)
     movzx edx, word [r12 + 42]               ; backing_h
