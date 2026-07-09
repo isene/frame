@@ -694,6 +694,11 @@ ptr_grab_slot:      resd 1               ; client slot holding the grab — need
                                          ; grabbing client dies
 ptr_grab_xi2:       resb 1               ; grab came from XIGrabDevice → deliver
 kbd_grab_xi2:       resb 1               ; XI2 events to the grabber (GTK menus)
+ptr_grab_implicit:  resb 1               ; grab came from a ButtonPress (X core
+                                         ; implicit grab): motion + release stay
+                                         ; pinned to the press window/client and
+                                         ; the grab auto-releases when the last
+                                         ; button goes up
 xi2_buf:            resb 96              ; XI2 GenericEvent build buffer (84 max)
 wap_best:           resq 1               ; window_at_point: winning record
 wap_abs_x:          resd 1               ; ...and its absolute origin (event
@@ -7821,6 +7826,7 @@ handle_xinput:
     mov [ptr_grab_slot], ebx
     mov dword [ptr_grab_mask], 0xFFFF        ; grab wants everything
     mov byte [ptr_grab_xi2], 1
+    mov byte [ptr_grab_implicit], 0          ; explicit grab overrides implicit
     mov dword [grab_motion_count], 0
     push rax
     CRLOG 'G', al
@@ -9775,6 +9781,21 @@ apply_cw_values:
     jmp .av_advance
 .av_cursor:
     mov [r13 + 60], eax                      ; cursor xid (None = 0 clears)
+    push rax                                 ; DIAG ring: core CWA cursor set
+    push rsi                                 ; ('W', shape or 0xFE=None 0xFF=
+    mov edi, eax                             ; unclassified) — XIChangeCursor
+    mov esi, 0xFE                            ; logs 'X'; this path was blind
+    test edi, edi
+    jz .av_cur_log
+    call cursor_shape_of
+    mov esi, eax
+    cmp eax, -1
+    jne .av_cur_log
+    mov esi, 0xFF
+.av_cur_log:
+    CRLOG 'W', sil
+    pop rsi
+    pop rax
     call cursor_sync                         ; window may be under the pointer
 .av_advance:
     add r12, 4
@@ -12434,6 +12455,7 @@ handle_grab_pointer:
     mov [ptr_grab_mask], eax
     mov [ptr_grab_slot], edi                  ; who holds it (death cleanup)
     mov byte [ptr_grab_xi2], 0                ; core grab → core events
+    mov byte [ptr_grab_implicit], 0          ; explicit grab overrides implicit
     movzx eax, byte [rsi + 1]                 ; owner-events (X: False → all
     mov [ptr_grab_owner], al                  ; events report the grab window)
     mov eax, [rsi + 16]                       ; grab cursor (scrot's crosshair)
@@ -14203,6 +14225,36 @@ deliver_pointer_button:
 .dpb_emit_slot:
     cmp eax, MAX_CLIENTS
     jae .dpb_done
+    ; X core implicit grab: a ButtonPress with no active grab pins the
+    ; pointer stream (motion + release) to THIS window/client until the
+    ; last button is released. FF drag-selection depends on it — without
+    ; the pin each drag motion re-hit-tests, the stream fragments across
+    ; subwindows, and the live highlight only rendered on ~30% of drags.
+    cmp r12d, 4                              ; press only
+    jne .dpb_no_igrab
+    mov ecx, [rbx]
+    mov [ptr_grab_win], ecx
+    mov [ptr_grab_slot], eax
+    mov ecx, [rbx + 24]                      ; event-mask = the window's own
+    mov [ptr_grab_mask], ecx                 ; selection (X spec)
+    mov dword [ptr_grab_cursor], 0
+    mov byte [ptr_grab_implicit], 1
+    ; owner-events True iff OwnerGrabButton selected (X spec) or the press
+    ; goes out as XI2 (XI2 implicit grabs keep normal in-client delivery —
+    ; GTK menus/FF rely on the deep pick staying live during the drag).
+    xor edx, edx
+    test ecx, 0x01000000                     ; OwnerGrabButtonMask
+    setnz dl
+    bt dword [rbx + 52], r12d                ; XI2 press selected?
+    setc cl
+    or dl, cl
+    mov [ptr_grab_owner], dl
+    mov [ptr_grab_xi2], cl                   ; grab format = press format
+    test cl, cl                              ; XI2 press: the core mask may be
+    jz .dpb_no_igrab                         ; 0 (FF selects only XI2) — take
+    mov dword [ptr_grab_mask], 0xFFFF        ; everything so drag motion still
+                                             ; flows when it leaves the window
+.dpb_no_igrab:
     ; Non-grab (focus/point) path: XI2 iff the target window selected it.
     bt dword [rbx + 52], r12d
     jnc .dpb_core
@@ -14224,6 +14276,24 @@ deliver_pointer_button:
     pop r8
     call send_pointer_event
 .dpb_done:
+    ; Implicit grab ends when the last button goes up. button_state still
+    ; carries THIS button's bit (callers update it post-send so 'state'
+    ; reflects the pre-event mask), so mask it out before the zero test.
+    cmp r12d, 5                              ; release?
+    jne .dpb_ret
+    cmp byte [ptr_grab_implicit], 0
+    je .dpb_ret
+    mov ecx, r13d
+    dec ecx
+    mov eax, 0x100
+    shl eax, cl
+    not eax
+    and eax, [button_state]                  ; remaining held buttons
+    jnz .dpb_ret
+    mov dword [ptr_grab_win], 0
+    mov byte [ptr_grab_implicit], 0
+    call cursor_sync                         ; back to the window's cursor
+.dpb_ret:
     pop r13
     pop r12
     pop rbx
