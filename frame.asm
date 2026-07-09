@@ -506,6 +506,26 @@ rs_min_stk:         resd 1               ; recomposite: min stk found this pass
 %define GC_REC_SIZE      16
 gcs:                resb MAX_GCS * GC_REC_SIZE
 
+; GC function (X GX* raster op) per slot — parallel byte table, the
+; 16-byte record is full. Default GXcopy (3). Only GXxor (6) changes
+; behaviour: PolyRectangle on the ROOT with a GXxor GC is the classic
+; rubber-band idiom (scrot -s live selection) and toggles xb_* below
+; instead of touching any backing.
+gc_funcs:           resb MAX_GCS
+
+; XOR rubber band — compositor overlay state. XOR pairs (draw, then
+; identical draw to erase) toggle it; the compositor re-applies the
+; inverted outline after every repaint that intersects it, so the band
+; survives page flips and per-buffer damage repair. Never lands in a
+; backing → GetImage screenshots stay clean.
+xb_on:              resb 1                 ; band visible
+xb_x:               resd 1                 ; path rect (X outline semantics)
+xb_y:               resd 1
+xb_w:               resd 1
+xb_h:               resd 1
+xb_fg:              resd 1                 ; GC fg & 0xFFFFFF (XOR mask)
+xb_lw:              resd 1                 ; line width, clamped 1..8
+
 ; ---- clip rectangles ---------------------------------------------------
 ; GTK partial repaints paint only the damaged rects of a buffer pixmap and
 ; blit its whole bounds with a clip set to the damage region. Ignoring the
@@ -16964,6 +16984,7 @@ recomposite_screen:
     mov ecx, r8d                              ; h
     call bg_fill_rect                         ; wallpaper (or solid) for this rect
     call .rs_window_walk
+    call xor_band_apply                       ; rubber band rides on top
     add rbx, 16
     dec r13d
     jnz .rs_rect_loop
@@ -17025,6 +17046,7 @@ recomposite_screen:
     shr rax, 2
     add [comp_px_fill], rax                   ; PERF counter
     call .rs_window_walk
+    call xor_band_apply                       ; rubber band rides on top
     mov rdi, [drm_dumb_addr]
     mov rcx, [drm_dumb_size]
     add [comp_px_flush], rcx                  ; PERF counter
@@ -18019,6 +18041,7 @@ gc_alloc:
     lea rcx, [gcs]
     sub rax, rcx
     shr rax, 4
+    mov byte [gc_funcs + rax], 3              ; default function = GXcopy
     imul rax, CLIP_ENTRY_SIZE
     lea rcx, [gc_clips]
     mov dword [rcx + rax], 0                  ; count 0 = no clip
@@ -18054,6 +18077,8 @@ apply_gc_values:
     bt ebx, 0
     jnc .agv_skip
     mov eax, [r12]
+    test r14d, r14d
+    jz .agv_func
     cmp r14d, 2
     je .agv_fg
     cmp r14d, 3
@@ -18062,6 +18087,13 @@ apply_gc_values:
     je .agv_lw
     cmp r14d, 19
     je .agv_clipmask
+    jmp .agv_adv
+.agv_func:
+    mov rcx, r13                             ; slot = (rec - gcs) / 16
+    lea rdx, [gcs]
+    sub rcx, rdx
+    shr rcx, 4
+    mov [gc_funcs + rcx], al
     jmp .agv_adv
 .agv_lw:
     mov [r13 + 12], eax                      ; line-width
@@ -20230,6 +20262,24 @@ handle_poly_rectangle:
     mov rbx, rsi                             ; req ptr
     mov [rsp + 0], edx                        ; req bytes
 
+    ; GC first: a GXxor rectangle on the ROOT is the rubber-band idiom
+    ; (scrot -s live selection). It must divert BEFORE the backing lookup
+    ; — the root has no backing, so the old order dropped it silently.
+    mov edi, [rbx + 8]
+    call gc_lookup
+    test rax, rax
+    jz .prr_done
+    mov ebp, [rax + 4]                        ; fg colour
+    mov rcx, rax                             ; slot = (rec - gcs) / 16
+    lea rdx, [gcs]
+    sub rcx, rdx
+    shr rcx, 4
+    cmp byte [gc_funcs + rcx], 6             ; GXxor?
+    jne .prr_backing
+    cmp dword [rbx + 4], X_ROOT_WINDOW
+    je .prr_band
+.prr_backing:
+
     mov edi, [rbx + 4]
     call drawable_get_backing
     test rax, rax
@@ -20237,12 +20287,6 @@ handle_poly_rectangle:
     mov r13, rax                             ; backing
     mov r14d, edx                            ; stride
     mov r15d, ecx                            ; bufh
-
-    mov edi, [rbx + 8]
-    call gc_lookup
-    test rax, rax
-    jz .prr_done
-    mov ebp, [rax + 4]                        ; fg colour
 
     ; rect count = (bytes - 12) / 8
     mov eax, [rsp + 0]
@@ -20288,6 +20332,207 @@ handle_poly_rectangle:
     pop r13
     pop r12
     pop rbx
+    ret
+
+.prr_band:
+    ; GXxor rectangles on root → rubber-band toggles, no backing touched.
+    ; rax = gc record (line width at +12, clamp 1..8; 0 = spec default 1).
+    mov r14d, [rax + 12]
+    test r14d, r14d
+    jg .prr_bw1
+    mov r14d, 1
+.prr_bw1:
+    cmp r14d, 8
+    jle .prr_bw2
+    mov r14d, 8
+.prr_bw2:
+    and ebp, 0x00FFFFFF                      ; fg → RGB-only XOR mask
+    mov eax, [rsp + 0]
+    sub eax, 12
+    jle .prr_done
+    shr eax, 3
+    mov [rsp + 4], eax                        ; remaining rects
+    lea r12, [rbx + 12]
+.prr_band_loop:
+    movsx r8d, word [r12 + 0]                ; x
+    movsx r9d, word [r12 + 2]                ; y
+    movzx r10d, word [r12 + 4]               ; w
+    movzx r11d, word [r12 + 6]               ; h
+    call xor_band_toggle
+    add r12, 8
+    dec dword [rsp + 4]
+    jnz .prr_band_loop
+    jmp .prr_done
+
+; ----------------------------------------------------------------------------
+; xor_band_toggle — one GXxor rectangle on the root.
+;   r8d/r9d/r10d/r11d = x/y/w/h (path rect), ebp = fg & 0xFFFFFF,
+;   r14d = line width (clamped).
+; XOR's self-inverse draw/erase pairs become state: the active band's own
+; rect again → band off; anything else → band (re)set. Either way the
+; affected outline strips are damaged; whether the band is painted there
+; is decided at composite time by xor_band_apply. Preserves r8-r12, rbx,
+; rbp, r14.
+; ----------------------------------------------------------------------------
+xor_band_toggle:
+    cmp byte [xb_on], 0
+    je .xbt_set
+    cmp r8d, [xb_x]
+    jne .xbt_move
+    cmp r9d, [xb_y]
+    jne .xbt_move
+    cmp r10d, [xb_w]
+    jne .xbt_move
+    cmp r11d, [xb_h]
+    jne .xbt_move
+    mov byte [xb_on], 0                      ; erase → old strips repaint clean
+    call xor_band_damage
+    mov byte [comp_dirty], 1
+    ret
+.xbt_move:
+    call xor_band_damage                     ; band moved → old strips repaint
+.xbt_set:
+    mov [xb_x], r8d
+    mov [xb_y], r9d
+    mov [xb_w], r10d
+    mov [xb_h], r11d
+    mov [xb_fg], ebp
+    mov [xb_lw], r14d
+    mov byte [xb_on], 1
+    call xor_band_damage
+    mov byte [comp_dirty], 1
+    ret
+
+; ----------------------------------------------------------------------------
+; xor_band_damage — damage the active band rect's four outline strips
+; (lw thick; overlapping corners are fine, damage is idempotent).
+; Preserves all registers (damage_add does).
+; ----------------------------------------------------------------------------
+xor_band_damage:
+    push rax
+    push rcx
+    push rdx
+    push r8
+    mov eax, [xb_x]                          ; top
+    mov edx, [xb_y]
+    mov ecx, [xb_w]
+    inc ecx
+    mov r8d, [xb_lw]
+    call damage_add
+    add edx, [xb_h]                          ; bottom
+    call damage_add
+    mov edx, [xb_y]                          ; left
+    mov ecx, [xb_lw]
+    mov r8d, [xb_h]
+    inc r8d
+    call damage_add
+    add eax, [xb_w]                          ; right
+    call damage_add
+    pop r8
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; ----------------------------------------------------------------------------
+; xor_band_apply — XOR the active band's outline into the buffer being
+; composited, clipped to bw_clip. Runs after the window walk of every
+; repaint region, so the band sits on top of all windows (the
+; IncludeInferiors look) and re-materializes in both flip buffers as
+; their damage lists are repaired. One byte-compare when no band is
+; active. Clobbers rax rcx rdx rsi rdi r8 r9 r11.
+; ----------------------------------------------------------------------------
+xor_band_apply:
+    cmp byte [xb_on], 0
+    jne .xba_go
+    ret
+.xba_go:
+    push rbx
+    mov ebx, [xb_fg]
+    ; Four DISJOINT strips — corner pixels must be XORed exactly once
+    ; (a double XOR would punch un-inverted notches):
+    ;   top    (x,   y,    w+1, lw)
+    ;   bottom (x,   y+h,  w+1, lw)         only if h >= lw
+    ;   left   (x,   y+lw, lw,  h+1-2*lw)   only if positive
+    ;   right  (x+w, y+lw, lw,  h+1-2*lw)   only if w >= lw
+    mov r8d, [xb_x]
+    mov r9d, [xb_y]
+    mov r10d, [xb_w]
+    inc r10d
+    mov r11d, [xb_lw]
+    call .xba_strip                          ; top
+    mov eax, [xb_h]
+    cmp eax, [xb_lw]
+    jl .xba_sides
+    mov r9d, [xb_y]
+    add r9d, [xb_h]
+    call .xba_strip                          ; bottom
+.xba_sides:
+    mov r11d, [xb_h]
+    inc r11d
+    sub r11d, [xb_lw]
+    sub r11d, [xb_lw]
+    jle .xba_ret
+    mov r9d, [xb_y]
+    add r9d, [xb_lw]
+    mov r10d, [xb_lw]
+    mov r8d, [xb_x]
+    call .xba_strip                          ; left
+    mov eax, [xb_w]
+    cmp eax, [xb_lw]
+    jl .xba_ret
+    add r8d, [xb_w]
+    call .xba_strip                          ; right
+.xba_ret:
+    pop rbx
+    ret
+; local: XOR strip r8d/r9d/r10d/r11d (x,y,w,h) ∩ bw_clip into the
+; composite target. ebx = XOR mask. Preserves r8-r11.
+.xba_strip:
+    push r10
+    mov eax, r8d                             ; x1 = max(x, clip_x1)
+    cmp eax, [bw_clip_x1]
+    jge .xbs_x1
+    mov eax, [bw_clip_x1]
+.xbs_x1:
+    mov edx, r9d                             ; y1 = max(y, clip_y1)
+    cmp edx, [bw_clip_y1]
+    jge .xbs_y1
+    mov edx, [bw_clip_y1]
+.xbs_y1:
+    mov ecx, r8d                             ; x2 = min(x+w, clip_x2)
+    add ecx, r10d
+    cmp ecx, [bw_clip_x2]
+    jle .xbs_x2
+    mov ecx, [bw_clip_x2]
+.xbs_x2:
+    mov esi, r9d                             ; y2 = min(y+h, clip_y2)
+    add esi, r11d
+    cmp esi, [bw_clip_y2]
+    jle .xbs_y2
+    mov esi, [bw_clip_y2]
+.xbs_y2:
+    cmp eax, ecx
+    jge .xbs_ret
+    cmp edx, esi
+    jge .xbs_ret
+    sub ecx, eax                             ; width in px
+.xbs_row:
+    mov edi, edx
+    imul edi, [drm_dumb_pitch]
+    add rdi, [drm_dumb_addr]
+    lea rdi, [rdi + rax*4]
+    mov r10d, ecx
+.xbs_px:
+    xor dword [rdi], ebx
+    add rdi, 4
+    dec r10d
+    jnz .xbs_px
+    inc edx
+    cmp edx, esi
+    jl .xbs_row
+.xbs_ret:
+    pop r10
     ret
 
 ; ============================================================================
