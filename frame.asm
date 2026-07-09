@@ -1163,6 +1163,260 @@ xkb_modmap_blob:
     db 133, 0x40               ; Super_L (Mod4)
     db 134, 0x40               ; Super_R (Mod4)
 XKB_MODMAP_BYTES equ $ - xkb_modmap_blob
+; xkb_std_names — standard XKB key name per X keycode 8..255 (4 bytes each,
+; NUL-padded). Real evdev names where defined (so FreeRDP/xkbfile can map
+; keycode->RDP scancode); unique 'Knnn' fallback elsewhere (xkbcommon needs
+; unique key identifiers). Generated from /usr/share/X11/xkb/keycodes/evdev.
+xkb_std_names:
+    db 75,48,48,56    ; kc 8 
+    db 69,83,67,0    ; kc 9 ESC
+    db 65,69,48,49    ; kc 10 AE01
+    db 65,69,48,50    ; kc 11 AE02
+    db 65,69,48,51    ; kc 12 AE03
+    db 65,69,48,52    ; kc 13 AE04
+    db 65,69,48,53    ; kc 14 AE05
+    db 65,69,48,54    ; kc 15 AE06
+    db 65,69,48,55    ; kc 16 AE07
+    db 65,69,48,56    ; kc 17 AE08
+    db 65,69,48,57    ; kc 18 AE09
+    db 65,69,49,48    ; kc 19 AE10
+    db 65,69,49,49    ; kc 20 AE11
+    db 65,69,49,50    ; kc 21 AE12
+    db 66,75,83,80    ; kc 22 BKSP
+    db 84,65,66,0    ; kc 23 TAB
+    db 65,68,48,49    ; kc 24 AD01
+    db 65,68,48,50    ; kc 25 AD02
+    db 65,68,48,51    ; kc 26 AD03
+    db 65,68,48,52    ; kc 27 AD04
+    db 65,68,48,53    ; kc 28 AD05
+    db 65,68,48,54    ; kc 29 AD06
+    db 65,68,48,55    ; kc 30 AD07
+    db 65,68,48,56    ; kc 31 AD08
+    db 65,68,48,57    ; kc 32 AD09
+    db 65,68,49,48    ; kc 33 AD10
+    db 65,68,49,49    ; kc 34 AD11
+    db 65,68,49,50    ; kc 35 AD12
+    db 82,84,82,78    ; kc 36 RTRN
+    db 76,67,84,76    ; kc 37 LCTL
+    db 65,67,48,49    ; kc 38 AC01
+    db 65,67,48,50    ; kc 39 AC02
+    db 65,67,48,51    ; kc 40 AC03
+    db 65,67,48,52    ; kc 41 AC04
+    db 65,67,48,53    ; kc 42 AC05
+    db 65,67,48,54    ; kc 43 AC06
+    db 65,67,48,55    ; kc 44 AC07
+    db 65,67,48,56    ; kc 45 AC08
+    db 65,67,48,57    ; kc 46 AC09
+    db 65,67,49,48    ; kc 47 AC10
+    db 65,67,49,49    ; kc 48 AC11
+    db 84,76,68,69    ; kc 49 TLDE
+    db 76,70,83,72    ; kc 50 LFSH
+    db 66,75,83,76    ; kc 51 BKSL
+    db 65,66,48,49    ; kc 52 AB01
+    db 65,66,48,50    ; kc 53 AB02
+    db 65,66,48,51    ; kc 54 AB03
+    db 65,66,48,52    ; kc 55 AB04
+    db 65,66,48,53    ; kc 56 AB05
+    db 65,66,48,54    ; kc 57 AB06
+    db 65,66,48,55    ; kc 58 AB07
+    db 65,66,48,56    ; kc 59 AB08
+    db 65,66,48,57    ; kc 60 AB09
+    db 65,66,49,48    ; kc 61 AB10
+    db 82,84,83,72    ; kc 62 RTSH
+    db 75,80,77,85    ; kc 63 KPMU
+    db 76,65,76,84    ; kc 64 LALT
+    db 83,80,67,69    ; kc 65 SPCE
+    db 67,65,80,83    ; kc 66 CAPS
+    db 70,75,48,49    ; kc 67 FK01
+    db 70,75,48,50    ; kc 68 FK02
+    db 70,75,48,51    ; kc 69 FK03
+    db 70,75,48,52    ; kc 70 FK04
+    db 70,75,48,53    ; kc 71 FK05
+    db 70,75,48,54    ; kc 72 FK06
+    db 70,75,48,55    ; kc 73 FK07
+    db 70,75,48,56    ; kc 74 FK08
+    db 70,75,48,57    ; kc 75 FK09
+    db 70,75,49,48    ; kc 76 FK10
+    db 78,77,76,75    ; kc 77 NMLK
+    db 83,67,76,75    ; kc 78 SCLK
+    db 75,80,55,0    ; kc 79 KP7
+    db 75,80,56,0    ; kc 80 KP8
+    db 75,80,57,0    ; kc 81 KP9
+    db 75,80,83,85    ; kc 82 KPSU
+    db 75,80,52,0    ; kc 83 KP4
+    db 75,80,53,0    ; kc 84 KP5
+    db 75,80,54,0    ; kc 85 KP6
+    db 75,80,65,68    ; kc 86 KPAD
+    db 75,80,49,0    ; kc 87 KP1
+    db 75,80,50,0    ; kc 88 KP2
+    db 75,80,51,0    ; kc 89 KP3
+    db 75,80,48,0    ; kc 90 KP0
+    db 75,80,68,76    ; kc 91 KPDL
+    db 76,86,76,51    ; kc 92 LVL3
+    db 90,69,72,65    ; kc 93 ZEHA
+    db 76,83,71,84    ; kc 94 LSGT
+    db 70,75,49,49    ; kc 95 FK11
+    db 70,75,49,50    ; kc 96 FK12
+    db 65,66,49,49    ; kc 97 AB11
+    db 75,65,84,65    ; kc 98 KATA
+    db 72,73,82,65    ; kc 99 HIRA
+    db 72,69,78,75    ; kc 100 HENK
+    db 72,75,84,71    ; kc 101 HKTG
+    db 77,85,72,69    ; kc 102 MUHE
+    db 74,80,67,77    ; kc 103 JPCM
+    db 75,80,69,78    ; kc 104 KPEN
+    db 82,67,84,76    ; kc 105 RCTL
+    db 75,80,68,86    ; kc 106 KPDV
+    db 80,82,83,67    ; kc 107 PRSC
+    db 82,65,76,84    ; kc 108 RALT
+    db 76,78,70,68    ; kc 109 LNFD
+    db 72,79,77,69    ; kc 110 HOME
+    db 85,80,0,0    ; kc 111 UP
+    db 80,71,85,80    ; kc 112 PGUP
+    db 76,69,70,84    ; kc 113 LEFT
+    db 82,71,72,84    ; kc 114 RGHT
+    db 69,78,68,0    ; kc 115 END
+    db 68,79,87,78    ; kc 116 DOWN
+    db 80,71,68,78    ; kc 117 PGDN
+    db 73,78,83,0    ; kc 118 INS
+    db 68,69,76,69    ; kc 119 DELE
+    db 73,49,50,48    ; kc 120 I120
+    db 77,85,84,69    ; kc 121 MUTE
+    db 86,79,76,45    ; kc 122 VOL-
+    db 86,79,76,43    ; kc 123 VOL+
+    db 80,79,87,82    ; kc 124 POWR
+    db 75,80,69,81    ; kc 125 KPEQ
+    db 73,49,50,54    ; kc 126 I126
+    db 80,65,85,83    ; kc 127 PAUS
+    db 73,49,50,56    ; kc 128 I128
+    db 73,49,50,57    ; kc 129 I129
+    db 72,78,71,76    ; kc 130 HNGL
+    db 72,74,67,86    ; kc 131 HJCV
+    db 65,69,49,51    ; kc 132 AE13
+    db 76,87,73,78    ; kc 133 LWIN
+    db 82,87,73,78    ; kc 134 RWIN
+    db 67,79,77,80    ; kc 135 COMP
+    db 83,84,79,80    ; kc 136 STOP
+    db 65,71,65,73    ; kc 137 AGAI
+    db 80,82,79,80    ; kc 138 PROP
+    db 85,78,68,79    ; kc 139 UNDO
+    db 70,82,78,84    ; kc 140 FRNT
+    db 67,79,80,89    ; kc 141 COPY
+    db 79,80,69,78    ; kc 142 OPEN
+    db 80,65,83,84    ; kc 143 PAST
+    db 70,73,78,68    ; kc 144 FIND
+    db 67,85,84,0    ; kc 145 CUT
+    db 72,69,76,80    ; kc 146 HELP
+    db 73,49,52,55    ; kc 147 I147
+    db 73,49,52,56    ; kc 148 I148
+    db 73,49,52,57    ; kc 149 I149
+    db 73,49,53,48    ; kc 150 I150
+    db 73,49,53,49    ; kc 151 I151
+    db 73,49,53,50    ; kc 152 I152
+    db 73,49,53,51    ; kc 153 I153
+    db 73,49,53,52    ; kc 154 I154
+    db 73,49,53,53    ; kc 155 I155
+    db 73,49,53,54    ; kc 156 I156
+    db 73,49,53,55    ; kc 157 I157
+    db 73,49,53,56    ; kc 158 I158
+    db 73,49,53,57    ; kc 159 I159
+    db 73,49,54,48    ; kc 160 I160
+    db 73,49,54,49    ; kc 161 I161
+    db 73,49,54,50    ; kc 162 I162
+    db 73,49,54,51    ; kc 163 I163
+    db 73,49,54,52    ; kc 164 I164
+    db 73,49,54,53    ; kc 165 I165
+    db 73,49,54,54    ; kc 166 I166
+    db 73,49,54,55    ; kc 167 I167
+    db 73,49,54,56    ; kc 168 I168
+    db 73,49,54,57    ; kc 169 I169
+    db 73,49,55,48    ; kc 170 I170
+    db 73,49,55,49    ; kc 171 I171
+    db 73,49,55,50    ; kc 172 I172
+    db 73,49,55,51    ; kc 173 I173
+    db 73,49,55,52    ; kc 174 I174
+    db 73,49,55,53    ; kc 175 I175
+    db 73,49,55,54    ; kc 176 I176
+    db 73,49,55,55    ; kc 177 I177
+    db 73,49,55,56    ; kc 178 I178
+    db 73,49,55,57    ; kc 179 I179
+    db 73,49,56,48    ; kc 180 I180
+    db 73,49,56,49    ; kc 181 I181
+    db 73,49,56,50    ; kc 182 I182
+    db 73,49,56,51    ; kc 183 I183
+    db 73,49,56,52    ; kc 184 I184
+    db 73,49,56,53    ; kc 185 I185
+    db 73,49,56,54    ; kc 186 I186
+    db 73,49,56,55    ; kc 187 I187
+    db 73,49,56,56    ; kc 188 I188
+    db 73,49,56,57    ; kc 189 I189
+    db 73,49,57,48    ; kc 190 I190
+    db 70,75,49,51    ; kc 191 FK13
+    db 70,75,49,52    ; kc 192 FK14
+    db 70,75,49,53    ; kc 193 FK15
+    db 70,75,49,54    ; kc 194 FK16
+    db 70,75,49,55    ; kc 195 FK17
+    db 70,75,49,56    ; kc 196 FK18
+    db 70,75,49,57    ; kc 197 FK19
+    db 70,75,50,48    ; kc 198 FK20
+    db 70,75,50,49    ; kc 199 FK21
+    db 70,75,50,50    ; kc 200 FK22
+    db 70,75,50,51    ; kc 201 FK23
+    db 70,75,50,52    ; kc 202 FK24
+    db 76,86,76,53    ; kc 203 LVL5
+    db 65,76,84,0    ; kc 204 ALT
+    db 77,69,84,65    ; kc 205 META
+    db 83,85,80,82    ; kc 206 SUPR
+    db 72,89,80,82    ; kc 207 HYPR
+    db 73,50,48,56    ; kc 208 I208
+    db 73,50,48,57    ; kc 209 I209
+    db 73,50,49,48    ; kc 210 I210
+    db 73,50,49,49    ; kc 211 I211
+    db 73,50,49,50    ; kc 212 I212
+    db 73,50,49,51    ; kc 213 I213
+    db 73,50,49,52    ; kc 214 I214
+    db 73,50,49,53    ; kc 215 I215
+    db 73,50,49,54    ; kc 216 I216
+    db 73,50,49,55    ; kc 217 I217
+    db 73,50,49,56    ; kc 218 I218
+    db 73,50,49,57    ; kc 219 I219
+    db 73,50,50,48    ; kc 220 I220
+    db 73,50,50,49    ; kc 221 I221
+    db 73,50,50,50    ; kc 222 I222
+    db 73,50,50,51    ; kc 223 I223
+    db 73,50,50,52    ; kc 224 I224
+    db 73,50,50,53    ; kc 225 I225
+    db 73,50,50,54    ; kc 226 I226
+    db 73,50,50,55    ; kc 227 I227
+    db 73,50,50,56    ; kc 228 I228
+    db 73,50,50,57    ; kc 229 I229
+    db 73,50,51,48    ; kc 230 I230
+    db 73,50,51,49    ; kc 231 I231
+    db 73,50,51,50    ; kc 232 I232
+    db 73,50,51,51    ; kc 233 I233
+    db 73,50,51,52    ; kc 234 I234
+    db 73,50,51,53    ; kc 235 I235
+    db 73,50,51,54    ; kc 236 I236
+    db 73,50,51,55    ; kc 237 I237
+    db 73,50,51,56    ; kc 238 I238
+    db 73,50,51,57    ; kc 239 I239
+    db 73,50,52,48    ; kc 240 I240
+    db 73,50,52,49    ; kc 241 I241
+    db 73,50,52,50    ; kc 242 I242
+    db 73,50,52,51    ; kc 243 I243
+    db 73,50,52,52    ; kc 244 I244
+    db 73,50,52,53    ; kc 245 I245
+    db 73,50,52,54    ; kc 246 I246
+    db 73,50,52,55    ; kc 247 I247
+    db 73,50,52,56    ; kc 248 I248
+    db 73,50,52,57    ; kc 249 I249
+    db 73,50,53,48    ; kc 250 I250
+    db 73,50,53,49    ; kc 251 I251
+    db 73,50,53,50    ; kc 252 I252
+    db 73,50,53,51    ; kc 253 I253
+    db 73,50,53,52    ; kc 254 I254
+    db 73,50,53,53    ; kc 255 I255
+XKB_STD_NAMES_BYTES equ $ - xkb_std_names
 dbg_ag_tag:         db 10, "AG: "
 dbg_ag_tag_len      equ $ - dbg_ag_tag
 dbg_sp:             db " "
@@ -6672,29 +6926,14 @@ handle_xkb:
     mov dword [rdi + 0], 0                    ; n_levels_per_type[4] = {0,0,0,0}
     add rdi, 4
     ; (indicatorNames / virtualModNames / groupNames all empty → 0 bytes)
-    ; keyNames: one XkbKeyNameRec ("Knnn") per keycode 8..255
-    mov r14d, X_MIN_KEYCODE
-    mov r12d, KEYCODE_RANGE
-.gn_keyname:
-    mov byte [rdi], 'K'
-    mov eax, r14d
-    xor edx, edx
-    mov ecx, 100
-    div ecx                                  ; al = hundreds
-    add al, '0'
-    mov [rdi + 1], al
-    mov eax, edx
-    xor edx, edx
-    mov ecx, 10
-    div ecx                                  ; al = tens, dl = units
-    add al, '0'
-    mov [rdi + 2], al
-    add dl, '0'
-    mov [rdi + 3], dl
-    add rdi, 4
-    inc r14d
-    dec r12d
-    jnz .gn_keyname
+    ; keyNames: one XkbKeyNameRec per keycode 8..255. Copy the standard XKB
+    ; evdev names ("ESC","AE01","SPCE"…) so keycode→name→RDP-scancode mapping
+    ; works (FreeRDP's load_map_from_xkbfile; else 247 "no RDP scancode" warns
+    ; + dead RDP keyboard). Unnamed keycodes carry a unique "Knnn" in the blob,
+    ; so xkbcommon (which only needs unique key identifiers) still resolves.
+    lea rsi, [xkb_std_names]
+    mov ecx, KEYCODE_RANGE                    ; 248 XkbKeyNameRec (4 bytes each)
+    rep movsd
     ; (keyAliases empty)
     mov r12, rdi                             ; end-of-data ptr
     ; --- header (32 bytes) ---
