@@ -312,6 +312,12 @@ cursor_argb:        resd 1                 ; computed premultiplied interior pix
 cursor_tab:         resb MAX_CURSORS * 8   ; +0 cursor xid, +4 sprite id
 cursor_tab_next:    resd 1                 ; rotating evict index when full
 cur_shape:          resd 1                 ; sprite currently in the BO
+cur_last_vis:       resb 1                 ; last non-blank shape drawn (BSS 0
+                                           ; = arrow). Motion substitutes this
+                                           ; for a lingering typing-blank.
+blank_moved:        resb 1                 ; pointer really moved since the
+                                           ; last EXPLICIT cursor set — gates
+                                           ; the blank→visible substitution
 ; --- cursor/drag diagnostic ring (SIGUSR1 dumps it) -------------------------
 ; 128 x 2-byte entries [tag, val]. Event-driven, written only when the cursor
 ; actually changes or a drag grab ends — a handful of writes per user action,
@@ -7774,7 +7780,7 @@ handle_xinput:
 .xi_chc_log:
     CRLOG 'X', cl
     pop rsi
-    call cursor_sync                         ; may be under the pointer now
+    call cursor_set_sync                     ; may be under the pointer now
 .xi_chc_done:
     ret
 
@@ -7863,7 +7869,7 @@ handle_xinput:
                                              ; (GTK menu-item selection)
     mov eax, [r12 + 12]                      ; XIGrabDevice cursor field
     mov [ptr_grab_cursor], eax
-    call cursor_sync
+    call cursor_set_sync
     movzx eax, word [r12 + 16]               ; re-derive deviceid (clobbered)
     cmp eax, 2
     jbe .xgd_maybe_both                      ; 0/1 = all devices → kbd too
@@ -9824,7 +9830,7 @@ apply_cw_values:
     CRLOG 'W', sil
     pop rsi
     pop rax
-    call cursor_sync                         ; window may be under the pointer
+    call cursor_set_sync                     ; window may be under the pointer
 .av_advance:
     add r12, 4
 .av_skip_bit:
@@ -12518,7 +12524,7 @@ handle_grab_pointer:
     push rbx
     push r12
     mov ebx, edi
-    call cursor_sync
+    call cursor_set_sync
     mov eax, ebx
     call client_meta_addr
     mov r12, rax
@@ -12864,6 +12870,14 @@ dispatch_input_event:
     mov [cursor_y], eax
 .die_motion:
     call cursor_move_hw                      ; move the sprite (one cheap ioctl)
+    ; Real motion un-hides a typing-blanked cursor (cursor_sync substitutes
+    ; the last visible shape once blank_moved is set). One compare when the
+    ; cursor is visible — the common case.
+    cmp dword [cur_shape], CUR_BLANK
+    jne .die_motion_vis
+    mov byte [blank_moved], 1
+    call cursor_sync
+.die_motion_vis:
     call deliver_pointer_motion
     jmp .die_done
 .die_wheel:
@@ -16598,6 +16612,20 @@ cursor_sync:
     xor eax, eax                             ; CUR_ARROW
 .csy_have:
     CRLOG 'S', al
+    ; Hide-while-typing contract: a BLANK resolution is honored only until
+    ; the pointer really moves (blank_moved, stamped in .die_motion) — then
+    ; the last visible shape shows instead, so FF's own un-hide can lag or
+    ; never arrive without stranding an invisible pointer. Every explicit
+    ; cursor set (cursor_set_sync) re-arms the blank.
+    cmp eax, CUR_BLANK
+    jne .csy_vis
+    cmp byte [blank_moved], 0
+    je .csy_apply                            ; fresh blank: honor the hide
+    movzx eax, byte [cur_last_vis]
+    jmp .csy_apply
+.csy_vis:
+    mov [cur_last_vis], al
+.csy_apply:
     cmp eax, [cur_shape]
     je .csy_out
     mov [cur_shape], eax
@@ -16608,6 +16636,15 @@ cursor_sync:
     pop r12
     pop rbx
     ret
+
+; ----------------------------------------------------------------------------
+; cursor_set_sync — cursor_sync for EXPLICIT cursor-set paths (XIChangeCursor,
+; CWA CWCursor, grab cursors): re-arms hide-while-typing first, so a freshly
+; set blank hides the pointer even when it moved since the previous set.
+; ----------------------------------------------------------------------------
+cursor_set_sync:
+    mov byte [blank_moved], 0
+    jmp cursor_sync
 
 ; ----------------------------------------------------------------------------
 ; handle_create_glyph_cursor — CreateGlyphCursor (94). rsi = req:
