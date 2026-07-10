@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.129-blue)
+![Version](https://img.shields.io/badge/version-0.0.130-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -224,6 +224,7 @@ rc convention):
 ```
 keymap = no                # keyboard layout: us (default) or no (Norwegian)
 sensitivity = 75           # pointer speed, percent of raw (default 100)
+dwt = 400                  # ms the touchpad ignores motion+taps after a keystroke (0 = off)
 cursor_color = ffffff      # cursor fill colour, RRGGBB hex (default ffffff)
 cursor_transparency = 50   # cursor % transparent: 0 solid .. 100 invisible (default 50)
 cursor_accent = 00c800     # arrow fill over pressable items, RRGGBB (default green)
@@ -241,6 +242,13 @@ client (glass, xterm, …) picks it up.
 
 `sensitivity`: scales pointer motion (touchpad + mouse) by this percent.
 `100` is raw 1:1; lower values slow the cursor for finer control.
+
+`dwt` (disable-while-typing / palm rejection): after any non-modifier
+keystroke the touchpad ignores motion and taps for this many ms, and a
+touch that *begins* inside that window stays ignored until the finger
+lifts — a palm resting on the pad can't steer or click, even after you
+stop typing. Modifier-only presses (Ctrl+click, Mod4+drag) don't mute,
+and physical clickpad button presses always work. `0` disables.
 
 `cursor_color` / `cursor_transparency`: the arrow's interior fill and how
 see-through it is. The black outline is always kept for contrast. Colour

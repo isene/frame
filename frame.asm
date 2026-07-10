@@ -290,6 +290,13 @@ display_num:        resq 1
 keymap_is_no:       resb 1                 ; ~/.framerc keymap=no → Norwegian
 pending_vt:         resd 1                 ; Ctrl+Alt+Fn target VT for switch_vt
 mouse_sens:         resd 1                 ; pointer sensitivity %, ~/.framerc (def 100)
+; ---- disable-while-typing (framerc dwt = <ms>, 0 = off, default 400) ------
+; Palm rejection: touchpad motion and taps are muted for cfg_dwt_ms after any
+; non-modifier keystroke, and a touch that BEGINS inside that window stays
+; muted until the finger lifts. Physical clickpad button presses still work.
+cfg_dwt_ms:         resd 1                 ; mute window in ms (0 disables)
+dwt_last_key_ms:    resd 1                 ; server_time_ms of last typing key
+dwt_touch_dead:     resd 1                 ; current touch began while typing
 cursor_rgb:         resd 1                 ; cursor fill colour 0xRRGGBB (def white)
 cursor_transp:      resd 1                 ; cursor % transparent (def 50)
 cursor_argb:        resd 1                 ; computed premultiplied interior pixel
@@ -11342,6 +11349,7 @@ read_framerc:
     mov dword [cursor_rgb], 0xFFFFFF
     mov dword [cursor_transp], 50
     mov dword [cfg_cursor_accent], 0xFF00C800 ; pressable-item arrow fill (green)
+    mov dword [cfg_dwt_ms], 400               ; disable-while-typing window (ms)
     ; --- locate HOME in envp ---
     mov rsi, [envp]
     test rsi, rsi
@@ -11573,15 +11581,25 @@ parse_framerc:
     ; sensitivity = N ?
     mov eax, [rsi]
     cmp eax, 'sens'
-    jne .pf_chk_cursor
+    jne .pf_chk_dwt
     mov ax, [rsi + 4]
     cmp ax, 'it'
-    jne .pf_chk_cursor
+    jne .pf_chk_dwt
     call pf_to_value
     call pf_parse_dec
     test eax, eax
     jz .pf_next_line                          ; ignore 0 — would freeze the pointer
     mov [mouse_sens], eax
+    jmp .pf_next_line
+.pf_chk_dwt:
+    ; dwt = N (ms the touchpad stays muted after a keystroke; 0 = off)
+    cmp word [rsi], 'dw'
+    jne .pf_chk_cursor
+    cmp byte [rsi + 2], 't'
+    jne .pf_chk_cursor
+    call pf_to_value
+    call pf_parse_dec
+    mov [cfg_dwt_ms], eax
     jmp .pf_next_line
 .pf_chk_cursor:
     ; cursor_color = RRGGBB / cursor_transparency = N / cursor_accent = RRGGBB
@@ -12661,6 +12679,13 @@ dispatch_input_event:
     je .die_mod4
     cmp r12d, 126
     je .die_mod4
+    ; Non-modifier key press/repeat: stamp the typing clock. Modifiers are
+    ; exempt (Ctrl+click / Mod4+drag must not mute the pad), releases don't
+    ; extend the mute.
+    test r13d, r13d
+    jz .die_check_grab
+    mov eax, [server_time_ms]
+    mov [dwt_last_key_ms], eax
     jmp .die_check_grab
 
 .die_ctrl:
@@ -12887,6 +12912,19 @@ dispatch_input_event:
     mov eax, edx
     sub eax, [abs_last_x]                     ; delta (1x sensitivity)
     mov [abs_last_x], edx
+    ; Disable-while-typing: dead touch, or any touch inside the typing
+    ; window, moves nothing. The anchor above still updates every event, so
+    ; motion resumes without a cursor jump when the mute lifts.
+    cmp dword [dwt_touch_dead], 0
+    jne .die_done
+    mov ecx, [cfg_dwt_ms]
+    test ecx, ecx
+    jz .die_abs_x_live
+    mov r8d, [server_time_ms]
+    sub r8d, [dwt_last_key_ms]
+    cmp r8d, ecx
+    jb .die_done
+.die_abs_x_live:
     ; tap_moved += |delta|
     mov r8d, eax
     mov r9d, r8d
@@ -12918,6 +12956,16 @@ dispatch_input_event:
     mov eax, edx
     sub eax, [abs_last_y]
     mov [abs_last_y], edx
+    cmp dword [dwt_touch_dead], 0             ; disable-while-typing (see X path)
+    jne .die_done
+    mov ecx, [cfg_dwt_ms]
+    test ecx, ecx
+    jz .die_abs_y_live
+    mov r8d, [server_time_ms]
+    sub r8d, [dwt_last_key_ms]
+    cmp r8d, ecx
+    jb .die_done
+.die_abs_y_live:
     mov r8d, eax
     mov r9d, r8d
     sar r9d, 31
@@ -13084,6 +13132,18 @@ dispatch_input_event:
     mov dword [abs_have_y], 0
     test r13d, r13d
     jz .die_touch_up
+    ; Finger down while typing → the whole touch is dead (a palm landing on
+    ; the pad); it stays muted until lift even after the window expires.
+    mov dword [dwt_touch_dead], 0
+    mov eax, [cfg_dwt_ms]
+    test eax, eax
+    jz .die_touch_alive
+    mov ecx, [server_time_ms]
+    sub ecx, [dwt_last_key_ms]
+    cmp ecx, eax
+    jae .die_touch_alive
+    mov dword [dwt_touch_dead], 1
+.die_touch_alive:
     ; Finger down: start tap tracking (timestamp + movement reset).
     mov rax, [rbx + 0]
     mov [tap_sec], rax
@@ -13094,6 +13154,11 @@ dispatch_input_event:
     jmp .die_done
 .die_touch_up:
     mov dword [finger_count], 0
+    cmp dword [dwt_touch_dead], 0             ; dead touch: no tap click
+    je .die_tap_check
+    mov dword [dwt_touch_dead], 0
+    jmp .die_done
+.die_tap_check:
     ; Tap = quick (<250ms) release with little movement → synthesize a click.
     mov rax, [rbx + 0]
     sub rax, [tap_sec]
