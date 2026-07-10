@@ -207,6 +207,7 @@ DEFAULT REL
 %define EM_PROPERTY_CHANGE       0x00400000
 %define EM_SUBSTRUCTURE_NOTIFY    0x00080000
 %define EM_SUBSTRUCTURE_REDIRECT  0x00100000
+%define EM_VISIBILITY_CHANGE      0x00010000
 
 ; ConfigureWindow value-mask bits.
 %define CFG_X                0x01
@@ -10220,6 +10221,22 @@ handle_map_window:
     mov rsi, r12                                ; window record
     call send_configure_notify
 .mw_check_sub:
+    ; Newly viewable + VisibilityChangeMask → VisibilityNotify(Unobscured)
+    ; to the owner. Spec order on map: MapNotify, Visibility, Expose.
+    ; xfreerdp3 BLOCKS in XMaskEvent for exactly this after XMapWindow.
+    test dword [r12 + 24], EM_VISIBILITY_CHANGE
+    jz .mw_no_vis
+    mov eax, [r12]
+    cmp eax, X_RID_BASE
+    jb .mw_no_vis
+    sub eax, X_RID_BASE
+    shr eax, 21
+    cmp eax, MAX_CLIENTS
+    jae .mw_no_vis
+    mov edi, eax                                ; owner slot
+    mov esi, [r12]                              ; window
+    call send_visibility_notify
+.mw_no_vis:
     ; Newly viewable + ExposureMask selected → the window's owner gets a
     ; full-window Expose (X semantics: paint now). scrot -s re-maps its
     ; shaped overlay and BLOCKS waiting for exactly this event.
@@ -13207,6 +13224,41 @@ send_expose:
     pop r15
     pop r14
     pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; send_visibility_notify — edi = client slot, esi = window xid. Emits a
+; 32-byte VisibilityNotify (code 15) with state Unobscured (0). Sent on
+; map to VisibilityChangeMask selectors: xfreerdp3's xf_CreateDesktopWindow
+; hard-BLOCKS in XMaskEvent right after XMapWindow until this arrives —
+; without it the whole RDP client wedges (black window, server times the
+; connection out). Occlusion changes are not tracked (compositor keeps
+; every mapped window's content anyway); Unobscured-on-map is what
+; blocking clients need.
+; ----------------------------------------------------------------------------
+send_visibility_notify:
+    push rbx
+    push r12
+    mov r12d, esi                            ; xid
+    mov eax, edi                             ; slot
+    call client_meta_addr                    ; rax = meta (+0 fd, +8 seq)
+    mov rbx, rax
+    lea rsi, [reply_buf]
+    xor eax, eax
+    mov [rsi + 0], rax
+    mov [rsi + 8], rax
+    mov [rsi + 16], rax
+    mov [rsi + 24], rax
+    mov byte [rsi + 0], 15                    ; VisibilityNotify
+    mov eax, [rbx + 8]
+    mov [rsi + 2], ax                         ; seq
+    mov [rsi + 4], r12d                       ; window
+    ; +8 state = 0 (Unobscured) — already zeroed
+    mov edi, [rbx]                            ; fd
+    mov edx, 32
+    EV_SEND
     pop r12
     pop rbx
     ret
