@@ -22411,6 +22411,83 @@ render_trapezoids:
 ; ============================================================================
 
 ; ----------------------------------------------------------------------------
+; glyph_evict_gsid — edi = gsid. Remove every glyph_recs entry with this
+; gsid, compacting BOTH the record array and the bitmap pool (pool bytes
+; reclaimed). Cold path (CreateGlyphSet only).
+;
+; Why: glyph records are never otherwise reclaimed. A client that dies or
+; re-creates a glyphset leaves its glyphs behind; when the XID is reused
+; (client-slot reuse gives a new glass the same glyphset XID, or a resize
+; re-creates one) glyph_find — first (gsid,glyphid) match wins — returns the
+; STALE glyph, at the previous owner's size/stride, and the new glass renders
+; scrambled text until frame restarts. Evicting on (re)create keeps one live
+; set per XID, which also bounds pool + table growth across a long session.
+;
+;   ebx=read idx  r12d=write idx  r13d=pool write off  r14d=gsid
+; ----------------------------------------------------------------------------
+glyph_evict_gsid:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r14d, edi
+    xor ebx, ebx                             ; read i
+    xor r12d, r12d                           ; write w
+    xor r13d, r13d                           ; pool write offset
+.gev_loop:
+    cmp ebx, [glyph_count]
+    jge .gev_commit
+    mov eax, ebx
+    imul eax, GLYPH_REC_SIZE
+    lea r10, [glyph_recs + rax]              ; src rec
+    cmp [r10 + 0], r14d
+    je .gev_next                             ; matches gsid → evict (skip)
+    ; survivor: bitmap size = stride(+24 u16) * height(+10 u16)
+    movzx eax, word [r10 + 24]
+    movzx edx, word [r10 + 10]
+    imul eax, edx
+    mov r11d, eax                            ; size
+    mov r8d, [r10 + 20]                      ; old bitmap_off
+    cmp r13d, r8d
+    je .gev_rec                              ; already in place
+    push rsi
+    push rdi
+    push rcx
+    lea rdi, [glyph_pool + r13]              ; dst ≤ src → forward copy safe
+    lea rsi, [glyph_pool + r8]
+    mov ecx, r11d
+    rep movsb
+    pop rcx
+    pop rdi
+    pop rsi
+.gev_rec:
+    mov eax, r12d
+    imul eax, GLYPH_REC_SIZE
+    lea r9, [glyph_recs + rax]               ; dst rec (w ≤ i → dst ≤ src)
+    mov rax, [r10 + 0]
+    mov [r9 + 0], rax
+    mov rax, [r10 + 8]
+    mov [r9 + 8], rax
+    mov rax, [r10 + 16]
+    mov [r9 + 16], rax
+    mov rax, [r10 + 24]
+    mov [r9 + 24], rax
+    mov [r9 + 20], r13d                      ; relocated bitmap_off
+    add r13d, r11d
+    inc r12d
+.gev_next:
+    inc ebx
+    jmp .gev_loop
+.gev_commit:
+    mov [glyph_count], r12d
+    mov [glyph_pool_used], r13d
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
 ; render_create_glyphset — rdi = req ptr (+4 gsid, +8 format). No reply.
 ; ----------------------------------------------------------------------------
 render_create_glyphset:
@@ -22418,18 +22495,37 @@ render_create_glyphset:
     mov ecx, [rdi + 4]                        ; gsid
     test ecx, ecx
     jz .cgs_done
+    ; Purge any stale records under this XID first (see glyph_evict_gsid).
+    push rdi
+    mov edi, ecx
+    call glyph_evict_gsid
+    pop rdi
+    mov ecx, [rdi + 4]                        ; reload gsid
     mov edx, [rdi + 8]                        ; format
     xor ebx, ebx
+    mov r8d, -1                               ; first empty slot seen
 .cgs_find:
     cmp ebx, MAX_GLYPHSETS
-    jge .cgs_done
+    jge .cgs_use_empty
     mov rax, rbx
     imul rax, GLYPHSET_REC
     lea rax, [glyphsets + rax]
+    cmp dword [rax], ecx
+    je .cgs_take                             ; reuse this XID's existing slot
     cmp dword [rax], 0
-    je .cgs_take
+    jne .cgs_next
+    cmp r8d, -1                              ; remember first empty
+    jne .cgs_next
+    mov r8d, ebx
+.cgs_next:
     inc ebx
     jmp .cgs_find
+.cgs_use_empty:
+    cmp r8d, -1
+    je .cgs_done                             ; table full → drop (bounded now)
+    mov eax, r8d
+    imul eax, GLYPHSET_REC
+    lea rax, [glyphsets + rax]
 .cgs_take:
     mov [rax + 0], ecx
     mov [rax + 4], edx
@@ -22438,12 +22534,16 @@ render_create_glyphset:
     ret
 
 ; ----------------------------------------------------------------------------
-; render_free_glyphset — rdi = req ptr (+4 glyphset). Clears the set entry.
-; (Glyph bitmaps stay in the pool; acceptable for a session.)
+; render_free_glyphset — rdi = req ptr (+4 glyphset). Clears the set entry
+; and reclaims its glyph records + pool bytes (glyph_evict_gsid).
 ; ----------------------------------------------------------------------------
 render_free_glyphset:
     push rbx
     mov ecx, [rdi + 4]
+    push rcx
+    mov edi, ecx
+    call glyph_evict_gsid
+    pop rcx
     xor ebx, ebx
 .fgs_find:
     cmp ebx, MAX_GLYPHSETS
