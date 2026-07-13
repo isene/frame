@@ -109,6 +109,8 @@ DEFAULT REL
 %define DRM_MODE_CURSOR_BO             0x01
 %define DRM_MODE_CURSOR_MOVE           0x02
 %define DRM_IOCTL_MODE_DESTROY_DUMB    0xC00464B4
+%define DRM_IOCTL_MODE_SETGAMMA        0xC02064A5   ; _IOWR('d',0xA5,drm_mode_crtc_lut)
+%define GAMMA_MAX                      1024         ; ramp buffer cap (i915 = 256)
 
 %define SYS_POLL        7
 %define SYS_MMAP        9
@@ -385,6 +387,19 @@ blank_crtc_cmd:     resb 104               ; zeroed SETCRTC = CRTC off
 cfg_blankkey_sym:   resd 1                 ; blank_key keysym (0 = none)
 cfg_blankkey_mods:  resb 1                 ; blank_key required mod_state
 blank_kc:           resd 1                 ; blank_key resolved X keycode
+; ---- gamma / color temperature (Mod4+Alt+n night, Mod4+Alt+b sunlight) ----
+; SETGAMMA on the CRTC(s): night-light warms (blue/green down), sunlight
+; steepens contrast. Per-channel LUT at scanout — zero per-pixel CPU, one
+; ioctl per toggle. framerc `nightlight`/`sunlight` set the strengths.
+gamma_mode:         resd 1                 ; 0 off, 1 night, 2 sunlight
+gamma_size:         resd 1                 ; CRTC LUT length (from GETCRTC)
+cfg_nightlight:     resd 1                 ; warmth strength 0..100
+cfg_sunlight:       resd 1                 ; contrast strength 0..100
+gamma_lut:          resb 32                ; struct drm_mode_crtc_lut
+    alignb 2
+gamma_r:            resw GAMMA_MAX
+gamma_g:            resw GAMMA_MAX
+gamma_b:            resw GAMMA_MAX
 bws_clip_save:      resd 4                 ; blit_window_shaped clip save
 bws_abs_x:          resd 1
 bws_abs_y:          resd 1
@@ -11362,6 +11377,8 @@ read_framerc:
     mov dword [cursor_transp], 50
     mov dword [cfg_cursor_accent], 0xFF00C800 ; pressable-item arrow fill (green)
     mov dword [cfg_dwt_ms], 400               ; disable-while-typing window (ms)
+    mov dword [cfg_nightlight], 60            ; night-light warmth strength
+    mov dword [cfg_sunlight], 40              ; sunlight contrast strength
     ; --- locate HOME in envp ---
     mov rsi, [envp]
     test rsi, rsi
@@ -11606,12 +11623,38 @@ parse_framerc:
 .pf_chk_dwt:
     ; dwt = N (ms the touchpad stays muted after a keystroke; 0 = off)
     cmp word [rsi], 'dw'
-    jne .pf_chk_cursor
+    jne .pf_chk_night
     cmp byte [rsi + 2], 't'
-    jne .pf_chk_cursor
+    jne .pf_chk_night
     call pf_to_value
     call pf_parse_dec
     mov [cfg_dwt_ms], eax
+    jmp .pf_next_line
+.pf_chk_night:
+    ; nightlight = N (warmth strength 0..100 for Mod4+Alt+n)
+    mov eax, [rsi]
+    cmp eax, 'nigh'
+    jne .pf_chk_sun
+    call pf_to_value
+    call pf_parse_dec
+    cmp eax, 100
+    jbe .pf_night_ok
+    mov eax, 100
+.pf_night_ok:
+    mov [cfg_nightlight], eax
+    jmp .pf_next_line
+.pf_chk_sun:
+    ; sunlight = N (contrast strength 0..100 for Mod4+Alt+b)
+    mov eax, [rsi]
+    cmp eax, 'sunl'
+    jne .pf_chk_cursor
+    call pf_to_value
+    call pf_parse_dec
+    cmp eax, 100
+    jbe .pf_sun_ok
+    mov eax, 100
+.pf_sun_ok:
+    mov [cfg_sunlight], eax
     jmp .pf_next_line
 .pf_chk_cursor:
     ; cursor_color = RRGGBB / cursor_transparency = N / cursor_accent = RRGGBB
@@ -12800,6 +12843,31 @@ dispatch_input_event:
     call comp_blank
     jmp .die_done
 .die_no_blankkey:
+
+    ; frame gamma hotkeys: Mod4+Alt (0x48) + n = night-light, + b = sunlight.
+    ; Server-level like blank_key — swallowed, never reach clients. r12d is
+    ; the X keycode (evdev+8): 'b'=56, 'n'=57.
+    movzx eax, byte [mod_state]
+    cmp al, MOD_MOD4 | MOD_MOD1
+    jne .die_no_gammakey
+    cmp r12d, 57                             ; 'n'
+    je .die_gamma_night
+    cmp r12d, 56                             ; 'b'
+    je .die_gamma_sun
+    jmp .die_no_gammakey
+.die_gamma_night:
+    cmp r13d, 1
+    jne .die_done                            ; swallow repeat/release
+    mov edi, 1
+    call gamma_toggle
+    jmp .die_done
+.die_gamma_sun:
+    cmp r13d, 1
+    jne .die_done
+    mov edi, 2
+    call gamma_toggle
+    jmp .die_done
+.die_no_gammakey:
 
     ; Release (value 0) → KeyRelease to the focused window.
     cmp r13d, 0
@@ -17664,6 +17732,168 @@ bg_fill_rect:
 ; ----------------------------------------------------------------------------
 ; now_mono_ms — rax = CLOCK_MONOTONIC in milliseconds.
 ; ----------------------------------------------------------------------------
+; ----------------------------------------------------------------------------
+; gamma_toggle — edi = target mode (1 night, 2 sunlight). If already in that
+; mode, turns OFF (mode 0 = identity restored); else switches to it. Then
+; rebuilds the LUT and pushes it to the CRTC(s).
+; ----------------------------------------------------------------------------
+gamma_toggle:
+    cmp [gamma_mode], edi
+    jne .gt_set
+    xor edi, edi                             ; same mode pressed → off
+.gt_set:
+    mov [gamma_mode], edi
+    ; fall through to apply_gamma
+
+; ----------------------------------------------------------------------------
+; apply_gamma — build red/green/blue LUTs for [gamma_mode] and SETGAMMA the
+; primary (and external, if active) CRTC. gamma_size comes from GETCRTC;
+; 0 = driver has no LUT → no-op. Integer math only.
+;   ebx=i  r12d=n  r13d=denom(n-1)  r14d=blue factor%  r15d=green factor%
+; ----------------------------------------------------------------------------
+apply_gamma:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12d, [gamma_size]
+    test r12d, r12d
+    jnz .ag_have_size
+    ; not fetched yet (first use): pull from the saved CRTC state.
+    mov r12d, [drm_crtc_save + 28]
+    test r12d, r12d
+    jz .ag_ret                               ; no gamma support
+    cmp r12d, GAMMA_MAX
+    jbe .ag_clamp_ok
+    mov r12d, GAMMA_MAX
+.ag_clamp_ok:
+    mov [gamma_size], r12d
+.ag_have_size:
+    mov r13d, r12d
+    dec r13d                                 ; denom = n-1
+    jnz .ag_denom_ok
+    mov r13d, 1                               ; guard (n==1)
+.ag_denom_ok:
+    ; Precompute night factors (blue = 100 - s*0.6, green = 100 - s*0.3).
+    mov eax, [cfg_nightlight]
+    imul eax, eax, 6
+    xor edx, edx
+    mov ecx, 10
+    div ecx                                  ; eax = s*6/10
+    mov r14d, 100
+    sub r14d, eax                            ; blue factor
+    jns .ag_bf_ok
+    xor r14d, r14d
+.ag_bf_ok:
+    mov eax, [cfg_nightlight]
+    imul eax, eax, 3
+    xor edx, edx
+    mov ecx, 10
+    div ecx                                  ; s*3/10
+    mov r15d, 100
+    sub r15d, eax                            ; green factor
+    jns .ag_gf_ok
+    xor r15d, r15d
+.ag_gf_ok:
+    xor ebx, ebx                             ; i = 0
+.ag_loop:
+    cmp ebx, r12d
+    jge .ag_upload
+    ; base = i * 65535 / denom  (identity value, 0..65535)
+    mov eax, ebx
+    imul eax, 65535
+    xor edx, edx
+    div r13d                                 ; eax = base
+    ; dispatch by mode
+    cmp dword [gamma_mode], 1
+    je .ag_night
+    cmp dword [gamma_mode], 2
+    je .ag_sun
+    ; mode 0: identity, all channels = base
+    mov [gamma_r + rbx*2], ax
+    mov [gamma_g + rbx*2], ax
+    mov [gamma_b + rbx*2], ax
+    jmp .ag_next
+.ag_night:
+    mov [gamma_r + rbx*2], ax                ; red unchanged
+    push rax
+    imul eax, r15d                           ; base * green%
+    xor edx, edx
+    mov ecx, 100
+    div ecx
+    mov [gamma_g + rbx*2], ax
+    pop rax
+    imul eax, r14d                           ; base * blue%
+    xor edx, edx
+    mov ecx, 100
+    div ecx
+    mov [gamma_b + rbx*2], ax
+    jmp .ag_next
+.ag_sun:
+    ; contrast: v = clamp( (base-32768)*k/100 + 32768 ), k = 100 + strength
+    mov ecx, [cfg_sunlight]
+    add ecx, 100                             ; k
+    mov eax, ebx                             ; recompute base (edx clobbered)
+    imul eax, 65535
+    xor edx, edx
+    div r13d
+    sub eax, 32768                           ; centre (signed)
+    imul eax, ecx                            ; * k
+    mov ecx, 100
+    cdq
+    idiv ecx                                 ; /100 (signed)
+    add eax, 32768
+    ; clamp 0..65535
+    test eax, eax
+    jns .ag_sun_lo
+    xor eax, eax
+.ag_sun_lo:
+    cmp eax, 65535
+    jle .ag_sun_hi
+    mov eax, 65535
+.ag_sun_hi:
+    mov [gamma_r + rbx*2], ax
+    mov [gamma_g + rbx*2], ax
+    mov [gamma_b + rbx*2], ax
+.ag_next:
+    inc ebx
+    jmp .ag_loop
+.ag_upload:
+    ; SETGAMMA on the primary CRTC.
+    mov eax, [drm_chosen_crtc]
+    mov [gamma_lut + 0], eax
+    mov eax, [gamma_size]
+    mov [gamma_lut + 4], eax
+    lea rax, [gamma_r]
+    mov [gamma_lut + 8], rax
+    lea rax, [gamma_g]
+    mov [gamma_lut + 16], rax
+    lea rax, [gamma_b]
+    mov [gamma_lut + 24], rax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_SETGAMMA
+    lea rdx, [gamma_lut]
+    syscall
+    ; External output shares the same LUT.
+    cmp byte [ext_active], 0
+    je .ag_ret
+    mov eax, [ext_crtc]
+    mov [gamma_lut + 0], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_SETGAMMA
+    lea rdx, [gamma_lut]
+    syscall
+.ag_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 now_mono_ms:
     push rcx
     mov rax, SYS_CLOCK_GETTIME

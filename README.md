@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.133-blue)
+![Version](https://img.shields.io/badge/version-0.0.134-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -225,6 +225,8 @@ rc convention):
 keymap = no                # keyboard layout: us (default) or no (Norwegian)
 sensitivity = 75           # pointer speed, percent of raw (default 100)
 dwt = 400                  # ms the touchpad ignores motion+taps after a keystroke (0 = off)
+nightlight = 60            # Mod4+Alt+n warmth strength 0..100 (default 60)
+sunlight = 40              # Mod4+Alt+b contrast strength 0..100 (default 40)
 cursor_color = ffffff      # cursor fill colour, RRGGBB hex (default ffffff)
 cursor_transparency = 50   # cursor % transparent: 0 solid .. 100 invisible (default 50)
 cursor_accent = 00c800     # arrow fill over pressable items, RRGGBB (default green)
@@ -249,6 +251,13 @@ touch that *begins* inside that window stays ignored until the finger
 lifts — a palm resting on the pad can't steer or click, even after you
 stop typing. Modifier-only presses (Ctrl+click, Mod4+drag) don't mute,
 and physical clickpad button presses always work. `0` disables.
+
+`nightlight` / `sunlight`: colour-temperature presets applied through the
+CRTC gamma LUT — one ioctl at scanout, zero per-pixel CPU. **`Mod4+Alt+n`**
+toggles night-light (warms the screen: blue and green pulled down by the
+`nightlight` strength); **`Mod4+Alt+b`** toggles sunlight mode (steepens
+contrast by the `sunlight` strength for reading in bright light). Press the
+same combo again to return to normal. Both strengths are `0..100`.
 
 `cursor_color` / `cursor_transparency`: the arrow's interior fill and how
 see-through it is. The black outline is always kept for contrast. Colour
