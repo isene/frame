@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.135-blue)
+![Version](https://img.shields.io/badge/version-0.0.136-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -228,6 +228,7 @@ dwt = 400                  # ms the touchpad ignores motion+taps after a keystro
 nightlight = 60            # Mod4+Alt+n warmth strength 0..100 (default 60)
 sunlight = 40              # Mod4+Alt+b contrast strength 0..100 (default 40)
 shake_find = 1             # wiggle the pointer to briefly enlarge it (0 = off)
+magnify = 2               # Mod4+Alt+z magnifier lens zoom factor 2..8 (default 2)
 cursor_color = ffffff      # cursor fill colour, RRGGBB hex (default ffffff)
 cursor_transparency = 50   # cursor % transparent: 0 solid .. 100 invisible (default 50)
 cursor_accent = 00c800     # arrow fill over pressable items, RRGGBB (default green)
@@ -264,6 +265,12 @@ same combo again to return to normal. Both strengths are `0..100`.
 grows (3x), so a lost cursor is easy to spot, then shrinks back on its own.
 Pure gesture, no key. Detection is a few compares per motion event and
 nothing at all when idle. `0` disables.
+
+`magnify` / **`Mod4+Alt+z`**: a magnifier lens that follows the cursor,
+showing the area under it enlarged by the `magnify` factor (2..8). Toggle
+again to hide. It's drawn as a compositor overlay — moving it just damages
+the old and new rects, so the desktop under it restores for free with no
+backing store. Runs only while the lens is up; off costs one compare.
 
 `cursor_color` / `cursor_transparency`: the arrow's interior fill and how
 see-through it is. The black outline is always kept for contrast. Colour

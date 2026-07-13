@@ -341,6 +341,26 @@ cur_hot_y:          resd 1
 ; (no timer). framerc `shake_find = 0` disables. All state event-driven.
 cur_scale:          resd 1                 ; arrow draw scale (1 = normal)
 cfg_shake_find:     resd 1                 ; 0 = off
+; ---- magnifier lens (Mod4+Alt+z): a zoom window that follows the cursor ----
+; Drawn as a post-window-walk overlay into the composited buffer. Moving it
+; damages the old + new rects; the compositor's own damage repaint restores
+; what was under the old position, so no backing store. framerc `magnify` =
+; zoom factor. LENS_W/LENS_H are the on-screen lens size.
+%define LENS_W 480
+%define LENS_H 320
+lens_active:        resd 1                 ; 1 = lens visible
+cfg_magnify:        resd 1                 ; zoom factor (2..8)
+lens_prev_x:        resd 1                 ; last lens top-left (for restore)
+lens_prev_y:        resd 1
+lens_prev_valid:    resb 1
+    alignb 4
+lens_sw:            resd 1                 ; lens_draw scratch (source dims/origin)
+lens_sh:            resd 1
+lens_sx:            resd 1
+lens_sy:            resd 1
+lens_lx:            resd 1                 ; lens rect top-left (may be negative)
+lens_ly:            resd 1
+lens_temp:          resb 240*160*4         ; source snapshot (max at zoom 2)
 shake_last_x:       resd 1                 ; cursor_x at last motion sample
 shake_dir:          resd 1                 ; last horizontal dir (-1/0/+1)
 shake_count:        resd 1                 ; reversals in the current burst
@@ -11393,6 +11413,7 @@ read_framerc:
     mov dword [cfg_sunlight], 40              ; sunlight contrast strength
     mov dword [cur_scale], 1                  ; cursor normal size
     mov dword [cfg_shake_find], 1             ; shake-to-find on by default
+    mov dword [cfg_magnify], 2                ; magnifier zoom factor
     ; --- locate HOME in envp ---
     mov rsi, [envp]
     test rsi, rsi
@@ -11674,10 +11695,27 @@ parse_framerc:
     ; shake_find = N (0 = off; the pointer-wiggle magnifier)
     mov eax, [rsi]
     cmp eax, 'shak'
-    jne .pf_chk_cursor
+    jne .pf_chk_magnify
     call pf_to_value
     call pf_parse_dec
     mov [cfg_shake_find], eax
+    jmp .pf_next_line
+.pf_chk_magnify:
+    ; magnify = N (lens zoom factor 2..8 for Mod4+Alt+z)
+    mov eax, [rsi]
+    cmp eax, 'magn'
+    jne .pf_chk_cursor
+    call pf_to_value
+    call pf_parse_dec
+    cmp eax, 2
+    jge .pf_mag_lo
+    mov eax, 2
+.pf_mag_lo:
+    cmp eax, 8
+    jle .pf_mag_ok
+    mov eax, 8
+.pf_mag_ok:
+    mov [cfg_magnify], eax
     jmp .pf_next_line
 .pf_chk_cursor:
     ; cursor_color = RRGGBB / cursor_transparency = N / cursor_accent = RRGGBB
@@ -12877,6 +12915,8 @@ dispatch_input_event:
     je .die_gamma_night
     cmp r12d, 56                             ; 'b'
     je .die_gamma_sun
+    cmp r12d, 52                             ; 'z'
+    je .die_lens_toggle
     jmp .die_no_gammakey
 .die_gamma_night:
     cmp r13d, 1
@@ -12889,6 +12929,11 @@ dispatch_input_event:
     jne .die_done
     mov edi, 2
     call gamma_toggle
+    jmp .die_done
+.die_lens_toggle:
+    cmp r13d, 1
+    jne .die_done
+    call lens_toggle
     jmp .die_done
 .die_no_gammakey:
 
@@ -12976,6 +13021,7 @@ dispatch_input_event:
     call cursor_sync
 .die_motion_vis:
     call shake_update                        ; wiggle-to-magnify (cheap; no-op off)
+    call lens_motion                         ; move the magnifier (no-op when off)
     call deliver_pointer_motion
     jmp .die_done
 .die_wheel:
@@ -17269,6 +17315,7 @@ recomposite_screen:
     add rbx, 16
     dec r13d
     jnz .rs_rect_loop
+    call lens_draw                            ; magnifier overlay (once, all rects walked)
 
     ; --- clflush only the damaged lines (write-back cache → RAM so the
     ; display engine scans fresh pixels). 64-byte lines per damaged row.
@@ -17328,6 +17375,7 @@ recomposite_screen:
     add [comp_px_fill], rax                   ; PERF counter
     call .rs_window_walk
     call xor_band_apply                       ; rubber band rides on top
+    call lens_draw                            ; magnifier overlay
     mov rdi, [drm_dumb_addr]
     mov rcx, [drm_dumb_size]
     add [comp_px_flush], rcx                  ; PERF counter
@@ -20950,6 +20998,252 @@ xor_band_damage:
     pop rdx
     pop rcx
     pop rax
+    ret
+
+; ----------------------------------------------------------------------------
+; lens_damage — damage the LENS_W x LENS_H rect with top-left (edi,esi).
+; damage_add clamps to the screen. Preserves all registers.
+; ----------------------------------------------------------------------------
+lens_damage:
+    push rax
+    push rcx
+    push rdx
+    push r8
+    mov eax, edi
+    mov edx, esi
+    mov ecx, LENS_W
+    mov r8d, LENS_H
+    call damage_add
+    pop r8
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; ----------------------------------------------------------------------------
+; lens_toggle — Mod4+Alt+z. Show/hide the magnifier. Damages the old rect on
+; hide (compositor repaints what was under it) and the new rect on show.
+; ----------------------------------------------------------------------------
+lens_toggle:
+    xor dword [lens_active], 1
+    cmp byte [lens_prev_valid], 0
+    je .lt_chk_on
+    mov edi, [lens_prev_x]
+    mov esi, [lens_prev_y]
+    call lens_damage
+    mov byte [lens_prev_valid], 0
+.lt_chk_on:
+    cmp dword [lens_active], 0
+    je .lt_done
+    mov edi, [cursor_x]
+    sub edi, LENS_W/2
+    mov esi, [cursor_y]
+    sub esi, LENS_H/2
+    mov [lens_prev_x], edi
+    mov [lens_prev_y], esi
+    mov byte [lens_prev_valid], 1
+    call lens_damage
+.lt_done:
+    mov byte [comp_dirty], 1
+    ret
+
+; ----------------------------------------------------------------------------
+; lens_motion — called on pointer motion while the lens is up. Damages the
+; old + new lens rects so the compositor restores under the old position and
+; paints the new one. Cheap: two damage_add calls, only while active.
+; ----------------------------------------------------------------------------
+lens_motion:
+    cmp dword [lens_active], 0
+    je .lmo_ret
+    cmp byte [lens_prev_valid], 0
+    je .lmo_new
+    mov edi, [lens_prev_x]
+    mov esi, [lens_prev_y]
+    call lens_damage
+.lmo_new:
+    mov edi, [cursor_x]
+    sub edi, LENS_W/2
+    mov esi, [cursor_y]
+    sub esi, LENS_H/2
+    mov [lens_prev_x], edi
+    mov [lens_prev_y], esi
+    mov byte [lens_prev_valid], 1
+    call lens_damage
+    mov byte [comp_dirty], 1
+.lmo_ret:
+    ret
+
+; ----------------------------------------------------------------------------
+; lens_draw — magnifier overlay. Runs once per composite after the window
+; walk (source pixels are the real window content). Snapshots the cursor-
+; centred source region into lens_temp, then nearest-neighbour scales it by
+; cfg_magnify into the lens rect, with a 3px white border. No-op when off.
+; ----------------------------------------------------------------------------
+lens_draw:
+    cmp dword [lens_active], 0
+    je .ld_ret0
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    ; source dims sw/sh = LENS / zoom
+    mov ecx, [cfg_magnify]
+    mov eax, LENS_W
+    xor edx, edx
+    div ecx
+    mov [lens_sw], eax
+    mov eax, LENS_H
+    xor edx, edx
+    div ecx
+    mov [lens_sh], eax
+    ; lens origin = cursor - LENS/2
+    mov eax, [cursor_x]
+    sub eax, LENS_W/2
+    mov [lens_lx], eax
+    mov eax, [cursor_y]
+    sub eax, LENS_H/2
+    mov [lens_ly], eax
+    ; source origin = cursor - sw/2, sh/2
+    mov eax, [lens_sw]
+    shr eax, 1
+    mov edx, [cursor_x]
+    sub edx, eax
+    mov [lens_sx], edx
+    mov eax, [lens_sh]
+    shr eax, 1
+    mov edx, [cursor_y]
+    sub edx, eax
+    mov [lens_sy], edx
+
+    ; --- snapshot the source region (clamped to screen) into lens_temp ---
+    xor r13d, r13d                            ; j
+.ld_snap_j:
+    cmp r13d, [lens_sh]
+    jge .ld_draw_init
+    mov r14d, [lens_sy]
+    add r14d, r13d                            ; srcy
+    test r14d, r14d
+    jns .ld_syl
+    xor r14d, r14d
+.ld_syl:
+    mov eax, [screen_h]
+    dec eax
+    cmp r14d, eax
+    jle .ld_syh
+    mov r14d, eax
+.ld_syh:
+    mov eax, r14d
+    imul eax, [drm_dumb_pitch]
+    mov r15, [drm_dumb_addr]
+    add r15, rax                              ; src row ptr
+    mov eax, r13d
+    imul eax, [lens_sw]
+    shl eax, 2
+    lea rbp, [lens_temp + rax]                ; temp row ptr
+    xor r12d, r12d                            ; i
+.ld_snap_i:
+    cmp r12d, [lens_sw]
+    jge .ld_snap_inext
+    mov ebx, [lens_sx]
+    add ebx, r12d                             ; srcx
+    test ebx, ebx
+    jns .ld_sxl
+    xor ebx, ebx
+.ld_sxl:
+    mov eax, [screen_w]
+    dec eax
+    cmp ebx, eax
+    jle .ld_sxh
+    mov ebx, eax
+.ld_sxh:
+    mov eax, [r15 + rbx*4]
+    mov [rbp + r12*4], eax
+    inc r12d
+    jmp .ld_snap_i
+.ld_snap_inext:
+    inc r13d
+    jmp .ld_snap_j
+
+.ld_draw_init:
+    mov ecx, [cfg_magnify]                    ; z (kept in ecx for the loops)
+    xor r13d, r13d                            ; sr
+.ld_row:
+    cmp r13d, [lens_sh]
+    jge .ld_done
+    mov eax, r13d
+    imul eax, [lens_sw]
+    shl eax, 2
+    lea rbp, [lens_temp + rax]                ; temp row ptr (sr)
+    xor r14d, r14d                            ; zy
+.ld_zy:
+    cmp r14d, ecx
+    jge .ld_row_next
+    mov eax, r13d
+    imul eax, ecx
+    add eax, r14d                             ; lensdy = sr*z + zy
+    mov r10d, eax                             ; keep for border
+    add eax, [lens_ly]                        ; desty
+    test eax, eax
+    js .ld_zy_next
+    cmp eax, [screen_h]
+    jge .ld_done                              ; below screen → all remaining off
+    imul eax, [drm_dumb_pitch]
+    mov r15, [drm_dumb_addr]
+    add r15, rax                              ; dest row ptr
+    xor r12d, r12d                            ; sc
+.ld_col:
+    cmp r12d, [lens_sw]
+    jge .ld_zy_next
+    mov r11d, [rbp + r12*4]                   ; source pixel for this block
+    xor ebx, ebx                              ; zx
+.ld_zx:
+    cmp ebx, ecx
+    jge .ld_zx_done
+    mov eax, r12d
+    imul eax, ecx
+    add eax, ebx                              ; lensdx = sc*z + zx
+    mov r9d, eax                              ; keep for border
+    add eax, [lens_lx]                        ; destx
+    test eax, eax
+    js .ld_zx_next
+    cmp eax, [screen_w]
+    jge .ld_zy_next                           ; past right edge → rest of row off
+    mov edx, r11d
+    cmp r9d, 3
+    jl .ld_border
+    cmp r9d, LENS_W-3
+    jge .ld_border
+    cmp r10d, 3
+    jl .ld_border
+    cmp r10d, LENS_H-3
+    jge .ld_border
+    jmp .ld_write
+.ld_border:
+    mov edx, 0xFFFFFFFF
+.ld_write:
+    mov [r15 + rax*4], edx
+.ld_zx_next:
+    inc ebx
+    jmp .ld_zx
+.ld_zx_done:
+    inc r12d
+    jmp .ld_col
+.ld_zy_next:
+    inc r14d
+    jmp .ld_zy
+.ld_row_next:
+    inc r13d
+    jmp .ld_row
+.ld_done:
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+.ld_ret0:
     ret
 
 ; ----------------------------------------------------------------------------
