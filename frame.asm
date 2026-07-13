@@ -584,7 +584,13 @@ pixmaps:            resb MAX_PIXMAPS * PIXMAP_REC_SIZE
 ;   +4  drawable (u32)
 ;   +8  format (u32)
 ;   +12 pad
-%define MAX_PICTURES     256
+%define MAX_PICTURES     1024   ; 256 exhausted on a full FF+GTK desktop —
+                                ; a dropped CreatePicture renders popups/menus
+                                ; empty or lost (5627 PICFULL in one session).
+                                ; Recovers on client death, so it's a working-
+                                ; set peak, not a leak; 4× headroom. Lookups
+                                ; terminate on match (cost tracks live count,
+                                ; not table size); BSS is demand-paged.
 %define PICTURE_REC_SIZE 16
 pictures:           resb MAX_PICTURES * PICTURE_REC_SIZE
 pic_clips:          resb MAX_PICTURES * CLIP_ENTRY_SIZE  ; see gc_clips
