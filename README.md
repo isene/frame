@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.134-blue)
+![Version](https://img.shields.io/badge/version-0.0.135-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -227,6 +227,7 @@ sensitivity = 75           # pointer speed, percent of raw (default 100)
 dwt = 400                  # ms the touchpad ignores motion+taps after a keystroke (0 = off)
 nightlight = 60            # Mod4+Alt+n warmth strength 0..100 (default 60)
 sunlight = 40              # Mod4+Alt+b contrast strength 0..100 (default 40)
+shake_find = 1             # wiggle the pointer to briefly enlarge it (0 = off)
 cursor_color = ffffff      # cursor fill colour, RRGGBB hex (default ffffff)
 cursor_transparency = 50   # cursor % transparent: 0 solid .. 100 invisible (default 50)
 cursor_accent = 00c800     # arrow fill over pressable items, RRGGBB (default green)
@@ -258,6 +259,11 @@ toggles night-light (warms the screen: blue and green pulled down by the
 `nightlight` strength); **`Mod4+Alt+b`** toggles sunlight mode (steepens
 contrast by the `sunlight` strength for reading in bright light). Press the
 same combo again to return to normal. Both strengths are `0..100`.
+
+`shake_find`: wiggle the pointer quickly left-right and the arrow briefly
+grows (3x), so a lost cursor is easy to spot, then shrinks back on its own.
+Pure gesture, no key. Detection is a few compares per motion event and
+nothing at all when idle. `0` disables.
 
 `cursor_color` / `cursor_transparency`: the arrow's interior fill and how
 see-through it is. The black outline is always kept for contrast. Colour

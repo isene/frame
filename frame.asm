@@ -335,6 +335,17 @@ cur_ring_idx:       resd 1
 grab_motion_count:  resd 1
 cur_hot_x:          resd 1                 ; hotspot of that sprite
 cur_hot_y:          resd 1
+; ---- shake-to-find: wiggle the pointer, the arrow briefly enlarges ----
+; Detects rapid horizontal direction reversals and scales the arrow sprite
+; inside the 64x64 BO. Reverts on the next motion after a short deadline
+; (no timer). framerc `shake_find = 0` disables. All state event-driven.
+cur_scale:          resd 1                 ; arrow draw scale (1 = normal)
+cfg_shake_find:     resd 1                 ; 0 = off
+shake_last_x:       resd 1                 ; cursor_x at last motion sample
+shake_dir:          resd 1                 ; last horizontal dir (-1/0/+1)
+shake_count:        resd 1                 ; reversals in the current burst
+shake_last_ms:      resd 1                 ; server_time_ms of last reversal
+magnify_deadline:   resd 1                 ; server_time_ms to shrink at
 cfg_cursor_accent:  resd 1                 ; ~/.framerc cursor_accent RRGGBB
 ptr_grab_cursor:    resd 1                 ; GrabPointer's cursor arg (scrot)
 netwm_cm_atom_srv:  resd 1                 ; _NET_WM_CM_S0 (frame = compositor)
@@ -1488,6 +1499,7 @@ dump_fb0_path:      db "/tmp/frame_fbA.raw", 0
 dump_fb1_path:      db "/tmp/frame_fbB.raw", 0
 dbg_fbstate:        db "FBSTATE back=", 0
 dbg_curstate:       db "CURSTATE shape=", 0
+dbg_cs_sc:          db " scale=", 0
 dbg_curring:        db "CURRING ", 0
 dbg_cs_gw:          db " grabwin=", 0
 dbg_cs_gc:          db " grabcur=", 0
@@ -11379,6 +11391,8 @@ read_framerc:
     mov dword [cfg_dwt_ms], 400               ; disable-while-typing window (ms)
     mov dword [cfg_nightlight], 60            ; night-light warmth strength
     mov dword [cfg_sunlight], 40              ; sunlight contrast strength
+    mov dword [cur_scale], 1                  ; cursor normal size
+    mov dword [cfg_shake_find], 1             ; shake-to-find on by default
     ; --- locate HOME in envp ---
     mov rsi, [envp]
     test rsi, rsi
@@ -11647,7 +11661,7 @@ parse_framerc:
     ; sunlight = N (contrast strength 0..100 for Mod4+Alt+b)
     mov eax, [rsi]
     cmp eax, 'sunl'
-    jne .pf_chk_cursor
+    jne .pf_chk_shake
     call pf_to_value
     call pf_parse_dec
     cmp eax, 100
@@ -11655,6 +11669,15 @@ parse_framerc:
     mov eax, 100
 .pf_sun_ok:
     mov [cfg_sunlight], eax
+    jmp .pf_next_line
+.pf_chk_shake:
+    ; shake_find = N (0 = off; the pointer-wiggle magnifier)
+    mov eax, [rsi]
+    cmp eax, 'shak'
+    jne .pf_chk_cursor
+    call pf_to_value
+    call pf_parse_dec
+    mov [cfg_shake_find], eax
     jmp .pf_next_line
 .pf_chk_cursor:
     ; cursor_color = RRGGBB / cursor_transparency = N / cursor_accent = RRGGBB
@@ -12952,6 +12975,7 @@ dispatch_input_event:
     mov byte [blank_moved], 1
     call cursor_sync
 .die_motion_vis:
+    call shake_update                        ; wiggle-to-magnify (cheap; no-op off)
     call deliver_pointer_motion
     jmp .die_done
 .die_wheel:
@@ -16376,15 +16400,21 @@ draw_cursor_arrow:
     push r13
     push r14
     push r15
+    push rbp
     mov r15, [cursor_fb_addr]
     mov r14d, [drm_cursor_create + 20]       ; pitch (bytes/row)
-    xor r13d, r13d                           ; y
+    mov ebp, [cur_scale]                     ; shake-to-find magnifier (1=normal)
+    test ebp, ebp
+    jnz .dca_scale_ok
+    mov ebp, 1
+.dca_scale_ok:
+    xor r13d, r13d                           ; ly (logical row)
 .dca_row:
-    cmp r13d, 15                             ; ARROW_H (slightly smaller)
+    cmp r13d, 15                             ; ARROW_H
     jge .dca_done
-    xor r12d, r12d                           ; x
+    xor r12d, r12d                           ; lx (logical col)
 .dca_col:
-    cmp r12d, r13d                           ; while x <= y
+    cmp r12d, r13d                           ; while lx <= ly
     jg .dca_row_next
     mov eax, esi                             ; interior fill (arrow: framerc
                                              ; cursor_color; accent: cursor_accent)
@@ -16398,16 +16428,39 @@ draw_cursor_arrow:
 .dca_black:
     mov eax, 0xFF000000                       ; black (opaque)
 .dca_plot:
-    mov r8d, r13d
-    imul r8d, r14d                           ; y * pitch
-    lea r8, [r8 + r12*4]                     ; + x*4
-    mov [r15 + r8], eax
+    ; plot a scale×scale block at (lx*scale, ly*scale); scale=1 → one pixel
+    mov r10d, r13d
+    imul r10d, ebp                           ; y0 = ly*scale
+    mov r11d, r12d
+    imul r11d, ebp                           ; x0 = lx*scale
+    xor r8d, r8d                             ; dy
+.dca_by:
+    cmp r8d, ebp
+    jge .dca_bdone
+    mov r9d, r10d
+    add r9d, r8d                             ; y = y0+dy
+    imul r9d, r14d                           ; y*pitch
+    xor ecx, ecx                             ; dx
+.dca_bx:
+    cmp ecx, ebp
+    jge .dca_bxdone
+    mov edx, r11d
+    add edx, ecx                             ; x = x0+dx
+    lea rdx, [r9 + rdx*4]
+    mov [r15 + rdx], eax
+    inc ecx
+    jmp .dca_bx
+.dca_bxdone:
+    inc r8d
+    jmp .dca_by
+.dca_bdone:
     inc r12d
     jmp .dca_col
 .dca_row_next:
     inc r13d
     jmp .dca_row
 .dca_done:
+    pop rbp
     pop r15
     pop r14
     pop r13
@@ -17732,6 +17785,81 @@ bg_fill_rect:
 ; ----------------------------------------------------------------------------
 ; now_mono_ms — rax = CLOCK_MONOTONIC in milliseconds.
 ; ----------------------------------------------------------------------------
+; ----------------------------------------------------------------------------
+; shake_update — called on every pointer motion. Tracks horizontal direction
+; reversals; a fast wiggle (>=4 reversals, each within 400 ms) magnifies the
+; arrow sprite (cur_scale=3) for ~1.2 s. Reverts on the first motion after
+; the deadline — no timer, so zero idle cost. framerc `shake_find = 0` off.
+; Redraws the sprite only on the two edges (magnify / shrink), never per
+; motion. Preserves nothing the caller needs (call it last in the path).
+; ----------------------------------------------------------------------------
+shake_update:
+    cmp dword [cfg_shake_find], 0
+    je .su_ret
+    mov eax, [cursor_x]
+    mov ecx, eax
+    sub ecx, [shake_last_x]                  ; ecx = dx
+    mov [shake_last_x], eax
+    ; If magnified and the deadline has passed, shrink back.
+    cmp dword [cur_scale], 1
+    jle .su_dir
+    mov eax, [server_time_ms]
+    sub eax, [magnify_deadline]
+    js .su_dir                               ; still before deadline
+    mov dword [cur_scale], 1
+    call .su_redraw
+.su_dir:
+    ; ignore sub-pixel jitter (|dx| < 3)
+    mov eax, ecx
+    mov edx, eax
+    sar edx, 31
+    xor eax, edx
+    sub eax, edx                             ; |dx|
+    cmp eax, 3
+    jl .su_ret
+    ; dir = sign(dx)
+    mov eax, 1
+    test ecx, ecx
+    jg .su_have_dir
+    mov eax, -1
+.su_have_dir:
+    mov edx, [shake_dir]
+    test edx, edx
+    jz .su_setdir                            ; first direction, no reversal yet
+    cmp eax, edx
+    je .su_setdir                            ; same direction
+    ; reversal: within 400 ms of the previous one it counts toward a burst
+    mov edx, [server_time_ms]
+    mov r8d, edx
+    sub r8d, [shake_last_ms]
+    mov [shake_last_ms], edx
+    cmp r8d, 400
+    jg .su_reset_count
+    inc dword [shake_count]
+    cmp dword [shake_count], 4
+    jl .su_setdir
+    ; trigger magnify
+    mov dword [shake_count], 0
+    mov dword [cur_scale], 3
+    mov edx, [server_time_ms]
+    add edx, 1200
+    mov [magnify_deadline], edx
+    push rax
+    call .su_redraw
+    pop rax
+    jmp .su_setdir
+.su_reset_count:
+    mov dword [shake_count], 1
+.su_setdir:
+    mov [shake_dir], eax
+.su_ret:
+    ret
+.su_redraw:
+    mov edi, [cur_shape]
+    call draw_cursor_shape                   ; repaints + re-latches the BO
+    call cursor_move_hw
+    ret
+
 ; ----------------------------------------------------------------------------
 ; gamma_toggle — edi = target mode (1 night, 2 sunlight). If already in that
 ; mode, turns OFF (mode 0 = identity restored); else switches to it. Then
@@ -23920,9 +24048,14 @@ dump_handler:
     jz .dh_cs_noenter
     mov eax, [rax + 60]
     call write_u64_stderr
-    jmp .dh_cs_nl
+    jmp .dh_cs_scale
 .dh_cs_noenter:
     xor eax, eax
+    call write_u64_stderr
+.dh_cs_scale:
+    lea rsi, [dbg_cs_sc]                        ; shake-to-find magnifier scale
+    call write_str_stderr
+    mov eax, [cur_scale]
     call write_u64_stderr
 .dh_cs_nl:
     lea rsi, [probe_conn_nl]
