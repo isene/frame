@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.139-blue)
+![Version](https://img.shields.io/badge/version-0.0.140-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -225,10 +225,10 @@ rc convention):
 keymap = no                # keyboard layout: us (default) or no (Norwegian)
 sensitivity = 75           # pointer speed, percent of raw (default 100)
 dwt = 400                  # ms the touchpad ignores motion+taps after a keystroke (0 = off)
-nightlight = 60            # Mod4+Alt+n warmth strength 0..100 (default 60)
-sunlight = 40              # Mod4+Alt+b contrast strength 0..100 (default 40)
+nightlight = 60            # Mod4+n warmth strength 0..100 (default 60)
+sunlight = 40              # Mod4+b contrast strength 0..100 (default 40)
 shake_find = 1             # wiggle the pointer to briefly enlarge it (0 = off)
-magnify = 2               # Mod4+Alt+z magnifier lens zoom factor 2..8 (default 2)
+magnify = 2               # Mod4+z magnifier lens zoom factor 2..8 (default 2)
 cursor_color = ffffff      # cursor fill colour, RRGGBB hex (default ffffff)
 cursor_transparency = 50   # cursor % transparent: 0 solid .. 100 invisible (default 50)
 cursor_accent = 00c800     # arrow fill over pressable items, RRGGBB (default green)
@@ -255,9 +255,9 @@ stop typing. Modifier-only presses (Ctrl+click, Mod4+drag) don't mute,
 and physical clickpad button presses always work. `0` disables.
 
 `nightlight` / `sunlight`: colour-temperature presets applied through the
-CRTC gamma LUT — one ioctl at scanout, zero per-pixel CPU. **`Mod4+Alt+n`**
+CRTC gamma LUT — one ioctl at scanout, zero per-pixel CPU. **`Mod4+n`**
 toggles night-light (warms the screen: blue and green pulled down by the
-`nightlight` strength); **`Mod4+Alt+b`** toggles sunlight mode (steepens
+`nightlight` strength); **`Mod4+b`** toggles sunlight mode (steepens
 contrast by the `sunlight` strength for reading in bright light). Press the
 same combo again to return to normal. Both strengths are `0..100`.
 
@@ -266,7 +266,7 @@ grows (3x), so a lost cursor is easy to spot, then shrinks back on its own.
 Pure gesture, no key. Detection is a few compares per motion event and
 nothing at all when idle. `0` disables.
 
-`magnify` / **`Mod4+Alt+z`**: a magnifier lens that follows the cursor,
+`magnify` / **`Mod4+z`**: a magnifier lens that follows the cursor,
 showing the area under it enlarged by the `magnify` factor (2..8). Toggle
 again to hide. It's drawn as a compositor overlay — moving it just damages
 the old and new rects, so the desktop under it restores for free with no

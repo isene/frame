@@ -341,7 +341,7 @@ cur_hot_y:          resd 1
 ; (no timer). framerc `shake_find = 0` disables. All state event-driven.
 cur_scale:          resd 1                 ; arrow draw scale (1 = normal)
 cfg_shake_find:     resd 1                 ; 0 = off
-; ---- magnifier lens (Mod4+Alt+z): a zoom window that follows the cursor ----
+; ---- magnifier lens (Mod4+z): a zoom window that follows the cursor ----
 ; Drawn as a post-window-walk overlay into the composited buffer. Moving it
 ; damages the old + new rects; the compositor's own damage repaint restores
 ; what was under the old position, so no backing store. framerc `magnify` =
@@ -418,7 +418,7 @@ blank_crtc_cmd:     resb 104               ; zeroed SETCRTC = CRTC off
 cfg_blankkey_sym:   resd 1                 ; blank_key keysym (0 = none)
 cfg_blankkey_mods:  resb 1                 ; blank_key required mod_state
 blank_kc:           resd 1                 ; blank_key resolved X keycode
-; ---- gamma / color temperature (Mod4+Alt+n night, Mod4+Alt+b sunlight) ----
+; ---- gamma / color temperature (Mod4+n night, Mod4+b sunlight) ----
 ; SETGAMMA on the CRTC(s): night-light warms (blue/green down), sunlight
 ; steepens contrast. Per-channel LUT at scanout — zero per-pixel CPU, one
 ; ioctl per toggle. framerc `nightlight`/`sunlight` set the strengths.
@@ -11666,7 +11666,7 @@ parse_framerc:
     mov [cfg_dwt_ms], eax
     jmp .pf_next_line
 .pf_chk_night:
-    ; nightlight = N (warmth strength 0..100 for Mod4+Alt+n)
+    ; nightlight = N (warmth strength 0..100 for Mod4+n)
     mov eax, [rsi]
     cmp eax, 'nigh'
     jne .pf_chk_sun
@@ -11679,7 +11679,7 @@ parse_framerc:
     mov [cfg_nightlight], eax
     jmp .pf_next_line
 .pf_chk_sun:
-    ; sunlight = N (contrast strength 0..100 for Mod4+Alt+b)
+    ; sunlight = N (contrast strength 0..100 for Mod4+b)
     mov eax, [rsi]
     cmp eax, 'sunl'
     jne .pf_chk_shake
@@ -11701,7 +11701,7 @@ parse_framerc:
     mov [cfg_shake_find], eax
     jmp .pf_next_line
 .pf_chk_magnify:
-    ; magnify = N (lens zoom factor 2..8 for Mod4+Alt+z)
+    ; magnify = N (lens zoom factor 2..8 for Mod4+z)
     mov eax, [rsi]
     cmp eax, 'magn'
     jne .pf_chk_cursor
@@ -12905,11 +12905,12 @@ dispatch_input_event:
     jmp .die_done
 .die_no_blankkey:
 
-    ; frame gamma hotkeys: Mod4+Alt (0x48) + n = night-light, + b = sunlight.
-    ; Server-level like blank_key — swallowed, never reach clients. r12d is
-    ; the X keycode (evdev+8): 'b'=56, 'n'=57.
+    ; frame hotkeys on plain Mod4 (the CHasm desktop realm): n = night-
+    ; light, b = sunlight, z = magnifier lens. Server-level like
+    ; blank_key — swallowed, never reach clients. r12d is the X keycode
+    ; (evdev+8): 'b'=56, 'n'=57, 'z'=52.
     movzx eax, byte [mod_state]
-    cmp al, MOD_MOD4 | MOD_MOD1
+    cmp al, MOD_MOD4
     jne .die_no_gammakey
     cmp r12d, 57                             ; 'n'
     je .die_gamma_night
@@ -21024,7 +21025,7 @@ lens_damage:
     ret
 
 ; ----------------------------------------------------------------------------
-; lens_toggle — Mod4+Alt+z. Show/hide the magnifier. Damages the old rect on
+; lens_toggle — Mod4+z. Show/hide the magnifier. Damages the old rect on
 ; hide (compositor repaints what was under it) and the new rect on show.
 ; ----------------------------------------------------------------------------
 lens_toggle:
