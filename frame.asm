@@ -14814,8 +14814,11 @@ find_key_grab:
     cmp ecx, r12d
     jne .fkg_next
     movzx ecx, word [rax + 10]
+    cmp ecx, 0x8000                          ; AnyModifier: matches every state
+    je .fkg_hit
     cmp ecx, r13d
     jne .fkg_next
+.fkg_hit:
     pop r13
     pop r12
     pop rbx
