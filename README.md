@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.138-blue)
+![Version](https://img.shields.io/badge/version-0.0.139-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -229,7 +229,6 @@ nightlight = 60            # Mod4+Alt+n warmth strength 0..100 (default 60)
 sunlight = 40              # Mod4+Alt+b contrast strength 0..100 (default 40)
 shake_find = 1             # wiggle the pointer to briefly enlarge it (0 = off)
 magnify = 2               # Mod4+Alt+z magnifier lens zoom factor 2..8 (default 2)
-dvr = 30                   # Mod4+Alt+r desktop rewind: snapshots kept (0 = off)
 cursor_color = ffffff      # cursor fill colour, RRGGBB hex (default ffffff)
 cursor_transparency = 50   # cursor % transparent: 0 solid .. 100 invisible (default 50)
 cursor_accent = 00c800     # arrow fill over pressable items, RRGGBB (default green)
@@ -272,18 +271,6 @@ showing the area under it enlarged by the `magnify` factor (2..8). Toggle
 again to hide. It's drawn as a compositor overlay — moving it just damages
 the old and new rects, so the desktop under it restores for free with no
 backing store. Runs only while the lens is up; off costs one compare.
-
-`dvr` / **`Mod4+Alt+r`**: a desktop DVR. frame keeps a rolling ring of the
-last `dvr` snapshots (max 60) of the whole screen, captured at half
-resolution, at most once per second, and only when something actually
-repainted — an idle desktop records nothing, and `dvr = 0` (the default)
-costs a single compare per repaint. `Mod4+Alt+r` rewinds: the newest
-snapshot fills the screen with a scrub bar at the bottom. `Left`/`Down`/
-`j` or wheel-up step back in time, `Right`/`Up`/`k` or wheel-down step
-forward, `Home`/`End` jump to the ends, `Escape` or `Mod4+Alt+r` returns
-to the live desktop. The view is modal — keys and clicks don't reach
-applications while it's up. Each snapshot holds screen/2 pixels in RAM
-(about 2.3 MB at 1920x1200), allocated only as frames actually land.
 
 `cursor_color` / `cursor_transparency`: the arrow's interior fill and how
 see-through it is. The black outline is always kept for contrast. Colour

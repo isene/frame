@@ -366,36 +366,6 @@ shake_dir:          resd 1                 ; last horizontal dir (-1/0/+1)
 shake_count:        resd 1                 ; reversals in the current burst
 shake_last_ms:      resd 1                 ; server_time_ms of last reversal
 magnify_deadline:   resd 1                 ; server_time_ms to shrink at
-
-; ---- desktop DVR (framerc `dvr = N`, Mod4+Alt+r): rolling visual history ----
-; A ring of downscaled desktop snapshots, captured at most once per second
-; and ONLY from the compositor's repaint path — an idle desktop records
-; nothing (damage-gated, no timer). The rewind view is a modal overlay:
-; arrows/j/k/wheel scrub, Escape (keysym-resolved) or Mod4+Alt+r exits.
-; The ring is plain BSS: pages stay zero (no RSS) until frames land, so
-; the default dvr=0 costs one dword compare per composite and nothing else.
-%define DVR_MAX_FRAMES 60
-%define DVR_SLOT_W     1920                ; slot fits screen/2 up to 3840x2160
-%define DVR_SLOT_H     1080
-%define DVR_SLOT_BYTES (DVR_SLOT_W * DVR_SLOT_H * 4)
-%define DVR_MIN_MS     1000                ; min gap between captures
-%define DVR_BAR_H      8                   ; scrub-position bar height
-%define DVR_BAR_GAP    4                   ;   and gap above screen bottom
-cfg_dvr:            resd 1                 ; frames to keep (0 = off, max 60)
-dvr_view:           resd 1                 ; 1 = rewind view up (modal input)
-dvr_pos:            resd 1                 ; viewed frame 0..count-1 (0 = oldest)
-dvr_count:          resd 1                 ; frames currently in the ring
-dvr_head:           resd 1                 ; next slot to write
-dvr_last_ms:        resd 1                 ; last capture time (rate limit)
-dvr_src_w:          resd 1                 ; screen dims at last capture —
-dvr_src_h:          resd 1                 ;   change = hotplug → ring reset
-dvr_scale:          resd 1                 ; downscale divisor (≥2)
-dvr_w:              resd 1                 ; stored frame dims
-dvr_h:              resd 1
-dvr_esc_kc:         resd 1                 ; keysym-resolved Escape keycode
-dvr_fillw:          resd 1                 ; view scratch: bar filled width
-dvr_ring:           resb DVR_MAX_FRAMES * DVR_SLOT_BYTES
-
 cfg_cursor_accent:  resd 1                 ; ~/.framerc cursor_accent RRGGBB
 ptr_grab_cursor:    resd 1                 ; GrabPointer's cursor arg (scrot)
 netwm_cm_atom_srv:  resd 1                 ; _NET_WM_CM_S0 (frame = compositor)
@@ -11688,33 +11658,12 @@ parse_framerc:
 .pf_chk_dwt:
     ; dwt = N (ms the touchpad stays muted after a keystroke; 0 = off)
     cmp word [rsi], 'dw'
-    jne .pf_chk_dvr
+    jne .pf_chk_night
     cmp byte [rsi + 2], 't'
-    jne .pf_chk_dvr
+    jne .pf_chk_night
     call pf_to_value
     call pf_parse_dec
     mov [cfg_dwt_ms], eax
-    jmp .pf_next_line
-.pf_chk_dvr:
-    ; dvr = N (desktop DVR: snapshots to keep, 0 = off, clamp 2..60;
-    ; Mod4+Alt+r rewinds; each frame ≈ screen/2 in RAM, ~2.3MB at 1920x1200)
-    cmp word [rsi], 'dv'
-    jne .pf_chk_night
-    cmp byte [rsi + 2], 'r'
-    jne .pf_chk_night
-    call pf_to_value
-    call pf_parse_dec
-    test eax, eax
-    jz .pf_dvr_ok                             ; 0 = off
-    cmp eax, 2
-    jge .pf_dvr_lo
-    mov eax, 2
-.pf_dvr_lo:
-    cmp eax, DVR_MAX_FRAMES
-    jle .pf_dvr_ok
-    mov eax, DVR_MAX_FRAMES
-.pf_dvr_ok:
-    mov [cfg_dvr], eax
     jmp .pf_next_line
 .pf_chk_night:
     ; nightlight = N (warmth strength 0..100 for Mod4+Alt+n)
@@ -12409,22 +12358,6 @@ init_keysyms:
     lea edx, [ecx + X_MIN_KEYCODE]
     mov [blank_kc], edx
 .iks_bk_done:
-    ; Resolve Escape → keycode for the DVR rewind view's exit key. Post-
-    ; remaps, so a caps-as-Escape setup exits with its real Escape key.
-    mov dword [dvr_esc_kc], 0
-    xor ecx, ecx
-.iks_dvr_scan:
-    cmp ecx, KEYCODE_RANGE
-    jge .iks_dvr_done
-    imul edx, ecx, 24
-    cmp dword [keysym_table + rdx], 0xFF1B
-    je .iks_dvr_hit
-    inc ecx
-    jmp .iks_dvr_scan
-.iks_dvr_hit:
-    lea edx, [ecx + X_MIN_KEYCODE]
-    mov [dvr_esc_kc], edx
-.iks_dvr_done:
     ret
 
 ; ----------------------------------------------------------------------------
@@ -13004,33 +12937,6 @@ dispatch_input_event:
     jmp .die_done
 .die_no_gammakey:
 
-    ; Desktop DVR — Mod4+Alt+r opens the rewind view (needs recorded frames);
-    ; while it's up the keyboard is modal: nav keys scrub, Escape / r close,
-    ; every other press+repeat is swallowed. Releases pass through to focus
-    ; so client-side modifier state never sticks. One compare when off.
-    cmp dword [dvr_view], 0
-    jne .die_dvr_modal
-    cmp dword [cfg_dvr], 0
-    je .die_no_dvrkey
-    movzx eax, byte [mod_state]
-    cmp al, MOD_MOD4 | MOD_MOD1
-    jne .die_no_dvrkey
-    cmp r12d, 27                             ; 'r'
-    jne .die_no_dvrkey
-    cmp r13d, 1
-    jne .die_done                            ; swallow the combo's repeat/release
-    call dvr_enter
-    jmp .die_done
-.die_dvr_modal:
-    cmp r13d, 0
-    je .die_release                          ; releases still delivered
-    cmp r13d, 1
-    jne .die_done                            ; repeats swallowed
-    mov edi, r12d
-    call dvr_view_key
-    jmp .die_done
-.die_no_dvrkey:
-
     ; Release (value 0) → KeyRelease to the focused window.
     cmp r13d, 0
     je .die_release
@@ -13121,13 +13027,6 @@ dispatch_input_event:
 .die_wheel:
     test edx, edx
     jz .die_done
-    cmp dword [dvr_view], 0                  ; rewind view: wheel scrubs
-    je .die_wheel_live                       ; (up = older, down = newer)
-    mov edi, edx
-    call dvr_wheel
-    jmp .die_done
-.die_wheel_live:
-    test edx, edx                            ; re-test: the dvr cmp ate the flags
     mov r12d, 4                              ; wheel up → button 4
     jns .die_wheel_send
     mov r12d, 5                              ; wheel down → button 5
@@ -14529,8 +14428,6 @@ deliver_pointer_motion:
 ; it selected ButtonPress (0x04) / ButtonRelease (0x08).
 ; ----------------------------------------------------------------------------
 deliver_pointer_button:
-    cmp dword [dvr_view], 0                  ; rewind view is modal: no clicks
-    jne .dpb_swallow                         ; reach clients (incl. taps)
     push rbx
     push r12
     push r13
@@ -14695,7 +14592,6 @@ deliver_pointer_button:
     pop r13
     pop r12
     pop rbx
-.dpb_swallow:
     ret
 
 ; ----------------------------------------------------------------------------
@@ -17419,11 +17315,9 @@ recomposite_screen:
     call bg_fill_rect                         ; wallpaper (or solid) for this rect
     call .rs_window_walk
     call xor_band_apply                       ; rubber band rides on top
-    call dvr_view_apply                       ; rewind view re-covers this rect
     add rbx, 16
     dec r13d
     jnz .rs_rect_loop
-    call dvr_capture                          ; DVR snapshot (≤1/s; off = 1 cmp)
     call lens_draw                            ; magnifier overlay (once, all rects walked)
 
     ; --- clflush only the damaged lines (write-back cache → RAM so the
@@ -17484,8 +17378,6 @@ recomposite_screen:
     add [comp_px_fill], rax                   ; PERF counter
     call .rs_window_walk
     call xor_band_apply                       ; rubber band rides on top
-    call dvr_view_apply                       ; rewind view (bw_clip = full screen)
-    call dvr_capture                          ; DVR snapshot (≤1/s; off = 1 cmp)
     call lens_draw                            ; magnifier overlay
     mov rdi, [drm_dumb_addr]
     mov rcx, [drm_dumb_size]
@@ -21355,357 +21247,6 @@ lens_draw:
     pop r12
     pop rbx
 .ld_ret0:
-    ret
-
-; ----------------------------------------------------------------------------
-; dvr_damage_all — full-screen damage + repaint request. Used by every DVR
-; state change (enter/scrub/exit) so the compositor redraws the view (or the
-; live desktop again on exit). Preserves all registers (damage_add does).
-; ----------------------------------------------------------------------------
-dvr_damage_all:
-    push rax
-    push rcx
-    push rdx
-    push r8
-    xor eax, eax
-    xor edx, edx
-    mov ecx, [screen_w]
-    mov r8d, [screen_h]
-    call damage_add
-    mov byte [comp_dirty], 1
-    pop r8
-    pop rdx
-    pop rcx
-    pop rax
-    ret
-
-; ----------------------------------------------------------------------------
-; dvr_enter — Mod4+Alt+r. Opens the rewind view on the newest frame. No-op
-; when nothing has been recorded yet.
-; ----------------------------------------------------------------------------
-dvr_enter:
-    cmp dword [dvr_count], 0
-    je .de_ret
-    mov dword [dvr_view], 1
-    mov eax, [dvr_count]
-    dec eax
-    mov [dvr_pos], eax                        ; start at the newest frame
-    jmp dvr_damage_all
-.de_ret:
-    ret
-
-; ----------------------------------------------------------------------------
-; dvr_older / dvr_newer — move the scrub position one frame back / forward
-; (clamped) and repaint. Shared by keys and the wheel.
-; ----------------------------------------------------------------------------
-dvr_older:
-    mov eax, [dvr_pos]
-    test eax, eax
-    jz .dol_ret
-    dec eax
-    mov [dvr_pos], eax
-    jmp dvr_damage_all
-.dol_ret:
-    ret
-
-dvr_newer:
-    mov eax, [dvr_pos]
-    inc eax
-    cmp eax, [dvr_count]
-    jge .dnw_ret
-    mov [dvr_pos], eax
-    jmp dvr_damage_all
-.dnw_ret:
-    ret
-
-; ----------------------------------------------------------------------------
-; dvr_wheel — edi = signed wheel delta while the view is up. Up (positive)
-; scrolls back in time, down returns toward now.
-; ----------------------------------------------------------------------------
-dvr_wheel:
-    test edi, edi
-    js dvr_newer
-    jmp dvr_older
-
-; ----------------------------------------------------------------------------
-; dvr_view_key — edi = X keycode of a fresh press while the view is up.
-; Left/Down/j = older, Right/Up/k = newer, Home/End = oldest/newest,
-; Escape (keysym-resolved) or r = exit. Everything else: swallowed (modal).
-; ----------------------------------------------------------------------------
-dvr_view_key:
-    cmp edi, 27                               ; 'r' → exit
-    je .dvk_exit
-    cmp edi, [dvr_esc_kc]                     ; Escape → exit
-    je .dvk_exit
-    cmp edi, 113                              ; Left
-    je dvr_older
-    cmp edi, 116                              ; Down
-    je dvr_older
-    cmp edi, 44                               ; j
-    je dvr_older
-    cmp edi, 114                              ; Right
-    je dvr_newer
-    cmp edi, 111                              ; Up
-    je dvr_newer
-    cmp edi, 45                               ; k
-    je dvr_newer
-    cmp edi, 110                              ; Home → oldest
-    je .dvk_home
-    cmp edi, 115                              ; End → newest
-    je .dvk_end
-    ret
-.dvk_exit:
-    mov dword [dvr_view], 0
-    jmp dvr_damage_all
-.dvk_home:
-    mov dword [dvr_pos], 0
-    jmp dvr_damage_all
-.dvk_end:
-    mov eax, [dvr_count]
-    dec eax
-    mov [dvr_pos], eax
-    jmp dvr_damage_all
-
-; ----------------------------------------------------------------------------
-; dvr_capture — snapshot the composited buffer into the ring, point-sampled
-; at 1/dvr_scale. Called from both composite paths after the window walk, so
-; it is inherently damage-gated: no repaint → no capture. Gates: feature off
-; (one compare), view up (don't record the rewind itself), ≥1s since last.
-; A screen-dims change (hotplug) recomputes the scale and resets the ring.
-; Preserves rbx, r12-r15, rbp (the damage path still needs its list regs).
-; ----------------------------------------------------------------------------
-dvr_capture:
-    cmp dword [cfg_dvr], 0
-    je .dc_ret0                               ; off: this compare is the cost
-    cmp dword [dvr_view], 0
-    jne .dc_ret0
-    ; Real clock, not server_time_ms: that one is stamped from input events
-    ; and stalls when the screen changes with no user input — exactly the
-    ; moments a DVR exists to catch. One syscall per composite, only when on.
-    call now_real_ms
-    mov ecx, eax
-    sub ecx, [dvr_last_ms]
-    cmp ecx, DVR_MIN_MS
-    jb .dc_ret0
-    push rbx
-    push r12
-    push r13
-    push r14
-    push r15
-    push rbp
-    mov [dvr_last_ms], eax
-    mov eax, [screen_w]
-    cmp eax, [dvr_src_w]
-    jne .dc_recalc
-    mov eax, [screen_h]
-    cmp eax, [dvr_src_h]
-    je .dc_grab
-.dc_recalc:
-    ; first capture, or the mode changed: smallest scale ≥2 that fits a slot
-    mov eax, [screen_w]
-    mov [dvr_src_w], eax
-    mov eax, [screen_h]
-    mov [dvr_src_h], eax
-    mov dword [dvr_count], 0
-    mov dword [dvr_head], 0
-    mov ecx, 2
-.dc_scl:
-    mov eax, [screen_w]
-    xor edx, edx
-    div ecx
-    cmp eax, DVR_SLOT_W
-    jg .dc_scl_up
-    mov eax, [screen_h]
-    xor edx, edx
-    div ecx
-    cmp eax, DVR_SLOT_H
-    jle .dc_scl_ok
-.dc_scl_up:
-    inc ecx
-    jmp .dc_scl
-.dc_scl_ok:
-    mov [dvr_scale], ecx
-    mov eax, [screen_w]
-    xor edx, edx
-    div ecx
-    mov [dvr_w], eax
-    mov eax, [screen_h]
-    xor edx, edx
-    div ecx
-    mov [dvr_h], eax
-.dc_grab:
-    mov eax, [dvr_head]
-    imul rax, rax, DVR_SLOT_BYTES
-    lea rbp, [dvr_ring]
-    add rbp, rax                              ; dst frame base
-    xor r13d, r13d                            ; j = dst row
-.dc_j:
-    cmp r13d, [dvr_h]
-    jge .dc_advance
-    mov eax, r13d
-    imul eax, [dvr_scale]                     ; src row = j*scale
-    imul eax, [drm_dumb_pitch]
-    mov r15, [drm_dumb_addr]
-    add r15, rax                              ; src row ptr
-    mov eax, r13d
-    imul eax, [dvr_w]
-    shl eax, 2
-    lea r14, [rbp + rax]                      ; dst row ptr
-    xor r12d, r12d                            ; i = dst col
-    xor ebx, ebx                              ; src col = i*scale
-.dc_i:
-    cmp r12d, [dvr_w]
-    jge .dc_jnext
-    mov eax, [r15 + rbx*4]
-    mov [r14 + r12*4], eax
-    add ebx, [dvr_scale]
-    inc r12d
-    jmp .dc_i
-.dc_jnext:
-    inc r13d
-    jmp .dc_j
-.dc_advance:
-    mov eax, [dvr_head]
-    inc eax
-    cmp eax, [cfg_dvr]
-    jl .dc_head_ok
-    xor eax, eax
-.dc_head_ok:
-    mov [dvr_head], eax
-    mov eax, [dvr_count]
-    cmp eax, [cfg_dvr]
-    jge .dc_pop
-    inc eax
-    mov [dvr_count], eax
-.dc_pop:
-    pop rbp
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-.dc_ret0:
-    ret
-
-; ----------------------------------------------------------------------------
-; dvr_view_apply — paint the viewed frame (nearest-neighbour upscale) over
-; the current bw_clip region, plus the scrub-position bar near the bottom.
-; Runs after the window walk of every repaint region while the view is up,
-; so client updates underneath can never punch through the frozen image —
-; and only the damaged rect is repainted, not the whole screen every time.
-; One dword compare when the view is down. Preserves rbx, r12-r15, rbp.
-; ----------------------------------------------------------------------------
-dvr_view_apply:
-    cmp dword [dvr_view], 0
-    jne .dva_go
-    ret
-.dva_go:
-    cmp dword [dvr_count], 0
-    je .dva_ret0                              ; safety: nothing to show
-    push rbx
-    push r12
-    push r13
-    push r14
-    push r15
-    push rbp
-    ; frame base: slot = head - count + pos (+ring size if negative)
-    mov eax, [dvr_head]
-    sub eax, [dvr_count]
-    add eax, [dvr_pos]
-    test eax, eax
-    jns .dva_idx_ok
-    add eax, [cfg_dvr]
-.dva_idx_ok:
-    imul rax, rax, DVR_SLOT_BYTES
-    lea rbp, [dvr_ring]
-    add rbp, rax
-    ; bar fill width = (pos+1) * screen_w / count
-    mov eax, [dvr_pos]
-    inc eax
-    imul eax, [screen_w]
-    xor edx, edx
-    div dword [dvr_count]
-    mov [dvr_fillw], eax
-    mov r13d, [bw_clip_y1]                    ; y
-.dva_row:
-    cmp r13d, [bw_clip_y2]
-    jge .dva_done
-    mov eax, r13d
-    imul eax, [drm_dumb_pitch]
-    mov r15, [drm_dumb_addr]
-    add r15, rax                              ; dst row ptr
-    ; scrub bar rows replace the frame rows near the bottom
-    mov eax, [screen_h]
-    sub eax, DVR_BAR_H + DVR_BAR_GAP
-    cmp r13d, eax
-    jl .dva_frame_row
-    mov eax, [screen_h]
-    sub eax, DVR_BAR_GAP
-    cmp r13d, eax
-    jge .dva_frame_row
-    mov r12d, [bw_clip_x1]
-.dva_bar_x:
-    cmp r12d, [bw_clip_x2]
-    jge .dva_row_next
-    mov edx, 0xFF303030                       ; track
-    cmp r12d, [dvr_fillw]
-    jge .dva_bar_put
-    mov edx, 0xFFF0F0F0                       ; filled (past → present)
-.dva_bar_put:
-    mov [r15 + r12*4], edx
-    inc r12d
-    jmp .dva_bar_x
-.dva_frame_row:
-    ; src row = min(y / scale, dvr_h-1)
-    mov eax, r13d
-    xor edx, edx
-    div dword [dvr_scale]
-    mov ecx, [dvr_h]
-    dec ecx
-    cmp eax, ecx
-    jle .dva_sy_ok
-    mov eax, ecx
-.dva_sy_ok:
-    imul eax, [dvr_w]
-    shl eax, 2
-    lea r14, [rbp + rax]                      ; src row base
-    mov r9d, [dvr_scale]
-    mov r10d, [dvr_w]
-    dec r10d                                  ; sx clamp
-    mov r12d, [bw_clip_x1]                    ; x
-    mov eax, r12d
-    xor edx, edx
-    div r9d
-    mov ebx, eax                              ; sx = x / scale
-    mov r8d, edx                              ;   and its phase
-.dva_fx:
-    cmp r12d, [bw_clip_x2]
-    jge .dva_row_next
-    mov eax, ebx
-    cmp eax, r10d
-    jle .dva_sx_ok
-    mov eax, r10d
-.dva_sx_ok:
-    mov eax, [r14 + rax*4]
-    mov [r15 + r12*4], eax
-    inc r12d
-    inc r8d
-    cmp r8d, r9d
-    jl .dva_fx
-    xor r8d, r8d
-    inc ebx
-    jmp .dva_fx
-.dva_row_next:
-    inc r13d
-    jmp .dva_row
-.dva_done:
-    pop rbp
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-.dva_ret0:
     ret
 
 ; ----------------------------------------------------------------------------
