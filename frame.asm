@@ -3328,19 +3328,25 @@ do_modeset:
 ; count_modes > 0. Returns rax=1 (found) or rax=0 (none), and on found:
 ; r12d = connector_id, drm_conn_buf populated, drm_modes_buf[0..68] = mode 0.
 ; ============================================================================
-modeset_find_connector:
-    push rbx
-    push r13
-    mov r13d, [drm_res_buf + 40]              ; count_connectors
-    xor ebx, ebx
-.mf_loop:
-    cmp ebx, r13d
-    jge .mf_none
-    mov eax, [drm_conn_ids + rbx*4]
-    mov r12d, eax
-
-    ; Zero + plug in our arrays + connector_id (same shape as the
-    ; probe path's per-connector call).
+; ----------------------------------------------------------------------------
+; getconnector_probed — r12d = connector id. The kernel only (re)probes a
+; connector — EDID read + mode-list fill — when GETCONNECTOR arrives with
+; count_modes == 0 (libdrm's two-call dance). A connector that was never
+; driven (external screen plugged after boot) otherwise reports connected
+; with 0 modes forever. Call 1 forces the probe; call 2 fetches into
+; drm_conn_buf + drm_enc_arr/drm_modes_buf/props. rax = call-2 ioctl result.
+; ----------------------------------------------------------------------------
+getconnector_probed:
+    lea rdi, [drm_conn_buf]
+    xor eax, eax
+    mov ecx, 10
+    rep stosq
+    mov [drm_conn_buf + 48], r12d
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_GETCONNECTOR
+    lea rdx, [drm_conn_buf]
+    syscall                                   ; counts all 0 → kernel probes
     lea rdi, [drm_conn_buf]
     xor eax, eax
     mov ecx, 10
@@ -3357,12 +3363,61 @@ modeset_find_connector:
     mov [drm_conn_buf + 16], rax
     lea rax, [drm_propvals_arr]
     mov [drm_conn_buf + 24], rax
-
     mov rax, SYS_IOCTL
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_GETCONNECTOR
     lea rdx, [drm_conn_buf]
     syscall
+    ret
+
+; ----------------------------------------------------------------------------
+; connector_pick_crtc — pick a crtc for the connector in drm_conn_buf.
+; edi = crtc id to exclude (0 = none). Tries the currently attached encoder
+; first, then every encoder in the connector's list — a cold connector has
+; encoder_id = 0, so the current-encoder shortcut alone finds nothing.
+; eax = crtc id, 0 = none.
+; ----------------------------------------------------------------------------
+connector_pick_crtc:
+    push rbx
+    push r12
+    mov r12d, edi                            ; excluded crtc
+    mov edi, [drm_conn_buf + 44]             ; current encoder (0 if never lit)
+    test edi, edi
+    jz .cpc_list
+    mov esi, r12d
+    call encoder_pick_crtc
+    test eax, eax
+    jnz .cpc_ret
+.cpc_list:
+    xor ebx, ebx
+.cpc_loop:
+    cmp ebx, [drm_conn_buf + 40]             ; count_encoders (fetched)
+    jge .cpc_none
+    mov edi, [drm_enc_arr + rbx*4]
+    mov esi, r12d
+    call encoder_pick_crtc
+    test eax, eax
+    jnz .cpc_ret
+    inc ebx
+    jmp .cpc_loop
+.cpc_none:
+    xor eax, eax
+.cpc_ret:
+    pop r12
+    pop rbx
+    ret
+
+modeset_find_connector:
+    push rbx
+    push r13
+    mov r13d, [drm_res_buf + 40]              ; count_connectors
+    xor ebx, ebx
+.mf_loop:
+    cmp ebx, r13d
+    jge .mf_none
+    mov eax, [drm_conn_ids + rbx*4]
+    mov r12d, eax
+    call getconnector_probed                  ; probe + buffered fetch
     test rax, rax
     js .mf_skip
 
@@ -15998,11 +16053,10 @@ modeset_pick_outputs:
     mov [panel_w], eax
     movzx eax, word [mode1_save + 14]
     mov [panel_h], eax
-    mov edi, [drm_conn_buf + 44]             ; encoder id
-    xor esi, esi
-    call encoder_pick_crtc
-    test eax, eax
-    jz .mpo_fail
+    xor edi, edi                             ; no crtc excluded
+    call connector_pick_crtc                 ; encoder-list fallback: output 1
+    test eax, eax                            ; may be a cold connector too
+    jz .mpo_fail                             ; (docked boot, lid closed)
     mov [drm_chosen_crtc], eax
 
     ; --- scan for a second connected connector (skip output 1's) ---
@@ -16014,36 +16068,15 @@ modeset_pick_outputs:
     mov r12d, [drm_conn_ids + rbx*4]
     cmp r12d, [drm_chosen_conn]
     je .mpo2_next
-    lea rdi, [drm_conn_buf]
-    xor eax, eax
-    mov ecx, 10
-    rep stosq
-    mov [drm_conn_buf + 32], dword DRM_MAX_MODES
-    mov [drm_conn_buf + 36], dword DRM_MAX_PROPS
-    mov [drm_conn_buf + 40], dword DRM_MAX_IDS
-    mov [drm_conn_buf + 48], r12d
-    lea rax, [drm_enc_arr]
-    mov [drm_conn_buf + 0], rax
-    lea rax, [drm_modes_buf]
-    mov [drm_conn_buf + 8], rax
-    lea rax, [drm_props_arr]
-    mov [drm_conn_buf + 16], rax
-    lea rax, [drm_propvals_arr]
-    mov [drm_conn_buf + 24], rax
-    mov rax, SYS_IOCTL
-    mov rdi, [drm_fd]
-    mov esi, DRM_IOCTL_MODE_GETCONNECTOR
-    lea rdx, [drm_conn_buf]
-    syscall
+    call getconnector_probed                 ; probe + buffered fetch
     test rax, rax
     js .mpo2_next
     cmp dword [drm_conn_buf + 60], DRM_MODE_CONNECTED
     jne .mpo2_next
     cmp dword [drm_conn_buf + 32], 0         ; count_modes
     je .mpo2_next
-    mov edi, [drm_conn_buf + 44]             ; its encoder
-    mov esi, [drm_chosen_crtc]               ; must land on a different crtc
-    call encoder_pick_crtc
+    mov edi, [drm_chosen_crtc]               ; must land on a different crtc
+    call connector_pick_crtc                 ; tries encoder list too (cold conn)
     test eax, eax
     jz .mpo2_next
     mov [ext_crtc], eax
