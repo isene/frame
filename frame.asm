@@ -25,18 +25,6 @@
 BITS 64
 DEFAULT REL
 
-; ---- Linux x86_64 syscalls -------------------------------------------------
-%define SYS_READ        0
-%define SYS_WRITE       1
-%define SYS_SENDTO      44
-%define MSG_DONTWAIT    0x40
-; EV_SEND — non-blocking event write: sendto(edi=fd, rsi=buf, rdx=len,
-; MSG_DONTWAIT). A client that stops draining its socket (a stalled GTK4
-; app) must NOT block the single-threaded server — its next event write
-; would otherwise hang the WHOLE server (frozen screen + dead input). On
-; would-block the event is simply DROPPED; events are lossy by nature, so
-; a missed motion/crossing is harmless and the client resyncs. Replies
-; stay blocking (request-driven; the client IS waiting on them).
 %macro CRLOG 2
     push rdi
     push rsi
@@ -47,119 +35,13 @@ DEFAULT REL
     pop rdi
 %endmacro
 
-%macro EV_SEND 0
-    mov rax, SYS_SENDTO
-    mov r10d, MSG_DONTWAIT
-    xor r8d, r8d
-    xor r9d, r9d
-    syscall
-    cmp rax, -11                 ; EAGAIN: client socket full, event dropped —
-    jne %%ok                     ; count it (SIGUSR1 FBSTATE line reports it;
-    inc dword [ev_dropped]       ; diagnosing "client went stale" reports)
-%%ok:
-%endmacro
-%define SYS_OPEN        2
-%define SYS_CLOSE       3
-%define SYS_LSEEK       8
-%define SYS_UNLINK      87
-%define SYS_EXIT        60
-%define SYS_RT_SIGACTION   13
-%define SYS_RT_SIGRETURN   15
-%define SIGINT          2
-%define SIGTERM         15
-%define SIGHUP          1
-%define SIGUSR1         10
-%define SA_RESTORER     0x04000000
-%define SYS_SOCKET      41
-%define SYS_BIND        49
-%define SYS_LISTEN      50
-%define SYS_ACCEPT      43
-%define SYS_GETSOCKNAME 51
-%define SYS_RECVFROM    45
-%define SYS_IOCTL       16
-
-%define AF_UNIX         1
-%define SOCK_STREAM     1
 %define DEFAULT_DISPLAY 7
-%define O_RDWR          0x2
 
-; ---- DRM/KMS ABI ----------------------------------------------------------
-; Linux ioctl encoding: (dir<<30) | (size<<16) | (type<<8) | nr
-; type 'd' = 0x64, dir _IOWR = 3.
-;
-; struct drm_version            = 64 bytes  → 0xC0406400
-; struct drm_mode_card_res      = 64 bytes  → 0xC04064A0
-; struct drm_mode_get_connector = 80 bytes  → 0xC05064A7
-%define DRM_IOCTL_VERSION              0xC0406400
-%define DRM_IOCTL_SET_MASTER           0x0000641E
-%define DRM_IOCTL_DROP_MASTER          0x0000641F
-%define DRM_IOCTL_MODE_GETRESOURCES    0xC04064A0
-%define DRM_IOCTL_MODE_GETCRTC         0xC06864A1
-%define DRM_IOCTL_MODE_SETCRTC         0xC06864A2
-%define DRM_IOCTL_MODE_GETENCODER      0xC01464A6
-%define DRM_IOCTL_MODE_GETCONNECTOR    0xC05064A7
-%define DRM_IOCTL_MODE_ADDFB           0xC01C64AE
-%define DRM_IOCTL_MODE_RMFB            0xC00464AF
-%define DRM_IOCTL_MODE_DIRTYFB         0xC01864B7
-%define DRM_IOCTL_MODE_PAGE_FLIP       0xC01864B0
-%define DRM_MODE_PAGE_FLIP_EVENT       0x01
-%define DRM_IOCTL_MODE_CREATE_DUMB     0xC02064B2
-%define DRM_IOCTL_MODE_MAP_DUMB        0xC01064B3
-%define DRM_IOCTL_MODE_CURSOR          0xC01C64A3   ; _IOWR('d',0xA3,28)
-%define DRM_MODE_CURSOR_BO             0x01
-%define DRM_MODE_CURSOR_MOVE           0x02
-%define DRM_IOCTL_MODE_DESTROY_DUMB    0xC00464B4
-%define DRM_IOCTL_MODE_SETGAMMA        0xC02064A5   ; _IOWR('d',0xA5,drm_mode_crtc_lut)
-%define GAMMA_MAX                      1024         ; ramp buffer cap (i915 = 256)
-
-%define SYS_POLL        7
-%define SYS_MMAP        9
-%define SYS_MUNMAP      11
-%define SYS_SHMGET      29
-%define SYS_SHMAT       30
-%define SYS_SHMCTL      31
-%define SYS_SHMDT       67
-%define IPC_STAT        2
-%define SHM_RDONLY      0x1000
-%define SYS_NANOSLEEP   35
-%define SYS_CLOCK_GETTIME 228
-%define CLOCK_MONOTONIC 1
-%define PROT_RW         3            ; PROT_READ | PROT_WRITE
-%define MAP_SHARED      1
-%define MAP_PRIVATE     2
-%define MAP_ANONYMOUS   0x20
-
-; ---- evdev / input ABI ----------------------------------------------------
-; struct input_event on 64-bit:
-;   __kernel_long_t tv_sec   (8)
-;   __kernel_long_t tv_usec  (8)
-;   __u16  type              (2)
-;   __u16  code              (2)
-;   __s32  value             (4)
-; = 24 bytes total.
-%define INPUT_EVENT_SIZE   24
-%define EV_SYN             0
-%define EV_KEY             1
-%define EV_REL             2
-%define EV_ABS             3
-%define EV_MSC             4
-%define EV_SW              5
-
-; EVIOCGNAME(64): _IOC(_IOC_READ, 'E', 0x06, 64)
-; (dir<<30) | (size<<16) | (type<<8) | nr = (2<<30) | (64<<16) | (0x45<<8) | 6
-%define EVIOCGNAME_64      0x80404506
-%define INPUT_DEV_MAX      32         ; scan /dev/input/event0..31
-%define INPUT_BATCH_BYTES  768        ; 32 events × 24 bytes
-
-%define DRM_MODE_CONNECTED      1
-%define DRM_MODE_DISCONNECTED   2
-%define DRM_MODE_UNKNOWNCONN    3
-
-; drm_mode_modeinfo size — 68 bytes per mode
-%define DRM_MODE_INFO_SIZE      68
-%define DRM_MAX_MODES           64
-%define DRM_MAX_PROPS           64
-%define DRM_MAX_IDS             32
+%ifdef FRAME_PLATFORM_FREEBSD
+%include "freebsd.asm"
+%else
+%include "linux.asm"
+%endif
 
 ; ---- X11 protocol constants ------------------------------------------------
 %define X_PROTO_MAJOR        11
@@ -1823,7 +1705,7 @@ _start:
     call do_probe
     xor edi, edi
     mov rax, SYS_EXIT
-    syscall
+    FRAME_SYSCALL
 .check_modeset:
     cmp dword [rdi], '--mo'
     jne .check_probe_input
@@ -1834,7 +1716,7 @@ _start:
     call do_modeset
     xor edi, edi
     mov rax, SYS_EXIT
-    syscall
+    FRAME_SYSCALL
 .check_probe_input:
     ; "--probe-input"
     cmp dword [rdi], '--pr'
@@ -1848,7 +1730,7 @@ _start:
     call do_probe_input
     xor edi, edi
     mov rax, SYS_EXIT
-    syscall
+    FRAME_SYSCALL
 .check_display:
     ; Fall-through here when argv[1] isn't --probe-input. We'll do a
     ; second pass over all argv entries below for --display, since it
@@ -1869,14 +1751,14 @@ _start:
     call do_watch_input
     xor edi, edi
     mov rax, SYS_EXIT
-    syscall
+    FRAME_SYSCALL
 .watch_usage:
     mov rsi, input_watch_usage
     mov rdx, input_watch_usage_len
     call write_stderr
     mov edi, 1
     mov rax, SYS_EXIT
-    syscall
+    FRAME_SYSCALL
 .check_num:
     call atoi_or_default
     mov [display_num], rax
@@ -1967,16 +1849,20 @@ _start:
     ; certain). SIG_IGN → the write returns -EPIPE instead; event writes
     ; ignore it and the dead client is reaped on its next read()=0.
     lea rdi, [sig_sa_buf]
-    mov qword [rdi + 0], 1                    ; sa_handler = SIG_IGN
-    mov qword [rdi + 8], 0                    ; sa_flags = 0
-    mov qword [rdi + 16], 0                   ; sa_restorer
-    mov qword [rdi + 24], 0                   ; sa_mask
+    mov qword [rdi + SA_HANDLER_OFFSET], 1    ; sa_handler = SIG_IGN
+    mov dword [rdi + SA_FLAGS_OFFSET], 0
+    mov qword [rdi + SA_MASK_OFFSET], 0
+%ifdef FRAME_PLATFORM_FREEBSD
+    mov qword [rdi + SA_MASK_OFFSET + 8], 0
+%endif
+%ifdef FRAME_PLATFORM_LINUX
+    mov qword [rdi + SA_RESTORER_OFFSET], 0
+%endif
     mov rax, SYS_RT_SIGACTION
-    mov edi, 13                               ; SIGPIPE
+    mov edi, SIGPIPE
     lea rsi, [sig_sa_buf]
     xor edx, edx
-    mov r10, 8
-    syscall
+    FRAME_SIGACTION
     cmp byte [fbtest_mode], 0
     jne .main_fbtest_init
     jmp .main_fbtest_done
@@ -2001,9 +1887,9 @@ _start:
     test rdi, rdi
     jz .skip_testinput
     mov rax, SYS_OPEN
-    mov esi, 0x802                           ; O_RDWR | O_NONBLOCK
+    mov esi, O_RDWR | O_NONBLOCK              ; test FIFO, non-blocking
     xor edx, edx
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .skip_testinput
     mov ecx, [input_fd_count]
@@ -2033,7 +1919,7 @@ _start:
     call write_stderr
     mov rax, SYS_EXIT
     mov rdi, 1
-    syscall
+    FRAME_SYSCALL
 
 ; ============================================================================
 ; announce_listening — write "frame: listening on display :N\n" to stderr.
@@ -2087,22 +1973,22 @@ socket_setup:
     ; Pre-unlink any stale socket file from a previous run. Ignore errors.
     mov rax, SYS_UNLINK
     lea rdi, [sockaddr_path]
-    syscall
+    FRAME_SYSCALL
 
     ; socket(AF_UNIX, SOCK_STREAM, 0)
     mov rax, SYS_SOCKET
     mov rdi, AF_UNIX
     mov rsi, SOCK_STREAM
     xor edx, edx
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ss_fail
     mov [listen_fd], rax
 
     ; Build sockaddr_un { sa_family = AF_UNIX, sun_path = path }.
     lea rdi, [sockaddr_buf]
-    mov word [rdi], AF_UNIX
-    add rdi, 2
+    mov word [rdi + SOCKADDR_UN_FAMILY_OFFSET], AF_UNIX
+    add rdi, SOCKADDR_UN_PATH_OFFSET
     lea rsi, [sockaddr_path]
     mov rcx, [sockaddr_pathlen]
 .ss_path_cp:
@@ -2121,22 +2007,25 @@ socket_setup:
     mov rdi, [listen_fd]
     lea rsi, [sockaddr_buf]
     mov rdx, [sockaddr_pathlen]
-    add rdx, 3                           ; family (2) + NUL (1)
-    syscall
+    add rdx, SOCKADDR_UN_LENGTH_BIAS
+%ifdef FRAME_PLATFORM_FREEBSD
+    mov [sockaddr_buf + SOCKADDR_UN_LENGTH_OFFSET], dl
+%endif
+    FRAME_SYSCALL
     test rax, rax
     js .ss_fail
     ; Make the socket world-connectable (0777), like every real X server, so
     ; clients running as a different user (e.g. tray apps as the real user
     ; while frame runs as root) can connect. /tmp/.X11-unix is already sticky.
-    mov rax, 90                          ; SYS_CHMOD
-    lea rdi, [sockaddr_buf + 2]          ; sun_path
+    mov rax, SYS_CHMOD
+    lea rdi, [sockaddr_buf + SOCKADDR_UN_PATH_OFFSET] ; sun_path
     mov esi, 0o777
-    syscall
+    FRAME_SYSCALL
     ; listen with a small backlog
     mov rax, SYS_LISTEN
     mov rdi, [listen_fd]
     mov rsi, 8
-    syscall
+    FRAME_SYSCALL
     xor eax, eax
     pop rbx
     ret
@@ -2153,7 +2042,7 @@ do_accept:
     mov rdi, [listen_fd]
     xor esi, esi
     xor edx, edx
-    syscall
+    FRAME_SYSCALL
     ret
 
 ; ============================================================================
@@ -2304,7 +2193,7 @@ emit_setup_reply:
     mov rax, SYS_WRITE
     mov rdi, r13                         ; target fd from caller
     mov rsi, rbx
-    syscall
+    FRAME_SYSCALL
     pop rdx
 
     ; Log success.
@@ -2468,7 +2357,7 @@ atoi_or_default:
 write_stderr:
     mov rax, SYS_WRITE
     mov rdi, 2
-    syscall
+    FRAME_SYSCALL
     ret
 
 ; ============================================================================
@@ -2523,7 +2412,7 @@ do_probe:
 
     mov rax, SYS_CLOSE
     mov rdi, [drm_fd]
-    syscall
+    FRAME_SYSCALL
     pop r13
     pop r12
     pop rbx
@@ -2570,7 +2459,7 @@ drm_try_open:
     lea rdi, [drm_card_path]
     mov esi, O_RDWR
     xor edx, edx
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     jns .dt_ok
     inc ebx
@@ -2606,7 +2495,7 @@ drm_probe_version:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_VERSION
     lea rdx, [drm_version_buf]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .dv_err
 
@@ -2641,7 +2530,7 @@ drm_probe_version:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_VERSION
     lea rdx, [drm_version_buf]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .dv_err
 
@@ -2693,7 +2582,7 @@ drm_probe_resources:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_GETRESOURCES
     lea rdx, [drm_res_buf]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .dr_err
 
@@ -2735,7 +2624,7 @@ drm_probe_resources:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_GETRESOURCES
     lea rdx, [drm_res_buf]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .dr_err
 
@@ -2830,7 +2719,7 @@ drm_probe_connectors:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_GETCONNECTOR
     lea rdx, [drm_conn_buf]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .dc_skip
 
@@ -2957,7 +2846,7 @@ do_modeset:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_SET_MASTER
     xor edx, edx
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ms_e_master
     mov rsi, ms_master_ok
@@ -2987,7 +2876,7 @@ do_modeset:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_GETENCODER
     lea rdx, [drm_encoder_buf]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ms_e_getcrtc
 
@@ -3038,7 +2927,7 @@ do_modeset:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_GETCRTC
     lea rdx, [drm_crtc_save]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ms_e_getcrtc
 
@@ -3057,7 +2946,7 @@ do_modeset:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_CREATE_DUMB
     lea rdx, [drm_dumb_create]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ms_e_dumb
     mov eax, [drm_dumb_create + 16]
@@ -3087,7 +2976,7 @@ do_modeset:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_MAP_DUMB
     lea rdx, [drm_dumb_map]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ms_e_mapdumb
     mov rax, [drm_dumb_map + 8]
@@ -3101,7 +2990,7 @@ do_modeset:
     mov r10d, MAP_SHARED
     mov r8, [drm_fd]
     mov r9, [drm_dumb_offset]
-    syscall
+    FRAME_SYSCALL
     cmp rax, -4096
     ja .ms_e_mmap
     mov [drm_dumb_addr], rax
@@ -3137,7 +3026,7 @@ do_modeset:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_ADDFB
     lea rdx, [drm_fb_cmd]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ms_e_addfb
     mov eax, [drm_fb_cmd]
@@ -3176,7 +3065,7 @@ do_modeset:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_SETCRTC
     lea rdx, [drm_crtc_set]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ms_e_setcrtc
 
@@ -3190,7 +3079,7 @@ do_modeset:
     mov qword [rdi + 8], 0
     mov rax, SYS_NANOSLEEP
     xor esi, esi
-    syscall
+    FRAME_SYSCALL
 
     ; Restore the original CRTC. drm_crtc_save came back from GETCRTC with
     ; the original mode + fb_id; replaying it via SETCRTC puts things back
@@ -3200,7 +3089,7 @@ do_modeset:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_SETCRTC
     lea rdx, [drm_crtc_save]
-    syscall
+    FRAME_SYSCALL
 
     ; Cleanup: RMFB, munmap, DESTROY_DUMB, DROP_MASTER, close.
     mov eax, [drm_fb_id]
@@ -3209,12 +3098,12 @@ do_modeset:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_RMFB
     lea rdx, [drm_dumb_destroy]
-    syscall
+    FRAME_SYSCALL
 
     mov rax, SYS_MUNMAP
     mov rdi, [drm_dumb_addr]
     mov rsi, [drm_dumb_size]
-    syscall
+    FRAME_SYSCALL
 
     mov eax, [drm_dumb_handle]
     mov [drm_dumb_destroy], eax
@@ -3222,17 +3111,17 @@ do_modeset:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_DESTROY_DUMB
     lea rdx, [drm_dumb_destroy]
-    syscall
+    FRAME_SYSCALL
 
     mov rax, SYS_IOCTL
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_DROP_MASTER
     xor edx, edx
-    syscall
+    FRAME_SYSCALL
 
     mov rax, SYS_CLOSE
     mov rdi, [drm_fd]
-    syscall
+    FRAME_SYSCALL
 
     mov rsi, ms_restore_ok
     mov rdx, ms_restore_ok_len
@@ -3250,7 +3139,7 @@ do_modeset:
     call write_stderr
     mov rax, SYS_CLOSE
     mov rdi, [drm_fd]
-    syscall
+    FRAME_SYSCALL
     jmp .ms_done
 .ms_e_no_conn:
     mov rsi, ms_no_conn
@@ -3310,10 +3199,10 @@ do_modeset:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_DROP_MASTER
     xor edx, edx
-    syscall
+    FRAME_SYSCALL
     mov rax, SYS_CLOSE
     mov rdi, [drm_fd]
-    syscall
+    FRAME_SYSCALL
 .ms_done:
     pop r15
     pop r14
@@ -3346,7 +3235,7 @@ getconnector_probed:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_GETCONNECTOR
     lea rdx, [drm_conn_buf]
-    syscall                                   ; counts all 0 → kernel probes
+    FRAME_SYSCALL                                   ; counts all 0 → kernel probes
     lea rdi, [drm_conn_buf]
     xor eax, eax
     mov ecx, 10
@@ -3367,7 +3256,7 @@ getconnector_probed:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_GETCONNECTOR
     lea rdx, [drm_conn_buf]
-    syscall
+    FRAME_SYSCALL
     ret
 
 ; ----------------------------------------------------------------------------
@@ -3481,7 +3370,7 @@ do_probe_input:
     lea rdi, [input_dev_path]
     xor esi, esi
     xor edx, edx
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .pi_next
     push rax
@@ -3491,7 +3380,7 @@ do_probe_input:
     mov esi, EVIOCGNAME_64
     lea rdx, [input_dev_name]
     mov rax, SYS_IOCTL
-    syscall
+    FRAME_SYSCALL
     pop rdi                              ; recover fd
     push rdi
     test rax, rax
@@ -3516,7 +3405,7 @@ do_probe_input:
 .pi_close_skip:
     pop rdi
     mov rax, SYS_CLOSE
-    syscall
+    FRAME_SYSCALL
 .pi_next:
     inc ebx
     jmp .pi_loop
@@ -3557,7 +3446,7 @@ do_watch_input:
     mov rax, SYS_OPEN
     xor esi, esi
     xor edx, edx
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .wi_open_fail
     mov r12, rax
@@ -3567,7 +3456,7 @@ do_watch_input:
     mov esi, EVIOCGNAME_64
     lea rdx, [input_dev_name]
     mov rax, SYS_IOCTL
-    syscall
+    FRAME_SYSCALL
 
     mov rsi, input_watch_pre
     mov rdx, input_watch_pre_len
@@ -3583,7 +3472,7 @@ do_watch_input:
     mov rdi, r12
     lea rsi, [input_event_batch]
     mov rdx, INPUT_BATCH_BYTES
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     jle .wi_done
 
@@ -3601,7 +3490,7 @@ do_watch_input:
 .wi_done:
     mov rax, SYS_CLOSE
     mov rdi, r12
-    syscall
+    FRAME_SYSCALL
     pop r13
     pop r12
     pop rbx
@@ -3849,7 +3738,7 @@ client_close:
     mov edi, [clients_meta + rax]
     push rax
     mov rax, SYS_CLOSE
-    syscall
+    FRAME_SYSCALL
     pop rax
     mov dword [clients_meta + rax], -1
     mov edi, ebx
@@ -4038,7 +3927,7 @@ client_cleanup_resources:
     imul esi, ecx
     shl esi, 2
     mov rax, SYS_MUNMAP
-    syscall
+    FRAME_SYSCALL
 .ccr_px_clear:
     mov dword [r15], 0
     mov qword [r15 + 16], 0
@@ -4136,7 +4025,7 @@ client_cleanup_resources:
     push rcx
     mov rdi, [shm_segs + rcx + 8]
     mov eax, SYS_SHMDT
-    syscall
+    FRAME_SYSCALL
     pop rcx
     mov dword [shm_segs + rcx], 0
 .ccr_shm_next:
@@ -4473,7 +4362,7 @@ serve_loop:
     mov rax, SYS_POLL
     lea rdi, [pollfd_buf]
     mov esi, MAX_CLIENTS + 1 + MAX_INPUTS + 3
-    syscall                                  ; (timeout in edx)
+    FRAME_SYSCALL                                  ; (timeout in edx)
     test rax, rax
     jz .sl_poll_timeout
     js .sl_iter                              ; -EINTR or similar — re-poll
@@ -4505,7 +4394,7 @@ serve_loop:
     call write_stderr
     pop rdi
     mov rax, SYS_CLOSE
-    syscall
+    FRAME_SYSCALL
     jmp .sl_clients
 .sl_announce_ok:
     mov rsi, log_accepted
@@ -4587,7 +4476,7 @@ serve_loop:
     mov edi, [uevent_fd]
     lea rsi, [uevent_buf]
     mov rdx, 4096
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     jle .sl_no_uevent                        ; EAGAIN → drained
     ; scan the datagram for "drm" (change@ ... /drm/cardN, HOTPLUG=1)
@@ -4636,7 +4525,7 @@ serve_loop:
     mov rdi, [drm_fd]
     lea rsi, [drm_event_buf]
     mov rdx, 64
-    syscall
+    FRAME_SYSCALL
     ; Walk the events: each FLIP_COMPLETE (type 2) retires one in-flight
     ; flip. With two outputs the two completions can arrive in one read or
     ; two wakeups — flip_pending is a count, not a flag.
@@ -4724,7 +4613,7 @@ client_process:
     mov edi, r13d
     mov edx, CLIENT_BUF_SIZE
     sub edx, r14d                             ; space left
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     jle .cp_close                             ; 0=EOF, <0=error
     add r14d, eax
@@ -5508,7 +5397,7 @@ handle_intern_atom:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
 
     pop r15
     pop r14
@@ -5583,7 +5472,7 @@ handle_shm:
     lea rsi, [reply_buf]
     mov edx, r8d
     mov eax, SYS_WRITE
-    syscall
+    FRAME_SYSCALL
     ret
 
 .shm_attach:
@@ -5605,7 +5494,7 @@ handle_shm:
     mov edx, SHM_RDONLY
 .shm_att_mode:
     push rbx
-    syscall
+    FRAME_SYSCALL
     pop rbx
     test rax, rax
     jns .shm_att_ok
@@ -5619,7 +5508,7 @@ handle_shm:
     xor esi, esi
     mov edx, SHM_RDONLY
     push rbx
-    syscall
+    FRAME_SYSCALL
     pop rbx
     test rax, rax
     js .shm_attach_done
@@ -5630,7 +5519,7 @@ handle_shm:
     mov edi, r13d
     mov esi, IPC_STAT
     lea rdx, [shmid_ds_buf]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .shm_attach_detach                    ; can't size it → safest to detach
     mov r13, [shmid_ds_buf + 48]             ; shm_segsz
@@ -5657,7 +5546,7 @@ handle_shm:
 .shm_attach_detach:
     mov eax, SYS_SHMDT
     mov rdi, rbx
-    syscall
+    FRAME_SYSCALL
     pop rcx                                  ; discard the pushed ro flag
     jmp .shm_attach_ret
 .shm_attach_done:
@@ -5684,7 +5573,7 @@ handle_shm:
     push rax
     mov rdi, [shm_segs + rax + 8]
     mov eax, SYS_SHMDT
-    syscall
+    FRAME_SYSCALL
     pop rax
     mov dword [shm_segs + rax], 0
 .shm_detach_done:
@@ -5843,7 +5732,7 @@ handle_shm_get_image:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov edx, 32
-    syscall
+    FRAME_SYSCALL
     jmp .sgi_out
 .sgi_err:
     ; BadMatch error so the client unblocks instead of hanging.
@@ -5863,7 +5752,7 @@ handle_shm_get_image:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov edx, 32
-    syscall
+    FRAME_SYSCALL
 .sgi_out:
     add rsp, 40
     pop rbp
@@ -5914,7 +5803,7 @@ handle_xfixes:
     lea rsi, [reply_buf]
     mov edx, r8d
     mov eax, SYS_WRITE
-    syscall
+    FRAME_SYSCALL
     ret
 
 .xf_select_input:
@@ -6234,7 +6123,7 @@ handle_query_extension:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
 
     pop r13
     pop r12
@@ -6268,7 +6157,7 @@ handle_xtest:
     lea rsi, [reply_buf]
     mov edx, r8d
     mov eax, SYS_WRITE
-    syscall
+    FRAME_SYSCALL
     ret
 
 .xt_compare_cursor:
@@ -6279,7 +6168,7 @@ handle_xtest:
     lea rsi, [reply_buf]
     mov edx, r8d
     mov eax, SYS_WRITE
-    syscall
+    FRAME_SYSCALL
     ret
 
 .xt_fake_input:
@@ -6469,7 +6358,7 @@ handle_shape:
     lea rsi, [reply_buf]
     mov edx, r8d
     mov eax, SYS_WRITE
-    syscall
+    FRAME_SYSCALL
     ret
 
 .shp_rectangles:
@@ -6576,7 +6465,7 @@ handle_shape:
     lea rsi, [reply_buf]
     mov edx, r8d
     mov eax, SYS_WRITE
-    syscall
+    FRAME_SYSCALL
     pop r14
     pop r13
     pop r12
@@ -6591,7 +6480,7 @@ handle_shape:
     lea rsi, [reply_buf]
     mov edx, r8d
     mov eax, SYS_WRITE
-    syscall
+    FRAME_SYSCALL
     ret
 
 .shp_get_rectangles:
@@ -6620,7 +6509,7 @@ handle_shape:
     lea rsi, [reply_buf]
     mov edx, r8d
     mov eax, SYS_WRITE
-    syscall
+    FRAME_SYSCALL
     pop r13
     pop rbx
     ret
@@ -6821,7 +6710,7 @@ handle_xkb:
     mov edi, r15d
     mov edx, r8d
     mov eax, SYS_WRITE
-    syscall
+    FRAME_SYSCALL
     ret
 
 .xkb_per_client_flags:
@@ -6842,7 +6731,7 @@ handle_xkb:
     mov edi, r15d
     mov edx, r8d
     mov eax, SYS_WRITE
-    syscall
+    FRAME_SYSCALL
     ret
 
 .xkb_get_device_info:
@@ -6870,7 +6759,7 @@ handle_xkb:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 36
-    syscall
+    FRAME_SYSCALL
     pop rbx
     ret
 
@@ -7025,7 +6914,7 @@ handle_xkb:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov edx, r8d
-    syscall
+    FRAME_SYSCALL
     pop r15
     pop r14
     pop r13
@@ -7115,7 +7004,7 @@ handle_xkb:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov edx, r8d
-    syscall
+    FRAME_SYSCALL
     pop r15
     pop r14
     pop r13
@@ -7127,7 +7016,7 @@ handle_xkb:
     mov edi, r15d
     mov edx, r8d
     mov eax, SYS_WRITE
-    syscall
+    FRAME_SYSCALL
     ret
 
 .xkb_use_ext:
@@ -7153,7 +7042,7 @@ handle_xkb:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
     pop rax
     pop rbx
     ret
@@ -7235,7 +7124,7 @@ handle_query_pointer:
     mov edi, r15d
     mov edx, 32
     mov eax, SYS_WRITE
-    syscall
+    FRAME_SYSCALL
     pop r13
     pop r12
     pop rbx
@@ -7379,7 +7268,7 @@ handle_translate_coordinates:
     mov edi, r15d
     mov edx, r8d
     mov eax, SYS_WRITE
-    syscall
+    FRAME_SYSCALL
     pop r14
     pop r13
     pop r12
@@ -7766,7 +7655,7 @@ handle_randr:
     mov edi, r15d
     mov edx, r8d
     mov eax, SYS_WRITE
-    syscall
+    FRAME_SYSCALL
     ret
 
 ; ----------------------------------------------------------------------------
@@ -8120,7 +8009,7 @@ handle_xinput:
     mov edi, r15d
     mov edx, r8d
     mov eax, SYS_WRITE
-    syscall
+    FRAME_SYSCALL
     pop r14
     pop r13
     pop rbx
@@ -8154,7 +8043,7 @@ handle_xinput:
     mov edi, r15d
     mov edx, r8d
     mov eax, SYS_WRITE
-    syscall
+    FRAME_SYSCALL
     ret
 
 ; XIQueryDevice — enumerate two master devices so GTK4/Qt see input. Master
@@ -8241,7 +8130,7 @@ handle_xinput:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov edx, r8d
-    syscall
+    FRAME_SYSCALL
     pop r14
     pop r13
     pop r12
@@ -8368,7 +8257,7 @@ handle_get_property:
     lea rsi, [reply_buf]
     mov edx, r10d
     add edx, 32
-    syscall
+    FRAME_SYSCALL
 
     ; Delete-on-read? Only when this read consumed to the end
     ; (bytes_after == 0) -- a chunked reader keeps the property
@@ -8402,7 +8291,7 @@ handle_get_property:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
 
 .gp_done:
     pop r14
@@ -8473,7 +8362,7 @@ handle_get_geometry:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
 
     pop r13
     pop r12
@@ -8566,7 +8455,7 @@ handle_query_tree:
     mov rdx, r15
     shl rdx, 2
     add rdx, 32
-    syscall
+    FRAME_SYSCALL
 
     pop r15
     pop r14
@@ -8629,7 +8518,7 @@ handle_list_extensions:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 100                             ; 32 header + 68 names
-    syscall
+    FRAME_SYSCALL
 
     pop r12
     pop rbx
@@ -8742,7 +8631,7 @@ handle_get_image:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov edx, 32
-    syscall
+    FRAME_SYSCALL
     ; Rows.
     mov dword [rsp + 20], 0                  ; row counter
 .gi_row:
@@ -8761,7 +8650,7 @@ handle_get_image:
     mov rax, [rsp]
     mov edi, [rax]
     mov rax, SYS_WRITE
-    syscall
+    FRAME_SYSCALL
     cmp rax, -4                              ; EINTR (e.g. the SIGUSR1 dump
     je .gi_wr                                ; handler) → retry, or the reply
                                              ; truncates and the stream desyncs
@@ -8791,7 +8680,7 @@ handle_get_image:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov edx, 32
-    syscall
+    FRAME_SYSCALL
 .gi_done:
     add rsp, 40
     pop rbp
@@ -8832,7 +8721,7 @@ handle_list_installed_colormaps:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 36
-    syscall
+    FRAME_SYSCALL
 
     pop r12
     pop rbx
@@ -8881,7 +8770,7 @@ handle_alloc_color:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov edx, 32
-    syscall
+    FRAME_SYSCALL
     pop r12
     pop rbx
     ret
@@ -8975,7 +8864,7 @@ handle_alloc_named_color:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov edx, 32
-    syscall
+    FRAME_SYSCALL
     pop r13
     pop r12
     pop rbx
@@ -9009,7 +8898,7 @@ handle_query_keymap:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 40
-    syscall
+    FRAME_SYSCALL
     pop r12
     pop rbx
     ret
@@ -9088,7 +8977,7 @@ handle_get_input_focus:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
 
     pop r12
     pop rbx
@@ -9176,7 +9065,7 @@ handle_get_keyboard_mapping:
     mov edi, [r12]
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
-    syscall
+    FRAME_SYSCALL
 
     pop r14
     pop r13
@@ -9200,7 +9089,7 @@ emit_canned_reply32:
     mov edi, [rdi]                           ; fd
     mov rax, SYS_WRITE
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
     pop rdx
     pop rsi
     pop rax
@@ -9287,7 +9176,7 @@ handle_get_window_attributes:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 44
-    syscall
+    FRAME_SYSCALL
 
     pop r13
     pop r12
@@ -9330,7 +9219,7 @@ handle_query_best_size:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
 
     pop r13
     pop r12
@@ -9387,7 +9276,7 @@ handle_get_keyboard_control:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 52
-    syscall
+    FRAME_SYSCALL
 
     pop r12
     pop rbx
@@ -9431,7 +9320,7 @@ handle_get_pointer_control:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
 
     pop r12
     pop rbx
@@ -9476,7 +9365,7 @@ handle_get_screen_saver:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
 
     pop r12
     pop rbx
@@ -9518,7 +9407,7 @@ handle_list_hosts:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
 
     pop r12
     pop rbx
@@ -9562,7 +9451,7 @@ handle_get_pointer_mapping:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 36
-    syscall
+    FRAME_SYSCALL
 
     pop r12
     pop rbx
@@ -9622,7 +9511,7 @@ handle_get_modifier_mapping:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 48
-    syscall
+    FRAME_SYSCALL
 
     pop r12
     pop rbx
@@ -9824,7 +9713,7 @@ window_destroy:
     movzx ecx, word [r13 + 42]               ; backing_h
     imul esi, ecx
     shl esi, 2                               ; bytes = w*h*4
-    syscall
+    FRAME_SYSCALL
     pop rbx
 .wd_kill_clear:
     mov dword [win_bgpix + rbx*4], 0         ; drop bg-pixmap ref (slot reuse)
@@ -10694,7 +10583,7 @@ handle_configure_window:
     mov esi, [rsp + 8]
     imul esi, [rsp]                           ; old w * old h
     shl esi, 2
-    syscall
+    FRAME_SYSCALL
     add rsp, 24
 .cfgw_recomp:
     mov byte [comp_dirty], 1
@@ -11267,7 +11156,7 @@ handle_get_atom_name:
     lea rsi, [reply_buf]
     mov edx, r9d
     add edx, 32
-    syscall
+    FRAME_SYSCALL
     jmp .gan_done
 
 .gan_zero:
@@ -11291,7 +11180,7 @@ handle_get_atom_name:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
 
 .gan_done:
     pop r14
@@ -11366,7 +11255,7 @@ handle_list_properties:
     mov rdx, r15
     shl rdx, 2
     add rdx, 32
-    syscall
+    FRAME_SYSCALL
 
     pop r15
     pop r14
@@ -11510,7 +11399,7 @@ read_framerc:
     lea rdi, [framerc_path]
     xor esi, esi                             ; O_RDONLY
     xor edx, edx
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .rf_done                              ; no ~/.framerc → US default
     mov rbx, rax                             ; fd
@@ -11518,11 +11407,11 @@ read_framerc:
     mov rdi, rbx
     lea rsi, [framerc_buf]
     mov edx, 2047
-    syscall
+    FRAME_SYSCALL
     push rax
     mov rax, SYS_CLOSE
     mov rdi, rbx
-    syscall
+    FRAME_SYSCALL
     pop rax
     test rax, rax
     jle .rf_done
@@ -12165,7 +12054,7 @@ handle_set_modifier_mapping:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov edx, 32
-    syscall
+    FRAME_SYSCALL
     xor edi, edi                             ; request = Modifier
     xor esi, esi
     xor edx, edx
@@ -12431,7 +12320,7 @@ maybe_grab_input:
     mov edi, ebx
     mov esi, 0x80044520                      ; EVIOCGBIT(0,4)
     lea rdx, [grab_bits]
-    syscall
+    FRAME_SYSCALL
     mov al, [grab_bits]
     test al, 0x0C                             ; EV_REL(2) | EV_ABS(3) → pointer
     jnz .mg_grab
@@ -12447,7 +12336,7 @@ maybe_grab_input:
     mov edi, ebx
     mov esi, 0x80604521                      ; EVIOCGBIT(EV_KEY,96)
     lea rdx, [grab_bits]
-    syscall
+    FRAME_SYSCALL
     test byte [grab_bits + 7], 0x02           ; KEY_SPACE = 57 = byte 7 bit 1
     jz .mg_done
 .mg_grab:
@@ -12455,7 +12344,7 @@ maybe_grab_input:
     mov edi, ebx
     mov esi, 0x40044590                      ; EVIOCGRAB
     mov edx, 1
-    syscall
+    FRAME_SYSCALL
 .mg_done:
     pop rbx
     ret
@@ -12516,9 +12405,9 @@ init_input:
     ; open O_RDONLY | O_NONBLOCK = 0 | 0x800
     mov rax, SYS_OPEN
     lea rdi, [input_dev_path]
-    mov esi, 0x800                            ; O_NONBLOCK
+    mov esi, O_NONBLOCK
     xor edx, edx
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ii_next
     ; Store the fd.
@@ -12665,7 +12554,7 @@ handle_grab_keyboard:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
 
     pop r12
     pop rbx
@@ -12711,7 +12600,7 @@ handle_grab_pointer:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
 
     pop r12
     pop rbx
@@ -12744,7 +12633,7 @@ process_input:
     mov rdi, r12
     lea rsi, [input_event_batch]
     mov rdx, INPUT_BATCH_BYTES
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     jle .pi_done                             ; 0=EOF, <0=error/EAGAIN
     mov r13, rax                             ; total bytes
@@ -12906,7 +12795,7 @@ dispatch_input_event:
     call compositor_shutdown
     mov rax, SYS_EXIT
     xor edi, edi
-    syscall
+    FRAME_SYSCALL
 .die_chk_vt:
     cmp r12d, 59                             ; F1..F10 = evdev 59..68 → VT 1..10
     jb .die_nozap
@@ -15521,7 +15410,7 @@ send_bad_window:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov edx, 32
-    syscall
+    FRAME_SYSCALL
     pop r13
     pop r12
     pop rbx
@@ -15640,7 +15529,7 @@ init_compositor:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_SET_MASTER
     xor edx, edx
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ic_fail_master
 
@@ -15669,7 +15558,7 @@ init_compositor:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_GETCRTC
     lea rdx, [drm_crtc_save]
-    syscall
+    FRAME_SYSCALL
 
     ; --- SETCRTC both outputs (crtc 1 at fb x=0, crtc 2 panned to ext_x) ---
     call compositor_program_crtcs
@@ -15807,7 +15696,7 @@ compositor_create_buffers:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_CREATE_DUMB
     lea rdx, [drm_dumb_create]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ccb_fail
     mov eax, [drm_dumb_create + 16]
@@ -15828,7 +15717,7 @@ compositor_create_buffers:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_MAP_DUMB
     lea rdx, [drm_dumb_map]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ccb_fail
     mov rax, [drm_dumb_map + 8]
@@ -15841,7 +15730,7 @@ compositor_create_buffers:
     mov r10d, MAP_SHARED
     mov r8, [drm_fd]
     mov r9, [drm_dumb_offset]
-    syscall
+    FRAME_SYSCALL
     cmp rax, -4096
     ja .ccb_fail
     mov [drm_dumb_addr], rax
@@ -15877,7 +15766,7 @@ compositor_create_buffers:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_ADDFB
     lea rdx, [drm_fb_cmd]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ccb_fail
     mov eax, [drm_fb_cmd]
@@ -15910,7 +15799,7 @@ compositor_create_buffers:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_CREATE_DUMB
     lea rdx, [drm_dumb_create]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ccb_fail
     mov eax, [drm_dumb_create + 16]
@@ -15926,7 +15815,7 @@ compositor_create_buffers:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_MAP_DUMB
     lea rdx, [drm_dumb_map]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ccb_fail
     mov rax, [drm_dumb_map + 8]
@@ -15939,7 +15828,7 @@ compositor_create_buffers:
     mov r10d, MAP_SHARED
     mov r8, [drm_fd]
     mov r9, [drm_dumb_offset]
-    syscall
+    FRAME_SYSCALL
     cmp rax, -4096
     ja .ccb_fail
     mov [comp_addr + 8], rax                 ; buffer 1 addr
@@ -15968,7 +15857,7 @@ compositor_create_buffers:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_ADDFB
     lea rdx, [drm_fb_cmd]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ccb_fail
     mov eax, [drm_fb_cmd]
@@ -16000,7 +15889,7 @@ encoder_pick_crtc:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_GETENCODER
     lea rdx, [drm_encoder_buf]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .epc_none
     mov eax, [drm_encoder_buf + 8]           ; current crtc
@@ -16138,7 +16027,7 @@ compositor_program_crtcs:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_SETCRTC
     lea rdx, [drm_crtc_set]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .cpc_ret
     cmp byte [ext_active], 0
@@ -16167,7 +16056,7 @@ compositor_program_crtcs:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_SETCRTC
     lea rdx, [drm_crtc_set2]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     jns .cpc_ok
     mov byte [ext_active], 0                 ; external refused its mode:
@@ -16195,7 +16084,7 @@ init_uevent_socket:
     lea rdi, [str_vtactive]
     xor esi, esi                             ; O_RDONLY
     xor edx, edx
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ius_netlink
     mov [vtactive_fd], eax
@@ -16204,9 +16093,9 @@ init_uevent_socket:
 .ius_netlink:
     mov rax, SYS_SOCKET
     mov edi, 16                              ; AF_NETLINK
-    mov esi, 2 | 0x800 | 0x80000             ; DGRAM | NONBLOCK | CLOEXEC
+    mov esi, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC
     mov edx, 15                              ; NETLINK_KOBJECT_UEVENT
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ius_done
     mov [uevent_fd], eax
@@ -16220,12 +16109,12 @@ init_uevent_socket:
     mov edi, [uevent_fd]
     lea rsi, [nl_addr]
     mov edx, 12
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     jns .ius_done
     mov rax, SYS_CLOSE                       ; bind refused → feature off
     mov edi, [uevent_fd]
-    syscall
+    FRAME_SYSCALL
     mov dword [uevent_fd], -1
 .ius_done:
     ret
@@ -16345,36 +16234,36 @@ compositor_release_buffers:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_RMFB
     lea rdx, [drm_dumb_destroy]
-    syscall
+    FRAME_SYSCALL
     mov rax, SYS_MUNMAP
     mov rdi, [comp_addr + 0]
     mov rsi, [drm_dumb_size]
-    syscall
+    FRAME_SYSCALL
     mov eax, [comp_handle + 0]
     mov [drm_dumb_destroy], eax
     mov rax, SYS_IOCTL
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_DESTROY_DUMB
     lea rdx, [drm_dumb_destroy]
-    syscall
+    FRAME_SYSCALL
     mov eax, [comp_fbid + 4]
     mov [drm_dumb_destroy], eax
     mov rax, SYS_IOCTL
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_RMFB
     lea rdx, [drm_dumb_destroy]
-    syscall
+    FRAME_SYSCALL
     mov rax, SYS_MUNMAP
     mov rdi, [comp_addr + 8]
     mov rsi, [drm_dumb_size]
-    syscall
+    FRAME_SYSCALL
     mov eax, [comp_handle + 4]
     mov [drm_dumb_destroy], eax
     mov rax, SYS_IOCTL
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_DESTROY_DUMB
     lea rdx, [drm_dumb_destroy]
-    syscall
+    FRAME_SYSCALL
     ret
 
 ; ----------------------------------------------------------------------------
@@ -16396,7 +16285,7 @@ init_hw_cursor:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_CREATE_DUMB
     lea rdx, [drm_cursor_create]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ihc_fail
     mov eax, [drm_cursor_create + 16]        ; handle
@@ -16412,7 +16301,7 @@ init_hw_cursor:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_MAP_DUMB
     lea rdx, [drm_cursor_map]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ihc_fail
     ; mmap the BO: size = pitch * 64
@@ -16425,7 +16314,7 @@ init_hw_cursor:
     mov r8, [drm_fd]
     mov r9, [drm_cursor_map + 8]             ; offset
     mov rax, SYS_MMAP
-    syscall
+    FRAME_SYSCALL
     cmp rax, -4096
     ja .ihc_fail
     mov [cursor_fb_addr], rax
@@ -16451,7 +16340,7 @@ init_hw_cursor:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_CURSOR
     lea rdx, [drm_cursor]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ihc_fail
     mov dword [cursor_ready], 1
@@ -16953,7 +16842,7 @@ cursor_move_hw:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_CURSOR
     lea rdx, [drm_cursor]
-    syscall
+    FRAME_SYSCALL
 .cmh_done:
     ret
 
@@ -16976,7 +16865,7 @@ cursor_set_bo:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_CURSOR
     lea rdx, [drm_cursor]
-    syscall
+    FRAME_SYSCALL
     pop r12
     pop rbx
     ret
@@ -17019,7 +16908,7 @@ init_fbtest:
     mov r10d, 0x22                            ; MAP_PRIVATE|MAP_ANONYMOUS
     mov r8, -1
     xor r9d, r9d
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .ft_fail
     mov [comp_addr + rbx*8], rax
@@ -17445,7 +17334,7 @@ recomposite_screen:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_PAGE_FLIP
     lea rdx, [drm_page_flip]
-    syscall
+    FRAME_SYSCALL
 
     cmp byte [dirtyfb_logged], 0             ; log the first flip's rc once
     jne .rs_flip_logged
@@ -17484,7 +17373,7 @@ recomposite_screen:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_PAGE_FLIP
     lea rdx, [drm_page_flip]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .rs_fb_swap                           ; ext flip refused: don't gate on it
     inc byte [flip_pending]
@@ -17723,7 +17612,7 @@ load_wallpaper:
     lea rdi, [wallpaper_path]
     xor esi, esi                              ; O_RDONLY
     xor edx, edx
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .lw_none                               ; can't open → solid bg
     mov r13d, eax                             ; r13 = fd
@@ -17735,7 +17624,7 @@ load_wallpaper:
     mov rax, SYS_READ
     mov edi, r13d
     lea rsi, [wallpaper_buf + rbx]
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     jle .lw_close_none                        ; EOF/short/error → wrong size
     add ebx, eax
@@ -17743,14 +17632,14 @@ load_wallpaper:
 .lw_full:
     mov rax, SYS_CLOSE
     mov edi, r13d
-    syscall
+    FRAME_SYSCALL
     lea rax, [wallpaper_buf]
     mov [wallpaper_ptr], rax                  ; success
     jmp .lw_pop
 .lw_close_none:
     mov rax, SYS_CLOSE
     mov edi, r13d
-    syscall
+    FRAME_SYSCALL
 .lw_none:
     mov qword [wallpaper_ptr], 0
 .lw_pop:
@@ -18088,7 +17977,7 @@ apply_gamma:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_SETGAMMA
     lea rdx, [gamma_lut]
-    syscall
+    FRAME_SYSCALL
     ; External output shares the same LUT.
     cmp byte [ext_active], 0
     je .ag_ret
@@ -18098,7 +17987,7 @@ apply_gamma:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_SETGAMMA
     lea rdx, [gamma_lut]
-    syscall
+    FRAME_SYSCALL
 .ag_ret:
     pop r15
     pop r14
@@ -18112,7 +18001,7 @@ now_mono_ms:
     mov rax, SYS_CLOCK_GETTIME
     mov edi, CLOCK_MONOTONIC
     lea rsi, [mono_ts]
-    syscall
+    FRAME_SYSCALL
     mov rax, [mono_ts]
     imul rax, rax, 1000
     push rax
@@ -18136,7 +18025,7 @@ now_real_ms:
     mov rax, SYS_CLOCK_GETTIME
     xor edi, edi                             ; CLOCK_REALTIME
     lea rsi, [mono_ts]
-    syscall
+    FRAME_SYSCALL
     mov rax, [mono_ts]
     imul rax, rax, 1000
     push rax
@@ -18170,7 +18059,7 @@ comp_blank:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_SETCRTC
     lea rdx, [blank_crtc_cmd]
-    syscall
+    FRAME_SYSCALL
     cmp byte [ext_active], 0                 ; the external sleeps too
     je .cb_one
     mov eax, [ext_crtc]
@@ -18179,7 +18068,7 @@ comp_blank:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_SETCRTC
     lea rdx, [blank_crtc_cmd]
-    syscall
+    FRAME_SYSCALL
 .cb_one:
     mov byte [blank_state], 1
     lea rsi, [log_blank]
@@ -18199,14 +18088,14 @@ comp_unblank:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_SETCRTC
     lea rdx, [drm_crtc_set]
-    syscall
+    FRAME_SYSCALL
     cmp byte [ext_active], 0
     je .cu_one
     mov rax, SYS_IOCTL
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_SETCRTC
     lea rdx, [drm_crtc_set2]
-    syscall
+    FRAME_SYSCALL
 .cu_one:
     mov byte [blank_state], 0
     mov byte [flip_pending], 0               ; any in-flight flip died with the CRTC
@@ -18220,31 +18109,40 @@ comp_unblank:
     ret
 
 ; ----------------------------------------------------------------------------
-; install_exit_handler — edi = signal number. Installs exit_handler with
-; the kernel sigaction ABI (needs SA_RESTORER + a restorer trampoline,
-; since we're libc-free).
+; install_exit_handler — edi = signal number. Installs exit_handler using
+; the selected kernel's sigaction layout. Linux needs SA_RESTORER; FreeBSD
+; supplies its signal-return trampoline in the delivered signal frame.
 ; ----------------------------------------------------------------------------
 install_exit_handler:
     push rdi
     lea rdi, [sig_sa_buf]
     lea rax, [exit_handler]
-    mov [rdi + 0], rax                       ; sa_handler
-    mov qword [rdi + 8], SA_RESTORER         ; sa_flags
+    mov [rdi + SA_HANDLER_OFFSET], rax
+    mov dword [rdi + SA_FLAGS_OFFSET], SA_HANDLER_FLAGS
+    mov qword [rdi + SA_MASK_OFFSET], 0
+%ifdef FRAME_PLATFORM_FREEBSD
+    mov qword [rdi + SA_MASK_OFFSET + 8], 0
+%endif
+%ifdef FRAME_PLATFORM_LINUX
     lea rax, [sig_restorer]
-    mov [rdi + 16], rax                      ; sa_restorer
-    mov qword [rdi + 24], 0                  ; sa_mask
+    mov [rdi + SA_RESTORER_OFFSET], rax
+%endif
     pop rdi                                   ; signum
     mov rax, SYS_RT_SIGACTION
     ; rdi = signum already
     lea rsi, [sig_sa_buf]
     xor edx, edx                             ; oldact = NULL
-    mov r10, 8                               ; sigsetsize
-    syscall
+    FRAME_SIGACTION
     ret
 
 sig_restorer:
+%ifdef FRAME_PLATFORM_LINUX
     mov rax, SYS_RT_SIGRETURN
-    syscall
+    FRAME_SYSCALL
+%else
+    ; FreeBSD supplies the signal-return trampoline in its signal frame.
+    ret
+%endif
 
 ; ----------------------------------------------------------------------------
 ; exit_handler — restore the console CRTC, drop DRM master, exit 0.
@@ -18255,7 +18153,7 @@ exit_handler:
     call compositor_shutdown
     mov rax, SYS_EXIT
     xor edi, edi
-    syscall
+    FRAME_SYSCALL
 
 ; ----------------------------------------------------------------------------
 ; switch_vt — edi = target VT number. Restore the console + drop DRM master,
@@ -18280,11 +18178,11 @@ switch_vt:
     mov rax, SYS_IOCTL
     mov esi, 0x5606                          ; VT_ACTIVATE
     mov edx, [pending_vt]
-    syscall
+    FRAME_SYSCALL
     mov rdx, rax                             ; ioctl result (survives close)
     pop rdi
     mov rax, SYS_CLOSE
-    syscall
+    FRAME_SYSCALL
     test rdx, rdx
     jns .sv_done
 .sv_fail:
@@ -18307,11 +18205,11 @@ switch_vt:
     mov rax, SYS_IOCTL
     mov esi, 0x5606                          ; VT_ACTIVATE
     mov edx, [pending_vt]
-    syscall
+    FRAME_SYSCALL
 .sv_exit:
     mov rax, SYS_EXIT
     xor edi, edi
-    syscall
+    FRAME_SYSCALL
 
 ; ----------------------------------------------------------------------------
 ; vt_console_open — open the console for VT ioctls. Rootless frame cannot
@@ -18346,14 +18244,14 @@ vt_console_open:
     lea rdi, [vt_dev_path]
     mov esi, 1                               ; O_WRONLY
     xor edx, edx
-    syscall
+    FRAME_SYSCALL
     ret
 .vco_tty0:
     mov rax, SYS_OPEN
     lea rdi, [str_dev_tty0]
     mov esi, 1
     xor edx, edx
-    syscall
+    FRAME_SYSCALL
     ret
 
 ; ----------------------------------------------------------------------------
@@ -18383,18 +18281,18 @@ vt_release_display:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_SETCRTC
     lea rdx, [blank_crtc_cmd]
-    syscall
+    FRAME_SYSCALL
 .vrd_ext_done:
     mov rax, SYS_IOCTL
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_SETCRTC
     lea rdx, [drm_crtc_save]                 ; console's saved CRTC state
-    syscall
+    FRAME_SYSCALL
     mov rax, SYS_IOCTL
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_DROP_MASTER
     xor edx, edx
-    syscall
+    FRAME_SYSCALL
     ; ungrab every input fd + reset input state
     xor ebx, ebx
 .vrd_ungrab:
@@ -18406,7 +18304,7 @@ vt_release_display:
     mov rax, SYS_IOCTL
     mov esi, 0x40044590                      ; EVIOCGRAB
     xor edx, edx                             ; 0 = release
-    syscall
+    FRAME_SYSCALL
 .vrd_next:
     inc ebx
     jmp .vrd_ungrab
@@ -18433,7 +18331,7 @@ vt_reacquire:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_SET_MASTER
     xor edx, edx
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .vra_done                             ; master busy: stay away, the next
     mov byte [vt_away], 0                    ; VT event retries
@@ -18482,12 +18380,12 @@ vt_read_active:
     mov rax, SYS_LSEEK
     xor esi, esi
     xor edx, edx
-    syscall
+    FRAME_SYSCALL
     mov rax, SYS_READ
     mov edi, [vtactive_fd]
     lea rsi, [vtact_buf]
     mov rdx, 15
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     jle .vra_zero
     ; parse the digits after "tty"
@@ -18541,13 +18439,13 @@ compositor_shutdown:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_SETCRTC
     lea rdx, [blank_crtc_cmd]
-    syscall
+    FRAME_SYSCALL
 .cs_ext_off_done:
     mov rax, SYS_IOCTL
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_SETCRTC
     lea rdx, [drm_crtc_save]
-    syscall
+    FRAME_SYSCALL
 
     ; 2. Tear down BOTH compositor buffers: RMFB → munmap → DESTROY_DUMB. Doing
     ;    this deterministically here (not implicitly at exit) is what lets the
@@ -18561,10 +18459,10 @@ compositor_shutdown:
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_DROP_MASTER
     xor edx, edx
-    syscall
+    FRAME_SYSCALL
     mov rax, SYS_CLOSE
     mov rdi, [drm_fd]
-    syscall
+    FRAME_SYSCALL
 .cs_done:
     ret
 
@@ -18929,7 +18827,7 @@ window_ensure_backing:
     movzx ecx, word [rbx + 42]
     imul esi, ecx
     shl esi, 2
-    syscall
+    FRAME_SYSCALL
     mov byte [rbx + 31], 0
 .web_alloc:
     ; bytes = w*h*4
@@ -18946,7 +18844,7 @@ window_ensure_backing:
     mov r10d, MAP_PRIVATE | MAP_ANONYMOUS
     mov r8, -1
     xor r9, r9
-    syscall
+    FRAME_SYSCALL
     cmp rax, -4096
     ja .web_fail
     mov [rbx + 32], rax                      ; backing_ptr
@@ -20202,7 +20100,7 @@ handle_create_pixmap:
     mov r10d, MAP_PRIVATE | MAP_ANONYMOUS
     mov r8, -1
     xor r9, r9
-    syscall
+    FRAME_SYSCALL
     pop rcx                                   ; bytes (unused now)
     cmp rax, -4096
     ja .cpx_done
@@ -20238,7 +20136,7 @@ handle_free_pixmap:
     imul esi, ecx
     shl esi, 2
     mov rax, SYS_MUNMAP
-    syscall
+    FRAME_SYSCALL
     mov dword [rbx], 0                        ; clear slot
     mov qword [rbx + 16], 0
 .fpx_done:
@@ -21516,7 +21414,7 @@ handle_send_event:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
 .se_done:
     pop r13
     pop r12
@@ -21687,7 +21585,7 @@ handle_render:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
     pop rax
     jmp .hr_done
 
@@ -21778,7 +21676,7 @@ handle_render:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 216
-    syscall
+    FRAME_SYSCALL
 .hr_done:
     pop r12
     pop rbx
@@ -21856,7 +21754,7 @@ handle_xvideo:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
     jmp .xv_done
 
 .xv_query_adaptors:
@@ -21897,7 +21795,7 @@ handle_xvideo:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 60
-    syscall
+    FRAME_SYSCALL
     jmp .xv_done
 
 .xv_query_encodings:
@@ -21932,7 +21830,7 @@ handle_xvideo:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 60
-    syscall
+    FRAME_SYSCALL
     jmp .xv_done
 
 .xv_grab_port:
@@ -21956,7 +21854,7 @@ handle_xvideo:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
     jmp .xv_done
 
 .xv_ungrab_port:
@@ -21992,7 +21890,7 @@ handle_xvideo:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
     jmp .xv_done
 
 .xv_set_port_attribute:
@@ -22017,7 +21915,7 @@ handle_xvideo:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
     jmp .xv_done
 
 .xv_query_port_attributes:
@@ -22040,7 +21938,7 @@ handle_xvideo:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
     jmp .xv_done
 
 .xv_list_image_formats:
@@ -22069,7 +21967,7 @@ handle_xvideo:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 160                              ; 32 + 128
-    syscall
+    FRAME_SYSCALL
     jmp .xv_done
 
 .xv_query_image_attributes:
@@ -22132,7 +22030,7 @@ handle_xvideo:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 56
-    syscall
+    FRAME_SYSCALL
     jmp .xv_done
 
 .xv_put_image:
@@ -24179,7 +24077,7 @@ handle_get_selection_owner:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 32
-    syscall
+    FRAME_SYSCALL
     pop rax
     pop r12
     pop rbx
@@ -24316,7 +24214,7 @@ handle_query_font:
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov rdx, 60
-    syscall
+    FRAME_SYSCALL
     pop rbx
     ret
 
@@ -24329,17 +24227,21 @@ handle_query_font:
 install_dump_handler:
     lea rdi, [sig_sa_buf]
     lea rax, [dump_handler]
-    mov [rdi + 0], rax
-    mov qword [rdi + 8], SA_RESTORER
+    mov [rdi + SA_HANDLER_OFFSET], rax
+    mov dword [rdi + SA_FLAGS_OFFSET], SA_HANDLER_FLAGS
+    mov qword [rdi + SA_MASK_OFFSET], 0
+%ifdef FRAME_PLATFORM_FREEBSD
+    mov qword [rdi + SA_MASK_OFFSET + 8], 0
+%endif
+%ifdef FRAME_PLATFORM_LINUX
     lea rax, [sig_restorer]
-    mov [rdi + 16], rax
-    mov qword [rdi + 24], 0
+    mov [rdi + SA_RESTORER_OFFSET], rax
+%endif
     mov rax, SYS_RT_SIGACTION
     mov edi, SIGUSR1
     lea rsi, [sig_sa_buf]
     xor edx, edx
-    mov r10, 8
-    syscall
+    FRAME_SIGACTION
     ret
 
 dump_handler:
@@ -24445,9 +24347,9 @@ dump_handler:
     ; --- write the raw ARGB backing to the per-xid path ---
     mov rax, SYS_OPEN
     lea rdi, [dump_path_buf]
-    mov esi, 0x241                            ; O_WRONLY|O_CREAT|O_TRUNC
+    mov esi, O_WRONLY | O_CREAT | O_TRUNC
     mov edx, 0x1A4                            ; 0644
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .dh_wf_done
     push rax                                  ; fd
@@ -24459,10 +24361,10 @@ dump_handler:
     mov rax, SYS_WRITE
     mov rdi, [rsp]
     mov rsi, [r12 + 32]
-    syscall
+    FRAME_SYSCALL
     mov rax, SYS_CLOSE
     mov rdi, [rsp]
-    syscall
+    FRAME_SYSCALL
     add rsp, 8
 .dh_wf_done:
     movzx r14d, word [r12 + 40]
@@ -24572,7 +24474,7 @@ dump_handler:
     lea rdi, [dump_fb0_path]
     mov esi, 0x241
     mov edx, 0x1A4
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .dh_fb1
     push rax
@@ -24580,16 +24482,16 @@ dump_handler:
     mov rsi, [comp_addr + 0]
     mov rdx, [drm_dumb_size]
     mov rax, SYS_WRITE
-    syscall
+    FRAME_SYSCALL
     pop rdi
     mov rax, SYS_CLOSE
-    syscall
+    FRAME_SYSCALL
 .dh_fb1:
     mov rax, SYS_OPEN                         ; fb1
     lea rdi, [dump_fb1_path]
     mov esi, 0x241
     mov edx, 0x1A4
-    syscall
+    FRAME_SYSCALL
     test rax, rax
     js .dh_nofb
     push rax
@@ -24597,10 +24499,10 @@ dump_handler:
     mov rsi, [comp_addr + 8]
     mov rdx, [drm_dumb_size]
     mov rax, SYS_WRITE
-    syscall
+    FRAME_SYSCALL
     pop rdi
     mov rax, SYS_CLOSE
-    syscall
+    FRAME_SYSCALL
 .dh_nofb:
     pop r15
     pop r14
