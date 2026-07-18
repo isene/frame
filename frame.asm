@@ -618,7 +618,10 @@ last_enter_win:     resd 1               ; window the pointer was last inside �
 ;   +8  depth (u8)
 ;   +9  pad (7)
 ;   +16 backing_ptr (q)     — mmap'd ARGB buffer (w*h*4)
-%define MAX_PIXMAPS      256
+%define MAX_PIXMAPS      1024               ; 256 hit PXFULL x98 after 2.5 days
+                                            ; live (FF + glasses + kitty images
+                                            ; working set) — same story as
+                                            ; MAX_PICTURES in v0.0.133
 %define PIXMAP_REC_SIZE  24
 pixmaps:            resb MAX_PIXMAPS * PIXMAP_REC_SIZE
 
