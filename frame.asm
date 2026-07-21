@@ -17824,8 +17824,8 @@ bg_fill_rect:
     mov r13d, edi
     mov r14d, ecx
     mov r15, [drm_dumb_addr]
-    mov ebp, [screen_w]
-    shl ebp, 2                                ; wallpaper stride = screen_w*4
+    mov ebp, [panel_w]
+    shl ebp, 2                                ; wallpaper stride = panel_w*4
 .bfr_row:
     test r14d, r14d
     jz .bfr_done
@@ -17837,6 +17837,21 @@ bg_fill_rect:
     mov eax, ebx
     shl eax, 2
     add rdi, rax
+    ; The wallpaper is PANEL-sized (the wp-set / .framebg contract), not
+    ; screen-sized: on a dual-head wide fb, sampling it with screen_w
+    ; stride read every row at double pitch and far past the buffer —
+    ; the "dragon got messed up" garble. Rows beyond panel_h and columns
+    ; beyond panel_w (the external monitor's area) get the solid bg.
+    cmp r12d, [panel_h]
+    jge .bfr_solid_row
+    mov ecx, [panel_w]
+    sub ecx, ebx                              ; image pixels left of panel edge
+    jle .bfr_solid_row                        ; rect starts right of the image
+    cmp ecx, r13d
+    jle .bfr_have_imgw
+    mov ecx, r13d                             ; whole rect row is image
+.bfr_have_imgw:
+    push rcx
     ; src = wallpaper_ptr + y*stride + x*4
     mov rsi, [wallpaper_ptr]
     mov eax, r12d
@@ -17845,8 +17860,20 @@ bg_fill_rect:
     mov eax, ebx
     shl eax, 2
     add rsi, rax
-    mov ecx, r13d
     rep movsd
+    pop rcx
+    mov eax, r13d
+    sub eax, ecx                              ; solid tail beyond the image
+    jle .bfr_row_next
+    mov ecx, eax
+    mov eax, COMP_BG_COLOR
+    rep stosd
+    jmp .bfr_row_next
+.bfr_solid_row:
+    mov ecx, r13d
+    mov eax, COMP_BG_COLOR
+    rep stosd
+.bfr_row_next:
     inc r12d
     dec r14d
     jmp .bfr_row
