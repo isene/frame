@@ -2,3 +2,5 @@ frame
 frame.o
 *.swp
 /test/
+*.deb
+pkgroot/

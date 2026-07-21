@@ -338,6 +338,23 @@ nasm -f elf64 frame.asm -o frame.o && ld frame.o -o frame
 State is BSS-allocated (no malloc). Per-client connection state lives
 in fixed slots; multi-client work in phase 4.
 
+## Packages
+
+**Debian/Ubuntu**: every release ships a dependency-free static amd64
+`.deb` — grab it from the
+[latest release](https://github.com/isene/frame/releases/latest) and:
+
+```bash
+sudo apt install ./frame_*_amd64.deb
+```
+
+**Arch**: a `PKGBUILD` is included in the repo root:
+
+```bash
+git clone https://github.com/isene/frame.git && cd frame && makepkg -si
+```
+
+
 ## License
 
 [Unlicense](https://unlicense.org/) - public domain.
