@@ -58,6 +58,44 @@ DEFAULT REL
     inc dword [ev_dropped]       ; diagnosing "client went stale" reports)
 %%ok:
 %endmacro
+
+; ---- memory-safety helpers -------------------------------------------------
+; The dangerous pattern in a wire-protocol server is a client-supplied length
+; or index driving a memory access without a guard. These two macros make the
+; guard uniform and greppable so a future handler can't silently omit it.
+;
+; REQ_AVAIL — clamp a wire-declared byte length to what the request actually
+; contains past a fixed header. client_process already guarantees the whole
+; request (per its length field) is buffered, so [reqptr+2]<<2 is a real,
+; in-bounds byte count; this stops a short/lying length from reading stale
+; buffer bytes beyond the request's own end (InternAtom name, ChangeProperty
+; value, ...). For a well-formed request the payload always fits, so the
+; clamp is a no-op — zero cost on the valid path.
+;   %1 = length reg (in/out, u32)   %2 = req ptr reg   %3 = header bytes (imm)
+;   %4 = scratch reg (u32, clobbered)
+; After: %1 = min(%1, max(0, request_bytes - %3)).
+%macro REQ_AVAIL 4
+    movzx %4, word [%2 + 2]       ; request length (4-byte units)
+    shl   %4, 2                   ; → bytes (whole request is buffered)
+    sub   %4, %3                  ; bytes available after the header
+    jg    %%have
+    xor   %1, %1                  ; header itself overruns → no payload
+    jmp   %%done
+%%have:
+    cmp   %1, %4
+    jbe   %%done
+    mov   %1, %4                  ; clamp to available
+%%done:
+%endmacro
+
+; IDX_OK — reject an out-of-range table index. Bail (unsigned) if %1 >= %2,
+; the guard every "wire value indexes a fixed-size table" site needs before
+; the access. Clobbers only flags.
+;   %1 = index reg   %2 = limit (reg/mem/imm)   %3 = bail label
+%macro IDX_OK 3
+    cmp   %1, %2
+    jae   %3
+%endmacro
 %define SYS_OPEN        2
 %define SYS_CLOSE       3
 %define SYS_LSEEK       8
@@ -69,6 +107,9 @@ DEFAULT REL
 %define SIGTERM         15
 %define SIGHUP          1
 %define SIGUSR1         10
+%define SIGILL          4
+%define SIGBUS          7
+%define SIGSEGV         11
 %define SA_RESTORER     0x04000000
 %define SYS_SOCKET      41
 %define SYS_BIND        49
@@ -437,7 +478,15 @@ bws_abs_y:          resd 1
 sih_result:         resb 1                 ; shape_input_hit scratch flag
 framerc_path:       resb 256               ; "$HOME/.framerc"
 framerc_buf:        resb 2048              ; ~/.framerc contents
-WALL_MAX            equ 1920*1200*4        ; max backing for the wallpaper (panel res)
+WALL_MAX            equ 7680*2160*4        ; max backing for the wallpaper — the WIDE
+                                           ; fb, not one panel: load_wallpaper refuses
+                                           ; a screen bigger than this and silently
+                                           ; falls back to the solid bg, so a 1920x1200
+                                           ; cap killed `background` on every dual-head
+                                           ; (or single 4K) setup. Sized for two 4K
+                                           ; outputs side by side; BSS is demand-paged,
+                                           ; so the reservation costs nothing until a
+                                           ; wallpaper is actually read into it.
 wallpaper_buf:      resb WALL_MAX          ; the raw BGRX pixels, read from the file once
 rc_remaps:          resb 16 * 28           ; staged `keycode` lines: keycode
                                            ; dword + 6 keysym dwords each
@@ -3448,8 +3497,10 @@ modeset_find_connector:
 ; ============================================================================
 ; do_probe_input — phase 3a. Scan /dev/input/event0..31, call EVIOCGNAME
 ; on each that opens, print "  event N: NAME". No privileges beyond reading
-; the device files (which on this system requires 'input' group; the user
-; can also be in 'video' to inherit that).
+; the device files. /dev/input/event* are root:input 0660, so that means
+; membership in 'input' (or root). 'video' does NOT grant it: group
+; membership doesn't cascade, and being in video while the nodes are
+; group input still opens 0 devices.
 ; ============================================================================
 do_probe_input:
     push rbx
@@ -5497,6 +5548,9 @@ handle_intern_atom:
     call client_buf_addr
     mov r13, rax                             ; request ptr
     movzx r14d, word [r13 + 4]               ; n
+    ; Clamp the name length to what the request actually holds so a short
+    ; request can't intern stale buffer bytes past its own end.
+    REQ_AVAIL r14d, r13, 8, eax
     lea r15, [r13 + 8]                       ; name ptr
     movzx ecx, byte [r13 + 1]                ; only-if-exists
 
@@ -9157,6 +9211,21 @@ handle_get_keyboard_mapping:
 
     movzx r14d, byte [r13 + 4]               ; first-keycode
     movzx ecx, byte [r13 + 5]                ; count
+    ; Clamp the wire-supplied range to keysym_table BEFORE it drives either
+    ; the source index or the reply length. Unchecked, first-keycode < 8
+    ; underflowed the index (crash) and first+count > 256 read past the
+    ; table into adjacent BSS and leaked it back to the client.
+    cmp r14d, X_MIN_KEYCODE
+    jae .gkm_first_ok
+    xor ecx, ecx                             ; first < min → nothing valid
+    jmp .gkm_range_ok
+.gkm_first_ok:
+    mov eax, X_MAX_KEYCODE + 1               ; 256
+    sub eax, r14d                            ; max count = 256 - first (1..248)
+    cmp ecx, eax
+    jbe .gkm_range_ok
+    mov ecx, eax                             ; clamp count into the table
+.gkm_range_ok:
 
     ; Header.
     lea rdi, [reply_buf]
@@ -11010,6 +11079,10 @@ handle_change_property:
     shl ecx, 2
 .cp_n_set:
     mov r13d, ecx                            ; nbytes for new data
+    ; Clamp the declared value length to what the request actually holds, so
+    ; a short/lying request can't copy stale buffer bytes into the stored
+    ; property value (a selection/clipboard infoleak).
+    REQ_AVAIL r13d, r12, 24, eax
 
     ; Allocate / fetch record.
     mov edi, [r12 + 4]                       ; window
@@ -11255,9 +11328,8 @@ handle_get_atom_name:
     mov r12, rax
 
     mov r13d, [r14 + 4]                      ; atom id
-    ; Bounds check.
-    cmp r13d, [atom_count]
-    jae .gan_zero
+    ; Bounds check (upper via IDX_OK, then reject atom 0 = None).
+    IDX_OK r13d, [atom_count], .gan_zero
     test r13d, r13d
     jz .gan_zero
     mov ecx, [atom_off + r13*4]              ; string offset
@@ -12558,6 +12630,13 @@ init_input:
     mov r13d, [input_fd_count]
     mov [input_fds + r13*4], eax
     inc dword [input_fd_count]
+    ; Only EVIOCGRAB when we actually own the display (--display). In
+    ; network-only / fbtest mode frame has nothing to draw and no business
+    ; stealing the live console's keyboard + mouse — grabbing there froze
+    ; the VT (no input, no Ctrl+C). Devices are still opened for reading, so
+    ; ungrabbed input flows to both frame and the console.
+    cmp byte [compositor_requested], 0
+    je .ii_next
     mov edi, eax                             ; fd → grab if keyboard/pointer
     call maybe_grab_input
 .ii_next:
@@ -15733,6 +15812,16 @@ init_compositor:
     call install_exit_handler
     mov edi, SIGHUP
     call install_exit_handler
+    ; Fault handlers: a memory-safety slip (OOB read/write, bad jump) must
+    ; not leave the panel dead while we hold DRM master. Restore the console
+    ; and exit instead. Only armed with the compositor up — network/fbtest
+    ; modes have no panel to protect.
+    mov edi, SIGSEGV
+    call install_crash_handler
+    mov edi, SIGBUS
+    call install_crash_handler
+    mov edi, SIGILL
+    call install_crash_handler
 
     ; Log what we got so we can verify mode/pitch/size after the fact.
     mov rsi, log_prefix
@@ -17749,7 +17838,11 @@ load_wallpaper:
     mov eax, [screen_w]
     imul eax, [screen_h]
     cmp eax, WALL_MAX / 4
-    ja .lw_close_none                         ; panel bigger than our buffer
+    ja .lw_none                               ; panel bigger than our buffer. No
+                                              ; fd open yet, so DON'T take the
+                                              ; close path (it would close r13's
+                                              ; stale value: a client socket, the
+                                              ; DRM fd, whatever was last in it)
     shl eax, 2
     mov r12d, eax                             ; r12 = expected bytes
     mov rax, SYS_OPEN
@@ -18316,6 +18409,43 @@ exit_handler:
     mov rax, SYS_EXIT
     xor edi, edi
     syscall
+
+; ----------------------------------------------------------------------------
+; crash_handler — SIGSEGV / SIGBUS / SIGILL. A missed bounds check anywhere
+; would otherwise fault while we hold DRM master, leaving the panel scanning
+; a freed framebuffer (black, recoverable only by a VT switch). This demotes
+; that to a clean console restore + non-zero exit. compositor_shutdown is
+; idempotent (its own re-entry guard), so a fault that occurs inside it just
+; early-outs instead of looping. Raw syscalls only → async-signal-safe.
+; Exit code 139 (128 + SIGSEGV) marks it as a crash without inviting a
+; launcher restart loop.
+; ----------------------------------------------------------------------------
+crash_handler:
+    call compositor_shutdown
+    mov rax, SYS_EXIT
+    mov edi, 139
+    syscall
+
+; ----------------------------------------------------------------------------
+; install_crash_handler — edi = signal number. Same sigaction ABI as
+; install_exit_handler but points at crash_handler.
+; ----------------------------------------------------------------------------
+install_crash_handler:
+    push rdi
+    lea rdi, [sig_sa_buf]
+    lea rax, [crash_handler]
+    mov [rdi + 0], rax                       ; sa_handler
+    mov qword [rdi + 8], SA_RESTORER         ; sa_flags
+    lea rax, [sig_restorer]
+    mov [rdi + 16], rax                      ; sa_restorer
+    mov qword [rdi + 24], 0                  ; sa_mask
+    pop rdi
+    mov rax, SYS_RT_SIGACTION
+    lea rsi, [sig_sa_buf]
+    xor edx, edx
+    mov r10, 8
+    syscall
+    ret
 
 ; ----------------------------------------------------------------------------
 ; switch_vt — edi = target VT number. Restore the console + drop DRM master,
