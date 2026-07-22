@@ -1100,6 +1100,7 @@ xi1_core_devs:      db 0,0,0,0, 2, 0, 0, 0
 dbg_pxfull:         db "PXFULL", 10        ; DIAG: CreatePixmap dropped — table full
 dbg_cli_tag:        db "c"                 ; DIAG: client slot prefix
 dbg_picfull:        db "PICFULL", 10       ; DIAG: CreatePicture dropped — table full
+dbg_gsfull:         db "GSFULL", 10        ; DIAG: CreateGlyphSet dropped — table full
 dbg_gcfull:         db "GCFULL", 10        ; DIAG: CreateGC dropped — table full
 log_request_pre:    db "  req opcode=", 0
 log_request_mid:    db " len=", 0
@@ -4094,6 +4095,31 @@ client_cleanup_resources:
     jmp .ccr_pic
 .ccr_pic_done:
 
+    ; Glyphsets: evict recs + pool bytes, then clear the slot. Dead clients
+    ; never send FreeGlyphSet; without this sweep the 64-slot table fills
+    ; over a session and new clients' CreateGlyphSet gets dropped — their
+    ; AddGlyphs then misreads A8 as ARGB32 and text renders scrambled
+    ; (2026-07-22 live-session garble).
+    xor ebx, ebx
+.ccr_gs:
+    cmp ebx, MAX_GLYPHSETS
+    jge .ccr_gs_done
+    mov rax, rbx
+    imul rax, GLYPHSET_REC
+    lea r15, [glyphsets + rax]
+    mov eax, [r15]
+    cmp eax, r13d
+    jb .ccr_gs_next
+    cmp eax, r14d
+    jae .ccr_gs_next
+    mov edi, eax
+    call glyph_evict_gsid                    ; reclaims recs + pool bytes
+    mov dword [r15], 0
+.ccr_gs_next:
+    inc ebx
+    jmp .ccr_gs
+.ccr_gs_done:
+
     ; Selection ownerships → None (the atom stays interned).
     xor ebx, ebx
 .ccr_sel:
@@ -7071,10 +7097,14 @@ handle_xkb:
     xor eax, eax
     mov ecx, 8
     rep stosd
-    ; KTLevelNames: name 0 levels per type (counts all 0, nKTLevels=0). Avoids
-    ; the num_levels>=wire check entirely; levels are simply unnamed (optional).
-    mov dword [rdi + 0], 0                    ; n_levels_per_type[4] = {0,0,0,0}
+    ; KTLevelNames: per-type level-name counts MUST equal the GetMap types'
+    ; numLevels — modern xkbcommon checks equality (kitty/GLFW died on
+    ; "type->num_levels == wire_num_levels"). Names themselves stay None(0).
+    mov dword [rdi + 0], 0x04020201           ; n_levels_per_type = {1,2,2,4}
     add rdi, 4
+    xor eax, eax
+    mov ecx, 9                                ; 1+2+2+4 level-name atoms, all None
+    rep stosd
     ; (indicatorNames / virtualModNames / groupNames all empty → 0 bytes)
     ; keyNames: one XkbKeyNameRec per keycode 8..255. Copy the standard XKB
     ; evdev names ("ESC","AE01","SPCE"…) so keycode→name→RDP-scancode mapping
@@ -7113,7 +7143,7 @@ handle_xkb:
     mov byte [rdi + 14], 4                    ; nTypes
     mov byte [rdi + 18], X_MIN_KEYCODE        ; firstKey
     mov byte [rdi + 19], KEYCODE_RANGE        ; nKeys
-    ; nKTLevels = 0 (no level names) — header already zeroed
+    mov word [rdi + 26], 9                    ; nKTLevels = 9 (matches the counts)
     mov edi, r15d                             ; fd
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
@@ -23247,7 +23277,12 @@ render_create_glyphset:
     jmp .cgs_find
 .cgs_use_empty:
     cmp r8d, -1
-    je .cgs_done                             ; table full → drop (bounded now)
+    jne .cgs_have_slot
+    lea rsi, [dbg_gsfull]                    ; DIAG: table full, create dropped
+    mov edx, 7
+    call write_stderr
+    jmp .cgs_done
+.cgs_have_slot:
     mov eax, r8d
     imul eax, GLYPHSET_REC
     lea rax, [glyphsets + rax]
@@ -23338,6 +23373,11 @@ render_add_glyphs:
     ; subpixel/LCD rendering is on, so this is the common case.
     mov edi, ecx
     call glyphset_format
+    test eax, eax                             ; set unknown (create was dropped):
+    jnz .ag_have_fmt                          ; guessing bpp corrupts the pool —
+    pop rcx                                   ; drop the whole upload instead
+    jmp .ag_done
+.ag_have_fmt:
     mov edx, 1
     cmp eax, 0x32
     je .ag_bpp_done
