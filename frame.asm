@@ -289,7 +289,8 @@ envp:               resq 1
 listen_fd:          resq 1
 client_fd:          resq 1
 display_num:        resq 1
-keymap_is_no:       resb 1                 ; ~/.framerc keymap=no → Norwegian
+keymap_is_no:       resb 1                 ; ~/.framerc keymap: 0=US 1=no 2=be
+                                           ; (nonzero = AltGr layout everywhere)
 pending_vt:         resd 1                 ; Ctrl+Alt+Fn target VT for switch_vt
 mouse_sens:         resd 1                 ; pointer sensitivity %, ~/.framerc (def 100)
 ; ---- disable-while-typing (framerc dwt = <ms>, 0 = off, default 400) ------
@@ -11487,7 +11488,7 @@ handle_list_properties:
 
 ; ----------------------------------------------------------------------------
 ; read_framerc — read ~/.framerc and set keymap_is_no from a `keymap = no`
-; line. No file / no key → keymap_is_no stays 0 (US default). Called once at
+; (1) or `keymap = be` (2) line. No file / no key → 0 (US default). Called once at
 ; startup, before init_keysyms. Line-based key=value, the CHasm rc convention.
 ; ----------------------------------------------------------------------------
 read_framerc:
@@ -11643,10 +11644,17 @@ parse_framerc:
     jne .pf_chk_keycode
     call pf_to_value
     cmp byte [rsi], 'n'
-    jne .pf_next_line
+    jne .pf_kb_try_be
     cmp byte [rsi + 1], 'o'
     jne .pf_next_line
     mov byte [keymap_is_no], 1
+    jmp .pf_next_line
+.pf_kb_try_be:
+    cmp byte [rsi], 'b'
+    jne .pf_next_line
+    cmp byte [rsi + 1], 'e'
+    jne .pf_next_line
+    mov byte [keymap_is_no], 2               ; Belgian — nonzero = AltGr layout
     jmp .pf_next_line
 .pf_chk_keycode:
     ; keycode N = SYM [SYM ...]   (xmodmap-mirror syntax, max 16 lines,
@@ -12333,6 +12341,8 @@ init_keysyms:
     KS 233, XF86_MonBrightnessUp, XF86_MonBrightnessUp
 
     ; --- Number row + punctuation: layout-dependent.
+    cmp byte [keymap_is_no], 2
+    je  .iks_be
     cmp byte [keymap_is_no], 0
     jne .iks_no
     ; US (default)
@@ -12394,6 +12404,51 @@ init_keysyms:
     KSA 20, '\', 0             ; AltGr++  = backslash
     KSA 26, 0x20AC, 0          ; AltGr+e  = €
     KSA 35, '~', 0             ; AltGr+¨  = tilde
+    jmp .iks_remaps
+.iks_be:
+    ; Belgian AZERTY (from xkb be(basic)). Latin-1 keysyms equal their
+    ; codepoints; dead keys are served as plain symbols (NO precedent).
+    KS 10, '&', '1'
+    KS 11, 0xE9, '2'            ; é / 2
+    KS 12, '"', '3'
+    KS 13, 0x27, '4'            ; apostrophe / 4
+    KS 14, '(', '5'
+    KS 15, 0xA7, '6'            ; § / 6
+    KS 16, 0xE8, '7'            ; è / 7
+    KS 17, '!', '8'
+    KS 18, 0xE7, '9'            ; ç / 9
+    KS 19, 0xE0, '0'            ; à / 0
+    KS 20, ')', 0xB0            ; ) / °
+    KS 21, '-', '_'
+    KS 49, 0xB2, 0xB3           ; ² / ³  (key left of 1)
+    KS 24, 'a', 'A'             ; the AZERTY letter moves
+    KS 25, 'z', 'Z'
+    KS 38, 'q', 'Q'
+    KS 52, 'w', 'W'
+    KS 47, 'm', 'M'
+    KS 34, '^', 0xA8            ; circumflex / diaeresis
+    KS 35, '$', '*'
+    KS 48, 0xF9, '%'            ; ù / %
+    KS 51, 0xB5, 0xA3           ; µ / £
+    KS 58, ',', '?'
+    KS 59, ';', '.'
+    KS 60, ':', '/'
+    KS 61, '=', '+'
+    KS 94, '<', '>'             ; ISO key left of Z
+    ; AltGr (level 3): the programming characters.
+    KS 108, 0xFE03, 0xFE03      ; right Alt = ISO_Level3_Shift (was Alt_R)
+    KSA 10, '|', 0              ; AltGr+&  = |
+    KSA 11, '@', 0              ; AltGr+é  = @
+    KSA 12, '#', 0              ; AltGr+"  = #
+    KSA 16, '{', 0              ; AltGr+è  = {
+    KSA 17, '[', 0              ; AltGr+!  = [
+    KSA 18, '{', 0              ; AltGr+ç  = { (as X's be table has it)
+    KSA 19, '}', 0              ; AltGr+à  = }
+    KSA 20, '\', 0              ; AltGr+)  = backslash
+    KSA 26, 0x20AC, 0           ; AltGr+e  = €
+    KSA 34, '[', 0              ; AltGr+^  = [
+    KSA 35, ']', 0              ; AltGr+$  = ]
+    KSA 61, '~', 0              ; AltGr+=  = ~
 .iks_remaps:
     ; Apply ~/.framerc `keycode N = SYM [SYM...]` remaps (staged by
     ; parse_framerc, which runs before this table is built). Native

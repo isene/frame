@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.144-blue)
+![Version](https://img.shields.io/badge/version-0.0.145-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -222,7 +222,7 @@ frame reads an optional `~/.framerc` (line-based `key = value`, the CHasm
 rc convention):
 
 ```
-keymap = no                # keyboard layout: us (default) or no (Norwegian)
+keymap = no                # keyboard layout: us (default), no (Norwegian), be (Belgian)
 sensitivity = 75           # pointer speed, percent of raw (default 100)
 dwt = 400                  # ms the touchpad ignores motion+taps after a keystroke (0 = off)
 nightlight = 60            # Mod4+n warmth strength 0..100 (default 60)
@@ -240,9 +240,12 @@ blank_key = Mod4+Escape    # hotkey that powers the panel off NOW (none = off)
 `keymap`: `us` (the default, or no file) is the standard US layout. `no`
 is Norwegian: `Shift+6` = `&`, the `ø æ å` keys, `< >` on the ISO key left
 of `Z`, Norwegian punctuation, and **AltGr** (right Alt = ISO_Level3_Shift
-= Mod5) for `@ £ $ { } [ ] \ € ~`. Delivered to clients via
+= Mod5) for `@ £ $ { } [ ] \ € ~`. `be` is Belgian AZERTY: the
+`a z q w m` letter moves, `é è ç à ù µ` , `² ³` left of 1, and AltGr for
+`| @ # { [ } \ € ~`. Delivered to clients via
 `GetKeyboardMapping` (6 keysyms/keycode, AltGr at level 3), so any X
-client (glass, xterm, …) picks it up.
+client (glass, xterm, …) picks it up. Note: `setxkbmap` does not work on
+frame — the layout comes from this key instead.
 
 `sensitivity`: scales pointer motion (touchpad + mouse) by this percent.
 `100` is raw 1:1; lower values slow the cursor for finer control.
