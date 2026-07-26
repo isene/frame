@@ -21023,8 +21023,12 @@ handle_poly_rectangle:
     movsx r9d, word [r12 + 2]                ; y
     movzx r10d, word [r12 + 4]               ; w
     movzx r11d, word [r12 + 6]               ; h
+    mov eax, r10d
+    or  eax, r11d
+    jz .prr_rect_next                        ; 0x0 rect draws nothing (X spec)
     mov ecx, ebp                             ; colour
     call rect_outline
+.prr_rect_next:
     add r12, 8
     dec dword [rsp + 4]
     jmp .prr_loop
@@ -21076,7 +21080,11 @@ handle_poly_rectangle:
     movsx r9d, word [r12 + 2]                ; y
     movzx r10d, word [r12 + 4]               ; w
     movzx r11d, word [r12 + 6]               ; h
-    call xor_band_toggle
+    mov eax, r10d                            ; 0x0 rect = four zero-length
+    or  eax, r11d                            ; butt-cap lines = NOTHING (X spec).
+    jz  .prr_band_next                       ; scrot -s click-select sends one
+    call xor_band_toggle                     ; and never erases → 1px ghost at 0,0
+.prr_band_next:
     add r12, 8
     dec dword [rsp + 4]
     jnz .prr_band_loop
