@@ -1085,6 +1085,39 @@ ks_names:
     dd 0xFE57
     db "dead_caron", 0
     dd 0xFE5A
+    ; The rest of the dead-key block, so ~/.framerc can put an accent on
+    ; any key. Clients compose them: glass holds the dead key, then emits
+    ; the composed letter on the next press (dead + space = bare accent).
+    db "dead_grave", 0
+    dd 0xFE50
+    db "dead_acute", 0
+    dd 0xFE51
+    db "dead_circumflex", 0
+    dd 0xFE52
+    db "dead_tilde", 0
+    dd 0xFE53
+    db "dead_macron", 0
+    dd 0xFE54
+    db "dead_breve", 0
+    dd 0xFE55
+    db "dead_abovedot", 0
+    dd 0xFE56
+    db "dead_abovering", 0
+    dd 0xFE58
+    db "dead_doubleacute", 0
+    dd 0xFE59
+    db "dead_cedilla", 0
+    dd 0xFE5B
+    db "dead_ogonek", 0
+    dd 0xFE5C
+    db "backslash", 0
+    dd 0x005C
+    db "grave", 0
+    dd 0x0060
+    db "apostrophe", 0
+    dd 0x0027
+    db "acute", 0
+    dd 0x00B4
     db "Pointer_Button2", 0
     dd 0xFEE9
     db "Pointer_Button3", 0
