@@ -80,6 +80,11 @@ DEFAULT REL
 
 %define AF_UNIX         1
 %define SOCK_STREAM     1
+%define SOCK_NONBLOCK   0x800            ; accept() returns -EAGAIN when the
+                                         ; queue is empty instead of parking
+                                         ; the whole server inside accept()
+%define SOCK_CLOEXEC    0x80000
+%define EAGAIN          11
 %define DEFAULT_DISPLAY 7
 %define O_RDWR          0x2
 
@@ -2127,10 +2132,13 @@ socket_setup:
     lea rdi, [sockaddr_path]
     syscall
 
-    ; socket(AF_UNIX, SOCK_STREAM, 0)
+    ; socket(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0).
+    ; NONBLOCK is what makes draining the accept queue safe: the serve loop
+    ; accepts until -EAGAIN, and on a blocking fd that last accept would
+    ; park the entire server (no repaint, no input) until someone connected.
     mov rax, SYS_SOCKET
     mov rdi, AF_UNIX
-    mov rsi, SOCK_STREAM
+    mov rsi, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC
     xor edx, edx
     syscall
     test rax, rax
@@ -2170,10 +2178,13 @@ socket_setup:
     lea rdi, [sockaddr_buf + 2]          ; sun_path
     mov esi, 0o777
     syscall
-    ; listen with a small backlog
+    ; Backlog matches MAX_CLIENTS. At 8, a burst of concurrent connects
+    ; (session start, a script launching several apps) overflowed the queue
+    ; and the kernel refused the surplus, which Xlib reports to the user as
+    ; "cannot open display" — about half of 30 simultaneous connects died.
     mov rax, SYS_LISTEN
     mov rdi, [listen_fd]
-    mov rsi, 8
+    mov rsi, MAX_CLIENTS
     syscall
     xor eax, eax
     pop rbx
@@ -4548,20 +4559,26 @@ serve_loop:
     jmp .sl_iter                             ; composite check and paint it.
 .sl_poll_done:
 
-    ; --- Listen fd ready: accept all pending connections.
+    ; --- Listen fd ready: accept all pending connections. The loop is the
+    ; point: one accept per poll pass could not keep up with a burst, so
+    ; connects piled into the (then 8-deep) backlog until the kernel started
+    ; refusing them. Drain until -EAGAIN, which the non-blocking listen fd
+    ; returns the moment the queue is empty.
     movzx eax, word [pollfd_buf + 6]
     test eax, eax
     jz .sl_clients
+.sl_accept_loop:
     call do_accept
     test rax, rax
-    js .sl_clients                           ; transient error — skip
+    js .sl_clients                           ; -EAGAIN (drained) or error
     mov edi, eax
     push rdi
     call client_alloc
     pop rdi
     cmp eax, -1
     jne .sl_announce_ok
-    ; All slots full — refuse and close immediately.
+    ; All slots full — refuse and close, then KEEP draining. Breaking out
+    ; here would leave the refused connect sitting in the queue.
     push rdi
     mov rsi, log_max_clients
     mov rdx, log_max_clients_len
@@ -4569,11 +4586,12 @@ serve_loop:
     pop rdi
     mov rax, SYS_CLOSE
     syscall
-    jmp .sl_clients
+    jmp .sl_accept_loop
 .sl_announce_ok:
     mov rsi, log_accepted
     mov rdx, log_accepted_len
     call write_stderr
+    jmp .sl_accept_loop
 
 .sl_clients:
     ; --- Walk client slots and process anyone whose revents has POLLIN.
