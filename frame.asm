@@ -503,6 +503,7 @@ atom_strings:       resb ATOM_STRINGS_CAP
 ; bytes — at the full keycode range plus 1 keysym/keycode that's ~1 KB;
 ; future reply types like QueryFont return more).
 reply_buf:          resb 16384
+cur_img_buf:        resb 64 * 64 * 4     ; XFixesGetCursorImage body (ARGB)
 pn_buf:             resb 32                  ; PropertyNotify scratch event
 xkb_getmap_present: resd 1               ; GetMap reply present mask (echoes req)
 
@@ -5982,7 +5983,124 @@ handle_xfixes:
     jz .xf_query_version
     cmp eax, 2
     je .xf_select_input
+    cmp eax, 4
+    je .xf_get_cursor_image
+    ; Minors that carry a REPLY must never fall through to a silent ret:
+    ; the client blocks forever waiting for bytes that never come. That is
+    ; exactly how screen sharing died — Firefox and ffmpeg both ask for the
+    ; cursor image to composite into the capture, and hung here while their
+    ; UI happily showed "sharing". Anything else reply-bearing that we have
+    ; not implemented gets BadImplementation so the client fails loudly.
+    cmp eax, 19                              ; FetchRegion
+    je .xf_unimpl
+    cmp eax, 24                              ; GetCursorName
+    je .xf_unimpl
+    cmp eax, 25                              ; GetCursorImageAndName
+    je .xf_unimpl
     ret                                      ; void: regions / save-set / etc.
+
+.xf_unimpl:
+    mov esi, 32
+    call xkb_reply_zero                      ; edi=slot; rdi=buf r15d=fd r8d=total
+    mov byte [rdi + 0], 0                    ; Error
+    mov byte [rdi + 1], 17                   ; BadImplementation
+    mov edi, r15d
+    lea rsi, [reply_buf]
+    mov edx, 32
+    mov eax, SYS_WRITE
+    syscall
+    ret
+
+; XFixesGetCursorImage (4). Reply: 32-byte header (position, size, hotspot,
+; serial) then width*height ARGB pixels. We hand back the real 64x64 hardware
+; cursor BO, copied row by row because its DRM pitch is not necessarily
+; width*4. With no DRM cursor (fbtest, cursor init failed) we still answer,
+; with a 1x1 transparent image, so the client proceeds without a pointer
+; rather than hanging.
+.xf_get_cursor_image:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov esi, 32
+    call xkb_reply_zero                      ; rdi=reply_buf r15d=fd r8d=32
+    mov byte [rdi + 1], 0                    ; XFIXES has no deviceID byte
+    cmp dword [cursor_ready], 0
+    je  .xfgci_empty
+    mov dword [rdi + 4], 64 * 64             ; length = w*h 4-byte units
+    mov eax, [cursor_x]
+    mov [rdi + 8], ax                        ; x
+    mov eax, [cursor_y]
+    mov [rdi + 10], ax                       ; y
+    mov word [rdi + 12], 64                  ; width
+    mov word [rdi + 14], 64                  ; height
+    mov eax, [cur_hot_x]
+    mov [rdi + 16], ax                       ; xhot
+    mov eax, [cur_hot_y]
+    mov [rdi + 18], ax                       ; yhot
+    mov eax, [cur_shape]
+    inc eax
+    mov [rdi + 20], eax                      ; cursor-serial (shape is enough:
+                                             ; clients only test for change)
+    mov edi, r15d
+    lea rsi, [reply_buf]
+    mov edx, 32
+    mov eax, SYS_WRITE
+    syscall
+    ; Body: 64 rows of 256 bytes, lifted out of the BO at its own pitch.
+    mov r13, [cursor_fb_addr]
+    mov r14d, [drm_cursor_create + 20]        ; BO pitch
+    lea r12, [cur_img_buf]
+    xor ebx, ebx
+.xfgci_row:
+    cmp ebx, 64
+    jge .xfgci_send
+    mov rsi, r13
+    mov eax, ebx
+    imul eax, r14d
+    add rsi, rax
+    mov rdi, r12
+    mov eax, ebx
+    shl eax, 8                                ; row * 256
+    add rdi, rax
+    mov ecx, 64
+    rep movsd
+    inc ebx
+    jmp .xfgci_row
+.xfgci_send:
+    mov edi, r15d
+    lea rsi, [cur_img_buf]
+    mov edx, 64 * 64 * 4
+    mov eax, SYS_WRITE
+    syscall
+    jmp .xfgci_out
+.xfgci_empty:
+    mov dword [rdi + 4], 1                    ; length = one pixel
+    mov eax, [cursor_x]
+    mov [rdi + 8], ax
+    mov eax, [cursor_y]
+    mov [rdi + 10], ax
+    mov word [rdi + 12], 1                    ; 1x1
+    mov word [rdi + 14], 1
+    mov edi, r15d
+    lea rsi, [reply_buf]
+    mov edx, 32
+    mov eax, SYS_WRITE
+    syscall
+    mov dword [cur_img_buf], 0                ; fully transparent pixel
+    mov edi, r15d
+    lea rsi, [cur_img_buf]
+    mov edx, 4
+    mov eax, SYS_WRITE
+    syscall
+.xfgci_out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
 
 .xf_query_version:
     ; XFixesQueryVersion (0): reply major=5 minor=0. Clients accept >= 1.
