@@ -543,6 +543,9 @@ xkb_getmap_present: resd 1               ; GetMap reply present mask (echoes req
 %define WINDOW_REC_SIZE  64          ; was 56; +56 border_pixel, +60 cursor
 windows:            resb MAX_WINDOWS * WINDOW_REC_SIZE
 win_bgpix:          resd MAX_WINDOWS      ; CW_BACK_PIXMAP xid per window slot
+win_painted:        resb MAX_WINDOWS      ; 1 once the CLIENT has drawn into
+                                          ; this window (not the back_pixel
+                                          ; fill frame does on map)
                                           ; (0=none). ClearArea restores from it
                                           ; instead of painting back_pixel.
 pl_backing:         resq 1                ; PolyLine draw scratch
@@ -10031,6 +10034,7 @@ window_destroy:
     pop rbx
 .wd_kill_clear:
     mov dword [win_bgpix + rbx*4], 0         ; drop bg-pixmap ref (slot reuse)
+    mov byte [win_painted + rbx], 0          ; ditto the has-drawn flag
     mov edi, [r13]                           ; free its property records too:
     call window_props_clear                  ; Xlib XID reuse is deterministic,
                                              ; so stale records would resurrect
@@ -17412,7 +17416,24 @@ damage_add:
 ; (children of non-root parents land where the compositor draws them) and
 ; calls damage_add. Clobbers rax, rcx, rdx, rdi.
 ; ----------------------------------------------------------------------------
+; Every client drawing request lands here (PutImage, CopyArea, the RENDER
+; paths, ...), so this is where a window earns its "the client has actually
+; drawn something" flag. Structural damage (map, configure, the back_pixel
+; fill) goes through damage_add_window instead and deliberately does NOT
+; set it — that is the whole distinction the compositor's hold relies on.
 damage_add_local:
+    push rax
+    push rcx
+    mov rax, rdi
+    lea rcx, [windows]
+    sub rax, rcx
+    shr rax, 6                                ; / WINDOW_REC_SIZE (64), no div
+    cmp rax, MAX_WINDOWS                       ; in a per-draw hot path
+    jae .dal_no_slot
+    mov byte [win_painted + rax], 1
+.dal_no_slot:
+    pop rcx
+    pop rax
     push r10
     push r11
     push rsi
@@ -17586,6 +17607,19 @@ recomposite_screen:
     mov r13d, eax                             ; remaining rects
     mov rbx, r14                              ; rect cursor
 .rs_rect_loop:
+    ; Hold back a rect that belongs entirely to a mapped window which has
+    ; never drawn and carries no background of its own. Painting it now can
+    ; only show the wallpaper underneath for the frame or two before the
+    ; client's first paint arrives — the flicker when an app opens. Leaving
+    ; the previous pixels there costs nothing: the client's first draw
+    ; damages the same area and composites it properly.
+    mov edi, [rbx + 0]
+    mov esi, [rbx + 4]
+    mov edx, [rbx + 8]
+    mov ecx, [rbx + 12]
+    call rect_unpainted_hold
+    test eax, eax
+    jnz .rs_rect_next
     mov eax, [rbx + 0]
     mov [bw_clip_x1], eax
     mov edx, [rbx + 4]
@@ -17606,6 +17640,7 @@ recomposite_screen:
     call bg_fill_rect                         ; wallpaper (or solid) for this rect
     call .rs_window_walk
     call xor_band_apply                       ; rubber band rides on top
+.rs_rect_next:
     add rbx, 16
     dec r13d
     jnz .rs_rect_loop
@@ -18015,6 +18050,67 @@ load_wallpaper:
     pop r12
     pop rbx
 .lw_ret:
+    ret
+
+; ----------------------------------------------------------------------------
+; rect_unpainted_hold — edi=x1, esi=y1, edx=x2, ecx=y2 (screen coords).
+; eax = 1 if some mapped TOPLEVEL window fully contains this rect, has never
+; been drawn into by its client (win_painted), and has back_pixel 0, i.e.
+; nothing of its own to show yet. Callers skip such rects entirely.
+;
+; Toplevels only (parent = root): their x/y are already root coordinates, and
+; a nested child that has not painted sits inside a parent that has, so the
+; parent's content is the right thing to keep showing.
+; ----------------------------------------------------------------------------
+rect_unpainted_hold:
+    push rbx
+    push r12
+    xor r12d, r12d                            ; slot
+.ruh_loop:
+    cmp r12d, MAX_WINDOWS
+    jge .ruh_no
+    mov rax, r12
+    imul rax, WINDOW_REC_SIZE
+    lea rax, [windows + rax]
+    mov r8d, [rax]                            ; xid
+    test r8d, r8d
+    jz .ruh_next                              ; empty slot
+    cmp r8d, X_ROOT_WINDOW
+    je .ruh_next
+    cmp dword [rax + 4], X_ROOT_WINDOW        ; toplevel?
+    jne .ruh_next
+    cmp byte [rax + 28], 0                    ; mapped?
+    je .ruh_next
+    cmp byte [win_painted + r12], 0           ; client drew already?
+    jne .ruh_next
+    cmp dword [rax + 44], 0                   ; back_pixel — a real background
+    jne .ruh_next                             ; is worth showing immediately
+    ; contains? win.x <= x1 && win.y <= y1 && x2 <= win.x+w && y2 <= win.y+h
+    movsx r9d, word [rax + 8]                 ; win x
+    cmp r9d, edi
+    jg .ruh_next
+    movsx r10d, word [rax + 10]               ; win y
+    cmp r10d, esi
+    jg .ruh_next
+    movzx r11d, word [rax + 12]               ; win w
+    add r11d, r9d
+    cmp edx, r11d
+    jg .ruh_next
+    movzx r11d, word [rax + 14]               ; win h
+    add r11d, r10d
+    cmp ecx, r11d
+    jg .ruh_next
+    mov eax, 1
+    pop r12
+    pop rbx
+    ret
+.ruh_next:
+    inc r12d
+    jmp .ruh_loop
+.ruh_no:
+    xor eax, eax
+    pop r12
+    pop rbx
     ret
 
 ; ----------------------------------------------------------------------------
