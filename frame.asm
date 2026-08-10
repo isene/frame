@@ -1204,6 +1204,15 @@ log_comp_size_len   equ $ - log_comp_size - 1
 log_pageflip:       db "frame: first PAGE_FLIP rc=", 0
 log_pageflip_len    equ $ - log_pageflip - 1
 str_render:         db "RENDER"
+str_xkb_rules:      db "_XKB_RULES_NAMES"
+str_xkb_rules_len   equ $ - str_xkb_rules
+; rules \0 model \0 layout \0 variant \0 options \0  (XkbRF_GetNamesProp)
+xkbrules_us:        db "evdev", 0, "pc105", 0, "us", 0, 0, 0
+xkbrules_us_len     equ $ - xkbrules_us
+xkbrules_no:        db "evdev", 0, "pc105", 0, "no", 0, 0, 0
+xkbrules_no_len     equ $ - xkbrules_no
+xkbrules_be:        db "evdev", 0, "pc105", 0, "be", 0, 0, 0
+xkbrules_be_len     equ $ - xkbrules_be
 str_xkb:            db "XKEYBOARD"
 str_randr:          db "RANDR"
 str_xinput:         db "XInputExtension"
@@ -2034,6 +2043,9 @@ _start:
     mov dword [cfg_blankkey_sym], 0xFF1B     ; blank_key default: Mod4+Escape
     mov byte [cfg_blankkey_mods], 0x40       ; (0x40 = MOD_MOD4)
     call read_framerc                        ; ~/.framerc → keymap_is_no
+    call publish_xkb_rules                   ; _XKB_RULES_NAMES so clients
+                                             ; (FreeRDP, setxkbmap) can see
+                                             ; which layout we speak
     cmp byte [fbtest_mode], 0                 ; fbtest: dims already set by init_fbtest,
     je .wp_not_fbtest                         ; so load the wallpaper now (--display
     call load_wallpaper                       ; loads later, after init_compositor)
@@ -18050,6 +18062,81 @@ load_wallpaper:
     pop r12
     pop rbx
 .lw_ret:
+    ret
+
+; ----------------------------------------------------------------------------
+; publish_xkb_rules — put _XKB_RULES_NAMES on the root window.
+;
+; Every real X server carries this property, and it is how a client learns
+; which LAYOUT the server speaks: xkbfile's XkbRF_GetNamesProp reads it
+; verbatim. FreeRDP calls exactly that to pick the keyboard layout it tells
+; the remote host about, so without the property an RDP session came up as
+; US no matter what ~/.framerc said — the Norwegian keys landed on American
+; positions on the far end. setxkbmap complains about the same absence
+; ("Couldn't interpret _XKB_RULES_NAMES property").
+;
+; Value is the standard five NUL-terminated fields:
+;   rules \0 model \0 layout \0 variant \0 options \0
+; ----------------------------------------------------------------------------
+publish_xkb_rules:
+    push rbx
+    push r12
+    push r13
+    ; layout string for this keymap kind (0 = us, 1 = no, 2 = be)
+    lea r12, [xkbrules_us]
+    mov r13d, xkbrules_us_len
+    cmp byte [keymap_is_no], 1
+    jne .pxr_chk_be
+    lea r12, [xkbrules_no]
+    mov r13d, xkbrules_no_len
+    jmp .pxr_have
+.pxr_chk_be:
+    cmp byte [keymap_is_no], 2
+    jne .pxr_have
+    lea r12, [xkbrules_be]
+    mov r13d, xkbrules_be_len
+.pxr_have:
+    ; atom: reuse if a client already interned the name, else create
+    lea rdi, [str_xkb_rules]
+    mov esi, str_xkb_rules_len
+    call atom_lookup
+    test eax, eax
+    jnz .pxr_have_atom
+    lea rdi, [str_xkb_rules]
+    mov esi, str_xkb_rules_len
+    call atom_create
+    test eax, eax
+    jz .pxr_done
+.pxr_have_atom:
+    mov ebx, eax                              ; atom
+    mov edi, X_ROOT_WINDOW
+    mov esi, ebx
+    call property_alloc
+    test rax, rax
+    jz .pxr_done
+    push rax                                  ; record
+    mov edi, r13d
+    call property_value_alloc
+    pop rcx                                   ; record
+    cmp eax, -1
+    je .pxr_done
+    ; copy the value in
+    push rcx
+    lea rdi, [property_values + rax]
+    mov rsi, r12
+    push rax
+    mov ecx, r13d
+    rep movsb
+    pop rax
+    pop rcx
+    mov dword [rcx + 8], 31                   ; type = STRING
+    mov byte [rcx + 12], 8                    ; format
+    mov [rcx + 16], r13d                      ; nbytes
+    mov [rcx + 20], eax                       ; value offset
+.pxr_done:
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; ----------------------------------------------------------------------------
