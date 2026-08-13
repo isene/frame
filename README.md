@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.151-blue)
+![Version](https://img.shields.io/badge/version-0.0.152-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -329,6 +329,23 @@ headless dual-head testing.
 Note: with two outputs the `background` file no longer matches the
 framebuffer size and is ignored (solid colour fallback) — re-render it
 at the combined resolution if wallpaper-on-dual matters.
+
+## A red band across the top
+
+frame serves 128 clients at once. If they are all taken, everything
+already on screen keeps working while nothing new can open — which
+reads as a broken desktop, not a full table. So while the table is
+full frame paints a red band along the top of the screen, above every
+window, and clears it the moment a slot frees.
+
+The log line beside it lists the peer pid of all 128 holders, because
+the answer is always "who owns a hundred of these":
+
+```bash
+L=$(ls -dt /tmp/frame-logs/desktop-*/frame.log | head -1)
+ps -p $(grep -a 'slot holder pids' "$L" | cut -d: -f3 | xargs -n1 | sort -u |
+        paste -sd,) -o pid,args
+```
 
 ## How it's built
 

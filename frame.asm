@@ -75,6 +75,7 @@ DEFAULT REL
 %define SYS_LISTEN      50
 %define SYS_ACCEPT      43
 %define SYS_GETSOCKNAME 51
+%define SYS_GETSOCKOPT  55
 %define SYS_RECVFROM    45
 %define SYS_IOCTL       16
 
@@ -84,6 +85,9 @@ DEFAULT REL
                                          ; queue is empty instead of parking
                                          ; the whole server inside accept()
 %define SOCK_CLOEXEC    0x80000
+%define SOL_SOCKET      1
+%define SO_PEERCRED     17               ; struct ucred {pid,uid,gid} of the
+                                         ; process on the other end
 %define EAGAIN          11
 %define DEFAULT_DISPLAY 7
 %define O_RDWR          0x2
@@ -476,6 +480,9 @@ rc_remap_count:     resd 1
 %define CSTATE_RUNNING   1
 clients_meta:       resb MAX_CLIENTS * CLIENT_META_SIZE
 clients_bufs:       resb MAX_CLIENTS * CLIENT_BUF_SIZE
+slots_full:         resb 1                 ; latched while the table is full
+peercred_buf:       resb 12                ; struct ucred from SO_PEERCRED
+peercred_len:       resd 1                 ; its optlen (in/out)
 
 ; pollfd_buf — listen_fd + up to MAX_CLIENTS client fds + up to
 ; MAX_INPUTS evdev devices. Rebuilt each poll iteration; ~1.2 KB of
@@ -1160,6 +1167,11 @@ log_serve_ready:    db "serve loop ready, polling listen + clients", 10
 log_serve_ready_len equ $ - log_serve_ready
 log_max_clients:    db "refusing connection, all 128 client slots in use", 10
 log_max_clients_len equ $ - log_max_clients
+log_slot_pids:      db "frame: slot holder pids:", 0
+log_slot_pids_len   equ $ - log_slot_pids - 1
+log_slots_free:     db "frame: client slots available again", 10
+log_slots_free_len  equ $ - log_slots_free
+log_pid_sep:        db " "
 log_input_pre:      db "opened ", 0
 log_input_pre_len   equ $ - log_input_pre - 1
 log_input_suf:      db " input device(s)", 10
@@ -3922,7 +3934,94 @@ client_close:
     mov rsi, log_client_gone
     mov rdx, log_client_gone_len
     call write_stderr
+    cmp byte [slots_full], 0                 ; a slot just freed → the table
+    jne .cc_unlatch                          ; is no longer full
     pop rbx
+    ret
+.cc_unlatch:
+    call slots_full_clear
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; slots_full_enter — the client table just refused a connection. Latched, so
+; a storm of refused connects costs one log line and one repaint, not one
+; per connect.
+;
+; Two things happen here, because the failure mode is nasty: every window
+; already on screen keeps working while nothing new can ever open, which
+; reads as "the desktop is broken", not "the server is out of slots".
+;
+;   1. Log the peer pid of every slot holder (SO_PEERCRED). The culprit is
+;      always "who owns 100 of these" — one `ps -p` on this line answers it.
+;      Without it the answer costs an hour of matching socket inodes through
+;      /proc, since frame is not dumpable and ss -xp / lsof come up empty.
+;   2. Paint a red band across the top of the screen (warn_band_apply), so
+;      the condition is visible at a glance rather than only in a log.
+;
+; 128 getsockopt calls, once per fill event. Zero cost until it happens.
+; ----------------------------------------------------------------------------
+slots_full_enter:
+    cmp byte [slots_full], 0
+    je .sfe_go
+    ret
+.sfe_go:
+    push rbx
+    mov byte [slots_full], 1
+    mov rsi, log_max_clients
+    mov rdx, log_max_clients_len
+    call write_stderr
+    mov rsi, log_slot_pids
+    mov rdx, log_slot_pids_len
+    call write_stderr
+    xor ebx, ebx
+.sfe_loop:
+    cmp ebx, MAX_CLIENTS
+    jge .sfe_done
+    mov rax, rbx
+    imul rax, CLIENT_META_SIZE
+    mov edi, [clients_meta + rax]
+    cmp edi, 0
+    jl .sfe_next                             ; empty slot (cannot happen here)
+    mov dword [peercred_len], 12
+    mov rax, SYS_GETSOCKOPT
+    mov esi, SOL_SOCKET
+    mov edx, SO_PEERCRED
+    lea r10, [peercred_buf]
+    lea r8, [peercred_len]
+    syscall
+    test rax, rax
+    js .sfe_next
+    mov rsi, log_pid_sep
+    mov rdx, 1
+    call write_stderr
+    mov eax, [peercred_buf]                  ; ucred.pid
+    call write_i64_stderr
+.sfe_next:
+    inc ebx
+    jmp .sfe_loop
+.sfe_done:
+    lea rsi, [probe_conn_nl]
+    mov rdx, 1
+    call write_stderr
+    mov dword [dmg_count0], -1               ; both buffers repaint, so the
+    mov dword [dmg_count1], -1               ; band shows up this frame
+    mov byte [comp_dirty], 1
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; slots_full_clear — a slot freed up. Drops the latch and repaints, which
+; erases the band: the warning is live state, not a sticky alarm.
+; ----------------------------------------------------------------------------
+slots_full_clear:
+    mov byte [slots_full], 0
+    mov rsi, log_slots_free
+    mov rdx, log_slots_free_len
+    call write_stderr
+    mov dword [dmg_count0], -1
+    mov dword [dmg_count1], -1
+    mov byte [comp_dirty], 1
     ret
 
 ; ----------------------------------------------------------------------------
@@ -4596,9 +4695,7 @@ serve_loop:
     ; All slots full — refuse and close, then KEEP draining. Breaking out
     ; here would leave the refused connect sitting in the queue.
     push rdi
-    mov rsi, log_max_clients
-    mov rdx, log_max_clients_len
-    call write_stderr
+    call slots_full_enter                    ; latched: logs + red band, once
     pop rdi
     mov rax, SYS_CLOSE
     syscall
@@ -17652,6 +17749,7 @@ recomposite_screen:
     call bg_fill_rect                         ; wallpaper (or solid) for this rect
     call .rs_window_walk
     call xor_band_apply                       ; rubber band rides on top
+    call warn_band_apply                      ; and the out-of-slots warning
 .rs_rect_next:
     add rbx, 16
     dec r13d
@@ -17716,6 +17814,7 @@ recomposite_screen:
     add [comp_px_fill], rax                   ; PERF counter
     call .rs_window_walk
     call xor_band_apply                       ; rubber band rides on top
+    call warn_band_apply                      ; and the out-of-slots warning
     call lens_draw                            ; magnifier overlay
     mov rdi, [drm_dumb_addr]
     mov rcx, [drm_dumb_size]
@@ -21759,6 +21858,60 @@ lens_draw:
     ret
 
 ; ----------------------------------------------------------------------------
+; warn_band_apply — while the client table is full, paint a red band across
+; the top of the screen. Runs after the window walk of every repaint region,
+; same as xor_band_apply, so it sits above every window (including strip) and
+; re-materializes in both flip buffers. One byte-compare when all is well.
+;
+; This is the whole user-visible half of the out-of-slots fix: without it the
+; only symptom is "nothing new opens", with the explanation sitting in a log.
+; The band clears itself the moment a slot frees.
+; ----------------------------------------------------------------------------
+%define WARN_BAND_H     4
+%define WARN_BAND_COLOR 0x00FF2020
+warn_band_apply:
+    cmp byte [slots_full], 0
+    jne .wba_go
+    ret
+.wba_go:
+    push rbx
+    mov eax, [bw_clip_x1]                    ; x1 (clip is never negative)
+    mov edx, [bw_clip_y1]                    ; y1
+    mov ecx, [screen_w]                      ; x2 = min(screen_w, clip_x2)
+    cmp ecx, [bw_clip_x2]
+    jle .wba_x2
+    mov ecx, [bw_clip_x2]
+.wba_x2:
+    mov esi, WARN_BAND_H                     ; y2 = min(band_h, clip_y2)
+    cmp esi, [bw_clip_y2]
+    jle .wba_y2
+    mov esi, [bw_clip_y2]
+.wba_y2:
+    cmp eax, ecx
+    jge .wba_ret
+    cmp edx, esi
+    jge .wba_ret
+    sub ecx, eax                             ; width in px
+    mov ebx, WARN_BAND_COLOR
+.wba_row:
+    mov edi, edx
+    imul edi, [drm_dumb_pitch]
+    add rdi, [drm_dumb_addr]
+    lea rdi, [rdi + rax*4]
+    mov r10d, ecx
+.wba_px:
+    mov [rdi], ebx
+    add rdi, 4
+    dec r10d
+    jnz .wba_px
+    inc edx
+    cmp edx, esi
+    jl .wba_row
+.wba_ret:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
 ; xor_band_apply — XOR the active band's outline into the buffer being
 ; composited, clipped to bw_clip. Runs after the window walk of every
 ; repaint region, so the band sits on top of all windows (the
@@ -24606,12 +24759,75 @@ handle_set_selection_owner:
     mov [sel_atoms + rdx*4], ecx
     inc dword [sel_count]
 .sso_set:
+    mov eax, [sel_owners + rdx*4]            ; previous owner
+    cmp eax, ebx
+    je .sso_store                            ; unchanged → no event
+    test eax, eax
+    jz .sso_store                            ; nobody held it
+    push rcx
+    push rdx
+    push rbx
+    mov edx, eax                             ; the window losing the selection
+    call send_selection_clear                ; ecx = selection (unchanged)
+    pop rbx
+    pop rdx
+    pop rcx
+.sso_store:
     mov [sel_owners + rdx*4], ebx
     mov edx, ebx                             ; new owner → arg
                                              ; ecx = selection (still) → arg
     call xfixes_emit_selection_notify        ; tell XFIXES subscribers (copyq)
 .sso_done:
     pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; send_selection_clear — ecx = selection atom, edx = the window losing it.
+;
+; SelectionClear event (32 bytes):
+;   +0 code = 29   +1 pad   +2 sequence   +4 time
+;   +8 owner (the losing window)   +12 selection   +16..31 pad
+;
+; The protocol owes this event to the old owner the moment a selection
+; changes hands, and an owner that never hears it never lets go. xclip is
+; the textbook case: it stays alive on purpose to serve the selection and
+; exits on SelectionClear, so while frame stayed silent every `… | xclip`
+; left a live process holding an X connection forever. Twelve days of that
+; filled all 128 client slots and nothing new could open. Same for copyq's
+; per-event helpers, which then hung waiting on owners that had moved on.
+; ----------------------------------------------------------------------------
+send_selection_clear:
+    cmp edx, X_RID_BASE                      ; root or a server-side window →
+    jb .ssc_ret                              ; no client to tell
+    mov eax, edx
+    sub eax, X_RID_BASE
+    shr eax, 21                              ; owner slot, encoded in the xid
+    cmp eax, MAX_CLIENTS
+    jae .ssc_ret
+    push rbx
+    push r12
+    mov r12d, eax
+    imul eax, eax, CLIENT_META_SIZE
+    cmp dword [clients_meta + rax], -1       ; owner already disconnected
+    je .ssc_pop
+    lea rdi, [reply_buf]
+    xor eax, eax
+    mov [rdi + 0], rax
+    mov [rdi + 8], rax
+    mov [rdi + 16], rax
+    mov [rdi + 24], rax
+    mov byte [rdi], 29                       ; SelectionClear
+    mov eax, [server_time_ms]
+    mov [rdi + 4], eax                       ; time
+    mov [rdi + 8], edx                       ; owner window
+    mov [rdi + 12], ecx                      ; selection
+    mov edi, r12d
+    lea rsi, [reply_buf]
+    call send_event_to_slot
+.ssc_pop:
+    pop r12
+    pop rbx
+.ssc_ret:
     ret
 
 ; handle_get_selection_owner — edi = slot, rsi = req. GetSelectionOwner (23).
