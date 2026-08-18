@@ -11742,6 +11742,7 @@ handle_list_properties:
 %define XK_F10          0xFFC7
 %define XK_F11          0xFFC8
 %define XK_F12          0xFFC9
+%define XK_F23          0xFFD4
 %define XK_Caps_Lock    0xFFE5
 %define XK_Shift_L      0xFFE1
 %define XK_Shift_R      0xFFE2
@@ -12621,6 +12622,9 @@ init_keysyms:
     KS 123, XF86_AudioRaiseVolume, XF86_AudioRaiseVolume
     KS 232, XF86_MonBrightnessDown, XF86_MonBrightnessDown
     KS 233, XF86_MonBrightnessUp, XF86_MonBrightnessUp
+    KS 201, XK_F23, XK_F23      ; the Copilot key (evdev KEY_F23 = 193):
+                                ; the kernel emits Meta+Shift+F23, so
+                                ; tile binds it as Mod4+Shift+F23
 
     ; --- Number row + punctuation: layout-dependent.
     cmp byte [keymap_is_no], 2
