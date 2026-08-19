@@ -69,6 +69,7 @@ DEFAULT REL
 %define SIGTERM         15
 %define SIGHUP          1
 %define SIGUSR1         10
+%define SIGUSR2         12
 %define SA_RESTORER     0x04000000
 %define SYS_SOCKET      41
 %define SYS_BIND        49
@@ -388,6 +389,7 @@ xv_port_draw:       resd 1                 ; drawable the port last drew to
 ; server — a helper (frame-bg) resizes any image to raw ONCE, offline.
 wallpaper_ptr:      resq 1                 ; ptr into wallpaper_buf, or 0 = solid bg
 wallpaper_path:     resb 256               ; the raw file path from framerc
+wall_reload:        resb 1                 ; SIGUSR2 sets it; serve_loop re-reads
 ; Selection ownership (SetSelectionOwner / GetSelectionOwner). Small table;
 ; the system tray needs strip to OWN _NET_SYSTEM_TRAY_S0 and apps to find it.
 SEL_MAX             equ 8
@@ -2026,6 +2028,7 @@ _start:
     call init_pictures
     call init_properties
     call install_dump_handler
+    call install_wall_handler
     ; Ignore SIGPIPE ALWAYS (both --display and --fbtest / network-only). A
     ; client closing its connection means frame's next write to that socket
     ; raises SIGPIPE, whose DEFAULT action TERMINATES the server — on the
@@ -4541,6 +4544,17 @@ serve_loop:
     mov rdx, log_serve_ready_len
     call write_stderr
 .sl_iter:
+    ; --- SIGUSR2 (wp-cycle / chasm-bg): re-read ~/.framebg and repaint.
+    ; The handler only sets the flag; the blocked poll returns EINTR and
+    ; lands here, so the reload runs in normal context, not in the handler.
+    cmp byte [wall_reload], 0
+    je  .sl_no_wallre
+    mov byte [wall_reload], 0
+    call load_wallpaper
+    mov dword [dmg_count0], -1               ; whole-screen repaint, both buffers
+    mov dword [dmg_count1], -1
+    mov byte [comp_dirty], 1
+.sl_no_wallre:
     ; --- Build pollfd_buf. Always begins with listen_fd. Then each
     ; live client slot gets a pollfd; empty slots are represented by
     ; fd=-1 (poll ignores those, returning revents=0).
@@ -18143,6 +18157,8 @@ load_wallpaper:
     mov edi, r13d
     lea rsi, [wallpaper_buf + rbx]
     syscall
+    cmp rax, -4                               ; EINTR (now also called at
+    je .lw_read                               ; runtime, signals may land)
     test rax, rax
     jle .lw_close_none                        ; EOF/short/error → wrong size
     add ebx, eax
@@ -25023,6 +25039,31 @@ handle_query_font:
     mov rdx, 60
     syscall
     pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; install_wall_handler / wall_handler — SIGUSR2 marks the wallpaper stale.
+; chasm-bg / wp-cycle send it after rebaking ~/.framebg. The handler only
+; sets a flag (async-signal-safe); serve_loop does the read and repaint.
+; ----------------------------------------------------------------------------
+install_wall_handler:
+    lea rdi, [sig_sa_buf]
+    lea rax, [wall_handler]
+    mov [rdi + 0], rax
+    mov qword [rdi + 8], SA_RESTORER
+    lea rax, [sig_restorer]
+    mov [rdi + 16], rax
+    mov qword [rdi + 24], 0
+    mov rax, SYS_RT_SIGACTION
+    mov edi, SIGUSR2
+    lea rsi, [sig_sa_buf]
+    xor edx, edx
+    mov r10, 8
+    syscall
+    ret
+
+wall_handler:
+    mov byte [wall_reload], 1
     ret
 
 ; ----------------------------------------------------------------------------

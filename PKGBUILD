@@ -1,6 +1,6 @@
 # Maintainer: Geir Isene <g@isene.com>
 pkgname=frame
-pkgver=0.0.153
+pkgver=0.0.154
 pkgrel=1
 pkgdesc="X11 display server in x86_64 assembly. DRM/KMS + evdev direct, no libc, no Mesa. Experimental."
 arch=('x86_64')
