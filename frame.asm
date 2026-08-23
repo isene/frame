@@ -483,6 +483,7 @@ rc_remap_count:     resd 1
 clients_meta:       resb MAX_CLIENTS * CLIENT_META_SIZE
 clients_bufs:       resb MAX_CLIENTS * CLIENT_BUF_SIZE
 slots_full:         resb 1                 ; latched while the table is full
+slots_warned:       resb 1                 ; latched past the 3/4 warning
 peercred_buf:       resb 12                ; struct ucred from SO_PEERCRED
 peercred_len:       resd 1                 ; its optlen (in/out)
 
@@ -1173,6 +1174,8 @@ log_slot_pids:      db "frame: slot holder pids:", 0
 log_slot_pids_len   equ $ - log_slot_pids - 1
 log_slots_free:     db "frame: client slots available again", 10
 log_slots_free_len  equ $ - log_slots_free
+log_slots_high:     db "frame: client table is three-quarters full — something may be leaking connections", 10
+log_slots_high_len  equ $ - log_slots_high
 log_pid_sep:        db " "
 log_input_pre:      db "opened ", 0
 log_input_pre_len   equ $ - log_input_pre - 1
@@ -3914,6 +3917,7 @@ client_alloc:
     mov byte [clients_meta + rax + 4], CSTATE_SETUP
     mov dword [clients_meta + rax + 8], 0    ; seq (incremented on first reply)
     mov dword [clients_meta + rax + 12], 0   ; buf_used
+    call slots_watch                         ; DIAG: 3/4-full early warning
     mov eax, ebx
     pop r12
     pop rbx
@@ -3980,18 +3984,32 @@ slots_full_enter:
     mov rsi, log_max_clients
     mov rdx, log_max_clients_len
     call write_stderr
+    call log_slot_holders
+    mov dword [dmg_count0], -1               ; both buffers repaint, so the
+    mov dword [dmg_count1], -1               ; band shows up this frame
+    mov byte [comp_dirty], 1
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; log_slot_holders — one line naming the peer pid of every occupied slot.
+; Shared by the table-full path and the early warning below.
+; ----------------------------------------------------------------------------
+log_slot_holders:
+    push rbx
+    call log_stamp
     mov rsi, log_slot_pids
     mov rdx, log_slot_pids_len
     call write_stderr
     xor ebx, ebx
-.sfe_loop:
+.lsh_loop:
     cmp ebx, MAX_CLIENTS
-    jge .sfe_done
+    jge .lsh_done
     mov rax, rbx
     imul rax, CLIENT_META_SIZE
     mov edi, [clients_meta + rax]
     cmp edi, 0
-    jl .sfe_next                             ; empty slot (cannot happen here)
+    jl .lsh_next                             ; empty slot
     mov dword [peercred_len], 12
     mov rax, SYS_GETSOCKOPT
     mov esi, SOL_SOCKET
@@ -4000,22 +4018,68 @@ slots_full_enter:
     lea r8, [peercred_len]
     syscall
     test rax, rax
-    js .sfe_next
+    js .lsh_next
     mov rsi, log_pid_sep
     mov rdx, 1
     call write_stderr
     mov eax, [peercred_buf]                  ; ucred.pid
     call write_i64_stderr
-.sfe_next:
+.lsh_next:
     inc ebx
-    jmp .sfe_loop
-.sfe_done:
+    jmp .lsh_loop
+.lsh_done:
     lea rsi, [probe_conn_nl]
     mov rdx, 1
     call write_stderr
-    mov dword [dmg_count0], -1               ; both buffers repaint, so the
-    mov dword [dmg_count1], -1               ; band shows up this frame
-    mov byte [comp_dirty], 1
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; slots_watch — DIAG. Called after a slot is handed out. Logs the holder
+; pids once when the table first crosses SLOTS_WARN, and re-arms when it
+; drops back below.
+;
+; The table filling up is never the real bug; something is leaking client
+; connections. On 2026-08-23 that was 66 copyq sync helpers stuck since the
+; 20th, 94 of 128 slots gone, and the first symptom would have been a dead
+; desktop. This fires while there is still room, so the culprit can be
+; caught alive and straced instead of guessed at afterwards.
+;
+; Cost: one scan of 128 slot words per ACCEPT. Accepts happen once per
+; client lifetime, so the idle path never touches this.
+; ----------------------------------------------------------------------------
+%define SLOTS_WARN (MAX_CLIENTS * 3 / 4)
+slots_watch:
+    push rbx
+    push r12
+    xor ebx, ebx
+    xor r12d, r12d                           ; live count
+.sw_count:
+    cmp ebx, MAX_CLIENTS
+    jge .sw_counted
+    mov rax, rbx
+    imul rax, CLIENT_META_SIZE
+    cmp dword [clients_meta + rax], -1
+    je .sw_next
+    inc r12d
+.sw_next:
+    inc ebx
+    jmp .sw_count
+.sw_counted:
+    cmp r12d, SLOTS_WARN
+    jge .sw_high
+    mov byte [slots_warned], 0               ; back under → re-arm
+    jmp .sw_out
+.sw_high:
+    cmp byte [slots_warned], 0
+    jne .sw_out                              ; already said so
+    mov byte [slots_warned], 1
+    mov rsi, log_slots_high
+    mov rdx, log_slots_high_len
+    call write_stderr
+    call log_slot_holders
+.sw_out:
+    pop r12
     pop rbx
     ret
 
