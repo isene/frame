@@ -1184,6 +1184,12 @@ log_unblank:        db "frame: panel on (input)", 10
 log_unblank_len     equ $ - log_unblank
 log_hotplug:        db "frame: display hotplug — outputs reconfigured", 10
 log_hotplug_len     equ $ - log_hotplug
+stamp_open:         db "["
+stamp_close:        db "] "
+log_uev_pre:        db "frame: drm uevent: ", 0
+log_uev_pre_len     equ $ - log_uev_pre - 1
+log_polldead:       db "frame: drm fd went POLLERR/POLLHUP — flips are now fire-and-forget", 10
+log_polldead_len    equ $ - log_polldead
 log_vtback:         db "frame: VT reacquired", 10
 log_vtback_len      equ $ - log_vtback
 log_shm_minor:      db " SHM minor=", 0
@@ -4814,6 +4820,7 @@ serve_loop:
     jmp .sl_uev_scan
 .sl_uev_hit:
     mov byte [hotplug_pending], 1
+    call log_uevent                          ; DIAG: rax still = datagram length
     jmp .sl_uevent_drain
 .sl_no_uevent:
     cmp byte [hotplug_pending], 0
@@ -4839,6 +4846,10 @@ serve_loop:
     test eax, 0x18                            ; error states → fd is dead
     jz .sl_drm_read
     mov byte [drm_poll_dead], 1
+    call log_stamp                           ; DIAG: once per session, at most
+    mov rsi, log_polldead
+    mov rdx, log_polldead_len
+    call write_stderr
 .sl_drm_read:
     mov rax, SYS_READ
     mov rdi, [drm_fd]
@@ -16715,6 +16726,7 @@ compositor_reconfigure:
     mov dword [dmg_count1], -1
     mov byte [comp_dirty], 1
     call rr_emit_screen_change
+    call log_stamp
     mov rsi, log_hotplug
     mov rdx, log_hotplug_len
     call write_stderr
@@ -18736,6 +18748,101 @@ now_real_ms:
     ret
 
 ; ----------------------------------------------------------------------------
+; log_stamp — prefix the next log line with "[<epoch seconds>] ".
+;
+; DIAG. Called only from paths that already fire at human rates: a DRM
+; uevent (about four a day), a panel blank or unblank (a dozen a day), a
+; hotplug. Never from the serve loop, a render, or an input batch, so an
+; idle desktop pays nothing for it. `date -d @<seconds>` reads it back.
+; Preserves every register.
+; ----------------------------------------------------------------------------
+log_stamp:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r11
+    lea rsi, [stamp_open]
+    mov rdx, 1
+    call write_stderr
+    mov rax, SYS_CLOCK_GETTIME
+    xor edi, edi                             ; CLOCK_REALTIME
+    lea rsi, [mono_ts]
+    syscall
+    mov rax, [mono_ts]                       ; whole seconds is enough here
+    call write_u64_stderr
+    lea rsi, [stamp_close]
+    mov rdx, 2
+    call write_stderr
+    pop r11
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; ----------------------------------------------------------------------------
+; log_uevent — rax = datagram length in uevent_buf. Dumps the whole record,
+; NULs turned into spaces.
+;
+; DIAG for the ~1s blanks Geir sees once or twice a week. frame's own logs
+; clear it of blame (no error path fires, the identical-config guard stops
+; every spurious probe), so the remaining suspects are panel-side: a PSR2
+; exit glitch or an eDP link retrain. Those are kernel-silent at default
+; log level, but the connector's link-status property change arrives here.
+; With the record logged, the next blank is evidence rather than a guess.
+;
+; Mutates uevent_buf, which is safe: the datagram has already been scanned
+; and the next read overwrites it. Runs on DRM uevents only.
+; ----------------------------------------------------------------------------
+log_uevent:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r11
+    mov rbx, rax
+    cmp rbx, 4095                            ; room for the newline
+    jbe .lu_len_ok
+    mov rbx, 4095
+.lu_len_ok:
+    test rbx, rbx
+    jle .lu_out
+    call log_stamp
+    lea rsi, [log_uev_pre]
+    mov rdx, log_uev_pre_len
+    call write_stderr
+    xor ecx, ecx
+.lu_scrub:
+    cmp rcx, rbx
+    jge .lu_scrubbed
+    mov al, [uevent_buf + rcx]
+    test al, al
+    jnz .lu_next
+    mov byte [uevent_buf + rcx], ' '         ; NUL-separated -> one line
+.lu_next:
+    inc rcx
+    jmp .lu_scrub
+.lu_scrubbed:
+    mov byte [uevent_buf + rbx], 10
+    lea rsi, [uevent_buf]
+    lea rdx, [rbx + 1]
+    call write_stderr
+.lu_out:
+    pop r11
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ----------------------------------------------------------------------------
 ; comp_blank — panel off after blank_timeout of idle: SETCRTC with no fb and
 ; no mode disables the CRTC; the display engine and eDP panel power down.
 ; ----------------------------------------------------------------------------
@@ -18768,6 +18875,7 @@ comp_blank:
     syscall
 .cb_one:
     mov byte [blank_state], 1
+    call log_stamp
     lea rsi, [log_blank]
     mov rdx, log_blank_len
     call write_stderr
@@ -18799,6 +18907,7 @@ comp_unblank:
     mov dword [dmg_count0], -1               ; whole-screen repaint, both buffers
     mov dword [dmg_count1], -1
     mov byte [comp_dirty], 1
+    call log_stamp
     lea rsi, [log_unblank]
     mov rdx, log_unblank_len
     call write_stderr
