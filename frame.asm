@@ -15187,8 +15187,94 @@ send_pointer_event:
 ; focus target so key events route there.
 ; ----------------------------------------------------------------------------
 handle_set_input_focus:
-    mov eax, [rsi + 4]
-    mov [focus_window], eax
+    push rbx
+    mov ebx, [rsi + 4]                       ; new focus window
+    mov eax, [focus_window]
+    cmp eax, ebx
+    je .hsif_done                            ; unchanged — no events, no work
+    mov [focus_window], ebx
+    ; X requires the losing and the gaining window to be told. GTK gates its
+    ; whole key path on this: a window that has never seen FocusIn discards
+    ; every key press, which is how a mapped, focused zathura went deaf while
+    ; glass (core input, no such gate) kept working.
+    mov edi, eax
+    mov esi, 10                              ; FocusOut to the old window
+    call send_focus_change
+    mov edi, ebx
+    mov esi, 9                               ; FocusIn to the new one
+    call send_focus_change
+.hsif_done:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; send_focus_change — edi = window xid, esi = 9 (FocusIn) / 10 (FocusOut).
+; Sends the core form to a window that selected FocusChange and the XI2 form
+; to one that selected it there; both when both. No-op for None/PointerRoot,
+; for an unknown window, or for a slot out of range.
+; ----------------------------------------------------------------------------
+send_focus_change:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12d, esi                            ; evtype 9/10
+    mov r13d, edi                            ; xid
+    cmp r13d, X_RID_BASE                     ; also rejects 0 (None) and 1
+    jb .sfc_done
+    mov edi, r13d
+    call window_lookup
+    test rax, rax
+    jz .sfc_done
+    mov rbx, rax                             ; window record
+    mov eax, r13d
+    sub eax, X_RID_BASE
+    shr eax, 21
+    cmp eax, MAX_CLIENTS
+    jae .sfc_done
+    push rax                                 ; owner slot
+    xor r14d, r14d
+    bt dword [rbx + 52], r12d                ; XI2 FocusIn/Out selected?
+    setc r14b
+    test dword [rbx + 24], 0x200000          ; core FocusChange selected?
+    jz .sfc_xi2
+    lea rdi, [reply_buf]
+    mov [rdi + 0], r12b                      ; code 9/10
+    mov byte [rdi + 1], 3                    ; detail NotifyNonlinear
+    mov word [rdi + 2], 0                    ; seq (patched by the sender)
+    mov [rdi + 4], r13d                      ; event window
+    mov byte [rdi + 8], 0                    ; mode NotifyNormal
+    xor eax, eax
+    mov [rdi + 9], eax
+    mov [rdi + 13], eax
+    mov [rdi + 17], eax
+    mov [rdi + 21], eax
+    mov [rdi + 25], eax
+    mov [rdi + 28], eax
+    mov edi, [rsp]                           ; slot
+    lea rsi, [reply_buf]
+    call send_event_to_slot
+.sfc_xi2:
+    test r14b, r14b
+    jz .sfc_pop
+    mov edi, r13d
+    call window_abs_xy                       ; r10d/r11d = window origin
+    mov r8d, [cursor_x]
+    sub r8d, r10d
+    mov r9d, [cursor_y]
+    sub r9d, r11d
+    mov edi, [rsp]                           ; slot
+    mov esi, r12d                            ; evtype 9/10
+    mov edx, 3                               ; detail NotifyNonlinear
+    mov ecx, r13d                            ; window
+    call send_xi2_crossing
+.sfc_pop:
+    add rsp, 8
+.sfc_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; ----------------------------------------------------------------------------
