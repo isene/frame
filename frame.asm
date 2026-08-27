@@ -1604,6 +1604,13 @@ dbg_cs_gw:          db " grabwin=", 0
 dbg_cs_gc:          db " grabcur=", 0
 dbg_cs_en:          db " enter=", 0
 dbg_cs_ec:          db " entercur=", 0
+dbg_cs_fo:          db " focus=", 0
+dbg_cs_kb:          db " kbdgrab=", 0
+dbg_cs_kw:          db " kbdwin=", 0
+dbg_dm_mask:        db " mask=", 0
+dbg_dm_xi2:         db " xi2=", 0
+dbg_dm_slot:        db " slot=", 0
+dbg_dm_fd:          db " fd=", 0
 dbg_evdrop:         db " evdrop=", 0
 dbg_pxblit:         db " blit=", 0
 dbg_pxfill:         db " fill=", 0
@@ -25307,6 +25314,18 @@ dump_handler:
     call write_str_stderr
     mov eax, [cur_scale]
     call write_u64_stderr
+    lea rsi, [dbg_cs_fo]                        ; the key path's target...
+    call write_str_stderr
+    mov eax, [focus_window]
+    call write_u64_stderr
+    lea rsi, [dbg_cs_kb]                        ; ...unless a grab outranks it
+    call write_str_stderr
+    mov eax, [active_kbd_slot]
+    call write_u64_stderr
+    lea rsi, [dbg_cs_kw]
+    call write_str_stderr
+    mov eax, [active_kbd_window]
+    call write_u64_stderr
 .dh_cs_nl:
     lea rsi, [probe_conn_nl]
     mov edx, 1
@@ -25447,6 +25466,42 @@ dump_handler:
     mov edx, 1
     call write_stderr
     pop rax                                   ; nonbg count
+    call write_u64_stderr
+    ; Input routing: why a mapped, focused window can still take no keys.
+    ; mask/xi2 decide WHETHER an event is sent, slot/fd decide WHERE.
+    lea rsi, [dbg_dm_mask]
+    call write_str_stderr
+    mov eax, [r12 + 24]                       ; combined event mask
+    call write_u64_stderr
+    lea rsi, [dbg_dm_xi2]
+    call write_str_stderr
+    mov eax, [r12 + 52]                       ; XI2 mask
+    call write_u64_stderr
+    lea rsi, [dbg_dm_slot]
+    call write_str_stderr
+    mov eax, [r12]
+    cmp eax, X_RID_BASE
+    jb .dh_noslot
+    sub eax, X_RID_BASE
+    shr eax, 21
+    cmp eax, MAX_CLIENTS
+    jb .dh_haveslot
+.dh_noslot:
+    mov eax, -1
+.dh_haveslot:
+    push rax
+    call write_u64_stderr
+    lea rsi, [dbg_dm_fd]
+    call write_str_stderr
+    pop rax
+    cmp eax, MAX_CLIENTS
+    jae .dh_nofd
+    call client_meta_addr
+    mov eax, [rax]                            ; the fd frame would write to
+    jmp .dh_fd_out
+.dh_nofd:
+    mov eax, -1
+.dh_fd_out:
     call write_u64_stderr
     lea rsi, [probe_conn_nl]
     mov rdx, 1
