@@ -766,6 +766,11 @@ key_grabs:          resb MAX_KEY_GRABS * KEY_GRAB_SIZE
 
 ; Active keyboard grab — set by GrabKeyboard, cleared by
 ; UngrabKeyboard. -1 = no active grab.
+lastkey_focus:      resd 1               ; DIAG: how the last key event was
+lastkey_win:        resd 1               ; routed. A window that takes no keys
+lastkey_slot:       resd 1               ; while focused shows up here as a
+lastkey_reason:     resd 1               ; reason other than 8/9.
+keys_to_slot:       resd MAX_CLIENTS     ; key events sent, per client slot
 active_kbd_slot:    resd 1
 active_kbd_window:  resd 1
 
@@ -1605,6 +1610,10 @@ dbg_cs_gc:          db " grabcur=", 0
 dbg_cs_en:          db " enter=", 0
 dbg_cs_ec:          db " entercur=", 0
 dbg_cs_fo:          db " focus=", 0
+dbg_lk_w:           db " lkwin=", 0
+dbg_lk_s:           db " lkslot=", 0
+dbg_lk_r:           db " lkreason=", 0
+dbg_dm_keys:        db " keys=", 0
 dbg_cs_kb:          db " kbdgrab=", 0
 dbg_cs_kw:          db " kbdwin=", 0
 dbg_dm_mask:        db " mask=", 0
@@ -15224,6 +15233,11 @@ deliver_to_focus:
     push r13
     mov r12d, esi                            ; keycode
     mov r13d, r8d                            ; event code
+    mov eax, [focus_window]                  ; DIAG: routing record
+    mov [lastkey_focus], eax
+    mov dword [lastkey_win], 0
+    mov dword [lastkey_slot], -1
+    mov dword [lastkey_reason], 0
     ; An ACTIVE keyboard grab (XGrabKeyboard — rofi, GTK menus) takes every
     ; key event, press AND release, overriding focus. Without this route
     ; rofi showed but no typed key ever reached it.
@@ -15243,6 +15257,7 @@ deliver_to_focus:
     mov edx, r12d                            ; detail = keycode
     mov ecx, [active_kbd_window]
     call send_xi2_device_event
+    mov dword [lastkey_reason], 1            ; keyboard grab, XI2
     jmp .dtf_done
 .dtf_grab_core:
     mov edi, eax
@@ -15251,6 +15266,7 @@ deliver_to_focus:
     mov edx, [active_kbd_window]
     mov r8d, r13d
     call send_key_press
+    mov dword [lastkey_reason], 2            ; keyboard grab, core
     jmp .dtf_done
 .dtf_nograb:
     ; Pick the target window.
@@ -15268,25 +15284,27 @@ deliver_to_focus:
     mov ebx, ecx                              ; target xid
     jmp .dtf_have
 .dtf_default:
+    mov dword [lastkey_reason], 3            ; focus unusable → fallback
     call first_mapped_window
     test eax, eax
-    jz .dtf_done
+    jz .dtf_done                             ; (reason stays 3: nothing mapped)
     mov ebx, eax
 .dtf_have:
+    mov [lastkey_win], ebx
     ; owner slot = (xid - X_RID_BASE) >> 21
     mov eax, ebx
     cmp eax, X_RID_BASE
-    jb .dtf_done
+    jb .dtf_lowxid
     sub eax, X_RID_BASE
     shr eax, 21
     cmp eax, MAX_CLIENTS
-    jae .dtf_done
+    jae .dtf_badslot
     push rax
     mov edi, ebx
     call window_lookup                        ; XI2 selected on the target?
     pop rcx
     test rax, rax
-    jz .dtf_done
+    jz .dtf_nowin
     bt dword [rax + 52], r13d                 ; evtype 2/3 = core key codes
     jnc .dtf_core
     mov edi, ebx
@@ -15299,12 +15317,27 @@ deliver_to_focus:
     sub eax, X_RID_BASE
     shr eax, 21
     mov edi, eax
+    mov [lastkey_slot], eax
+    inc dword [keys_to_slot + rax*4]
+    mov dword [lastkey_reason], 8             ; delivered, XI2
     mov esi, r13d                             ; evtype
     mov edx, r12d                             ; detail = keycode
     mov ecx, ebx                              ; window
     call send_xi2_device_event
     jmp .dtf_done
+.dtf_lowxid:
+    mov dword [lastkey_reason], 5
+    jmp .dtf_done
+.dtf_badslot:
+    mov dword [lastkey_reason], 6
+    jmp .dtf_done
+.dtf_nowin:
+    mov dword [lastkey_reason], 7
+    jmp .dtf_done
 .dtf_core:
+    mov [lastkey_slot], ecx
+    inc dword [keys_to_slot + rcx*4]
+    mov dword [lastkey_reason], 9             ; delivered, core
     mov edi, ecx                              ; client slot
     mov esi, r12d                             ; keycode
     movzx ecx, byte [mod_state]
@@ -25318,6 +25351,18 @@ dump_handler:
     call write_str_stderr
     mov eax, [focus_window]
     call write_u64_stderr
+    lea rsi, [dbg_lk_w]
+    call write_str_stderr
+    mov eax, [lastkey_win]
+    call write_u64_stderr
+    lea rsi, [dbg_lk_s]
+    call write_str_stderr
+    mov eax, [lastkey_slot]
+    call write_u64_stderr
+    lea rsi, [dbg_lk_r]
+    call write_str_stderr
+    mov eax, [lastkey_reason]
+    call write_u64_stderr
     lea rsi, [dbg_cs_kb]                        ; ...unless a grab outranks it
     call write_str_stderr
     mov eax, [active_kbd_slot]
@@ -25494,6 +25539,7 @@ dump_handler:
     lea rsi, [dbg_dm_fd]
     call write_str_stderr
     pop rax
+    push rax
     cmp eax, MAX_CLIENTS
     jae .dh_nofd
     call client_meta_addr
@@ -25502,6 +25548,17 @@ dump_handler:
 .dh_nofd:
     mov eax, -1
 .dh_fd_out:
+    call write_u64_stderr
+    lea rsi, [dbg_dm_keys]
+    call write_str_stderr
+    pop rax
+    cmp eax, MAX_CLIENTS
+    jae .dh_nokeys
+    mov eax, [keys_to_slot + rax*4]           ; key events frame has sent it
+    jmp .dh_keys_out
+.dh_nokeys:
+    xor eax, eax
+.dh_keys_out:
     call write_u64_stderr
     lea rsi, [probe_conn_nl]
     mov rdx, 1
