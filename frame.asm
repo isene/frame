@@ -456,7 +456,7 @@ rc_remaps:          resb 16 * 28           ; staged `keycode` lines: keycode
 rc_remap_count:     resd 1
 
 ; ---- Phase 4 multi-client state -------------------------------------------
-; clients_meta[16] — one 16-byte slot per concurrent client.
+; clients_meta[24] — one 24-byte slot per concurrent client.
 ;   +0 fd (s32)          -1 = empty slot
 ;   +4 state (u8)        0 = SETUP, 1 = RUNNING
 ;   +5 pad (3)
@@ -476,7 +476,7 @@ rc_remap_count:     resd 1
 ; 256 KB × 128 slots = 32 MB of BSS reservation — demand-paged, so
 ; only touched pages cost real memory.
 %define MAX_CLIENTS      128
-%define CLIENT_META_SIZE 16
+%define CLIENT_META_SIZE 24
 %define CLIENT_BUF_SIZE  262144
 %define CSTATE_SETUP     0
 %define CSTATE_RUNNING   1
@@ -3917,6 +3917,7 @@ client_alloc:
     mov byte [clients_meta + rax + 4], CSTATE_SETUP
     mov dword [clients_meta + rax + 8], 0    ; seq (incremented on first reply)
     mov dword [clients_meta + rax + 12], 0   ; buf_used
+    mov dword [clients_meta + rax + 16], 0   ; buf_pos (first unconsumed byte)
     call slots_watch                         ; DIAG: 3/4-full early warning
     mov eax, ebx
     pop r12
@@ -4979,6 +4980,7 @@ client_process:
     push r12
     push r13
     push r14
+    push r15
     mov ebx, edi                             ; slot
 
     ; meta_ptr in r12, fd in r13d
@@ -4987,6 +4989,28 @@ client_process:
     mov r12, rax
     mov r13d, [r12]
     mov r14d, [r12 + 12]                     ; buf_used
+    mov r15d, [r12 + 16]                     ; buf_pos: first unconsumed byte
+
+    ; Compact the buffer ONCE here, not after every request. The drain
+    ; loop below only advances buf_pos. Memmoving the tail down per
+    ; request is O(n^2) in buffered bytes: a 256 KB buffer holding a few
+    ; thousand small draw requests cost ~20 s of CPU for one screen of
+    ; colour-run text, 97% of it in this one rep movsb.
+    test r15d, r15d
+    jz .cp_compacted
+    mov eax, ebx
+    call client_buf_addr
+    mov rdi, rax
+    mov rsi, rax
+    add rsi, r15
+    mov ecx, r14d
+    sub ecx, r15d
+    rep movsb
+    sub r14d, r15d
+    xor r15d, r15d
+    mov [r12 + 12], r14d
+    mov dword [r12 + 16], 0
+.cp_compacted:
 
     ; If buffer is full, drop client (request too big / malformed).
     cmp r14d, CLIENT_BUF_SIZE
@@ -5014,38 +5038,41 @@ client_process:
     mov [r12 + 12], r14d
 
 .cp_drain:
+    ; Reload the cursor every iteration: handlers reached via
+    ; dispatch_request do not preserve r15, so the register copy below is
+    ; only valid until the next call. The meta field is the truth.
+    mov r15d, [r12 + 16]                     ; buf_pos
     ; --- State machine.
     movzx eax, byte [r12 + 4]
     cmp eax, CSTATE_SETUP
     je .cp_setup
     ; RUNNING.
-    cmp r14d, 4
+    mov eax, r14d
+    sub eax, r15d                            ; bytes still unconsumed
+    cmp eax, 4
     jl .cp_done                              ; need at least the 4-byte header
     mov eax, ebx
     call client_buf_addr
+    add rax, r15                             ; request starts at buf + buf_pos
     movzx edx, word [rax + 2]                ; length in 4-byte units
     shl edx, 2
     test edx, edx
     jnz .cp_have_len
     mov edx, 4                               ; defensive (length 0 shouldn't happen)
 .cp_have_len:
-    cmp r14d, edx
+    mov eax, r14d
+    sub eax, r15d
+    cmp eax, edx
     jl .cp_done                              ; need more bytes for this request
     push rdx
     mov edi, ebx
     mov esi, edx
     call dispatch_request
     pop rdx
-    ; Shift remaining buffer down by edx.
-    mov eax, ebx
-    call client_buf_addr
-    sub r14d, edx
-    mov rsi, rax
-    add rsi, rdx
-    mov rdi, rax
-    mov ecx, r14d
-    rep movsb
-    mov [r12 + 12], r14d
+    ; Consume the request by moving the cursor, not the bytes. Update the
+    ; meta field directly: handlers reached through dispatch_request do
+    ; not preserve r15, so any register copy of the cursor is stale here.
+    add [r12 + 16], edx
     jmp .cp_drain
 
 .cp_setup:
@@ -5075,6 +5102,8 @@ client_process:
     call emit_setup_reply
     pop rdx
     mov byte [r12 + 4], CSTATE_RUNNING
+    xor r15d, r15d                           ; setup shifts, so the cursor
+    mov dword [r12 + 16], 0                  ; restarts at the buffer front
     ; Shift buffer past the consumed setup bytes.
     mov eax, ebx
     call client_buf_addr
@@ -5094,6 +5123,7 @@ client_process:
     jmp .cp_close
 
 .cp_done:
+    pop r15
     pop r14
     pop r13
     pop r12
@@ -5103,6 +5133,7 @@ client_process:
 .cp_close:
     mov edi, ebx
     call client_close
+    pop r15
     pop r14
     pop r13
     pop r12
@@ -5111,7 +5142,7 @@ client_process:
 
 ; ============================================================================
 ; dispatch_request — edi = slot, esi = request size in bytes. The request
-; lives at client_buf_addr(slot)[0..esi-1].
+; lives at client_buf_addr(slot) + buf_pos, for esi bytes.
 ;
 ; Increments the per-client sequence number for every request (whether or
 ; not it gets a reply; replies need the matching sequence so the client
@@ -5128,9 +5159,11 @@ dispatch_request:
     mov eax, ebx
     call client_meta_addr
     inc dword [rax + 8]
+    mov r12d, [rax + 16]                     ; buf_pos
 
     mov eax, ebx
     call client_buf_addr
+    add rax, r12
     mov r12, rax                             ; request ptr
 
     movzx eax, byte [r12]                    ; opcode
@@ -5749,6 +5782,8 @@ handle_intern_atom:
     mov r12, rax                             ; meta ptr
     mov eax, ebx
     call client_buf_addr
+    mov ecx, [r12 + 16]                      ; buf_pos — the drain loop leaves
+    add rax, rcx                             ; earlier requests in the buffer
     mov r13, rax                             ; request ptr
     movzx r14d, word [r13 + 4]               ; n
     lea r15, [r13 + 8]                       ; name ptr
@@ -8910,6 +8945,8 @@ handle_query_tree:
 
     mov eax, ebx
     call client_buf_addr
+    mov ecx, [r12 + 16]                      ; buf_pos — the drain loop leaves
+    add rax, rcx                             ; earlier requests in the buffer
     mov r13, rax                             ; request ptr
     mov edi, [r13 + 4]                       ; window xid
     call window_lookup
