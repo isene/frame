@@ -400,8 +400,15 @@ sel_count:          resd 1
 ; +4 selection atom, +8 window. Fires XFixesSelectionNotify to that client
 ; when the selection's owner changes (SetSelectionOwner). This is how copyq
 ; (Qt) tracks the system clipboard.
-XFIXES_SUB_MAX      equ 16
+; 64 entries at 12 bytes is 768 bytes of BSS. It was 16, and a full
+; table drops the new subscription SILENTLY. copyq's process swarm
+; (server, monitorClipboard and N helpers, each subscribing CLIPBOARD
+; and PRIMARY) plus Firefox filled it, and #system lost a day to a
+; clipboard watcher whose byte-perfect SelectSelectionInput simply
+; never produced an event.
+XFIXES_SUB_MAX      equ 64
 xfixes_subs:        resb XFIXES_SUB_MAX * 12
+xfixes_full_logged: resb 1               ; only complain about a full table once
 xfixes_sub_evbuf:   resb 32
 ; MIT-SHM attached segments. Each entry (24 bytes): +0 shmseg id (u32, 0=empty),
 ; +4 owning client slot (u32), +8 attached address (u64), +16 segment size (u64).
@@ -1150,6 +1157,8 @@ xi1_core_devs:      db 0,0,0,0, 2, 0, 0, 0
                     db 20, "Virtual core pointer"
                     db 21, "Virtual core keyboard"
                     db 0
+dbg_xfixes_full:    db "frame: XFIXES subscription table full, dropping SelectSelectionInput", 10
+dbg_xfixes_full_len equ $ - dbg_xfixes_full
 dbg_pxfull:         db "PXFULL", 10        ; DIAG: CreatePixmap dropped — table full
 dbg_cli_tag:        db "c"                 ; DIAG: client slot prefix
 dbg_picfull:        db "PICFULL", 10       ; DIAG: CreatePicture dropped — table full
@@ -6390,7 +6399,27 @@ handle_xfixes:
     jmp .xfsi_find
 .xfsi_place:
     cmp r12d, -1
-    je .xfsi_done                            ; table full → drop
+    jne .xfsi_store
+    ; Table full. Say so once per frame run: a silent drop here looks
+    ; exactly like a working subscription that never fires, and the
+    ; client has no way to tell.
+    cmp byte [xfixes_full_logged], 0
+    jne .xfsi_done
+    mov byte [xfixes_full_logged], 1
+    push rax
+    push rdi
+    push rsi
+    push rdx
+    mov eax, SYS_WRITE
+    mov edi, 2
+    lea rsi, [dbg_xfixes_full]
+    mov edx, dbg_xfixes_full_len
+    syscall
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rax
+    jmp .xfsi_done
 .xfsi_store:
     mov eax, r12d
     imul eax, eax, 12
