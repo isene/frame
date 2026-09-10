@@ -14690,12 +14690,43 @@ sync_pointer_window:
     push rbx
     call window_at_point
     test rax, rax
-    jz .spw_cur
+    jz .spw_none
     mov rbx, rax
     call pointer_crossings
+    jmp .spw_cur
+.spw_none:
+    call pointer_left_all
 .spw_cur:
     call cursor_sync                         ; window/grab cursor may differ now
     pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; pointer_left_all — only the root is under the pointer now: LeaveNotify to
+; the window it was last inside (if that window still exists) and forget
+; it. Until v0.1.2 last_enter_win kept the old xid, so a later window with
+; the SAME xid never got an EnterNotify: a restarted client takes the same
+; slot, so the same xids, and its first window mapped under a parked
+; pointer looked "already entered". GDK drops wheel and hover handling for
+; a window it was never told the pointer entered; firefox hover stayed
+; dead across a restart until a workspace round-trip forced a crossing.
+; Costs one load when nothing was entered. Clobbers caller-saved regs.
+; ----------------------------------------------------------------------------
+pointer_left_all:
+    mov edi, [last_enter_win]
+    test edi, edi
+    jz .pla_done
+    call window_lookup
+    test rax, rax
+    jz .pla_clear
+    mov rsi, rax
+    mov edi, 8                               ; LeaveNotify
+    mov edx, 3                               ; detail Nonlinear
+    call send_crossing
+.pla_clear:
+    mov dword [last_enter_win], 0
+    call cursor_sync                         ; back to the root cursor
+.pla_done:
     ret
 
 ; ----------------------------------------------------------------------------
@@ -14961,7 +14992,10 @@ deliver_pointer_motion:
 .dpm_point:
     call window_at_point
     test rax, rax
-    jz .dpm_done
+    jnz .dpm_have
+    call pointer_left_all                    ; onto bare root: Leave + forget
+    jmp .dpm_done
+.dpm_have:
     mov rbx, rax
     call pointer_crossings                   ; Enter/Leave BEFORE motion gating
     mov esi, 6                               ; propagate up to the nearest
