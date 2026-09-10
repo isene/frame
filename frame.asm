@@ -14243,106 +14243,22 @@ window_abs_origin:
     ret
 
 window_at_point:
-    ; Absolute-aware pick: a window counts only if its WHOLE ancestor chain
-    ; is mapped, and its rect is tested at its ABSOLUTE origin (child x/y
-    ; are parent-relative). The old parent-local test let a nested child of
-    ; an UNMAPPED toplevel (firefox's content child while its tab lived on
-    ; another workspace) swallow clicks anywhere its parent-relative rect
-    ; happened to land — tray right-clicks opened firefox menus. Winner's
-    ; absolute origin lands in wap_abs_x/y for event-coordinate math.
-    push rbx
-    push r12
-    push r14
-    push r15
-    xor ebx, ebx
-    xor r12d, r12d                           ; best stk = 0 (topmost wins)
-    mov qword [wap_best], 0
-.wap_loop:
-    cmp ebx, MAX_WINDOWS
-    jge .wap_done
-    mov r8, rbx
-    imul r8, WINDOW_REC_SIZE
-    lea r8, [windows + r8]
-    mov r9d, [r8]                            ; xid
-    test r9d, r9d
-    jz .wap_next
-    cmp r9d, X_ROOT_WINDOW
-    je .wap_next
-    cmp byte [r8 + 28], 0                     ; mapped?
-    je .wap_next
-    mov r9d, [r8 + 48]                        ; stk: can it beat the best at
-    cmp r9d, r12d                             ; all? (cheap pre-filter before
-    jbe .wap_next                             ; the ancestor walk)
-    ; --- ancestor walk: every ancestor mapped; accumulate absolute origin
-    movsx r14d, word [r8 + 8]                 ; abs x
-    movsx r15d, word [r8 + 10]                ; abs y
-    mov edi, [r8 + 4]                         ; parent xid
-.wap_anc:
-    test edi, edi
-    jz .wap_anc_ok
-    cmp edi, X_ROOT_WINDOW
-    je .wap_anc_ok
-    push r8
-    push r9
-    call window_lookup                        ; rax = ancestor (clobbers rax only)
-    pop r9
-    pop r8
-    test rax, rax
-    jz .wap_next                              ; orphaned → not clickable
-    cmp byte [rax + 28], 0                    ; unmapped ancestor → invisible
-    je .wap_next
-    movsx ecx, word [rax + 8]
-    add r14d, ecx
-    movsx ecx, word [rax + 10]
-    add r15d, ecx
-    mov edi, [rax + 4]
-    jmp .wap_anc
-.wap_anc_ok:
-    ; --- point inside the absolute rect? (ecx/edx = window-local px/py)
-    mov ecx, [cursor_x]
-    sub ecx, r14d
-    js .wap_next
-    movzx eax, word [r8 + 12]                 ; w
-    cmp ecx, eax
-    jge .wap_next
-    mov edx, [cursor_y]
-    sub edx, r15d
-    js .wap_next
-    movzx eax, word [r8 + 14]                 ; h
-    cmp edx, eax
-    jge .wap_next
-    ; SHAPE input region: an empty input shape means click-through (spot's
-    ; overlay) — the window never becomes the pick.
-    mov edi, [r8]
-    mov esi, ecx                              ; px window-local
-    ; edx = py window-local
-    call shape_input_hit                      ; preserves all regs
-    jnz .wap_next                             ; ZF=0 → pass through
-    mov r12d, r9d                             ; new topmost stk
-    mov [wap_best], r8
-    mov [wap_abs_x], r14d
-    mov [wap_abs_y], r15d
-.wap_next:
-    inc ebx
-    jmp .wap_loop
-.wap_done:
-    mov rax, [wap_best]
-    pop r15
-    pop r14
-    pop r12
-    pop rbx
+    ; Top-down pick, level by level, the way X defines it: at each level the
+    ; topmost mapped sibling holding the point wins, then descend into it.
+    ; Until v0.1.3 this compared one global stacking number across the
+    ; whole tree, so a toplevel re-mapped by tile (fresh, higher number)
+    ; beat its own content child that was mapped once at startup. Firefox
+    ; then got its pointer events addressed to the toplevel, and hover was
+    ; dead until something restacked the child. A child is always above its
+    ; parent; window_at_point_deep already knows that.
+    call window_at_point_deep                 ; rax = deepest record (or 0)
+    mov [wap_best], rax
+    mov ecx, [wapd_abs_x]
+    mov [wap_abs_x], ecx
+    mov ecx, [wapd_abs_y]
+    mov [wap_abs_y], ecx
     ret
 
-; ----------------------------------------------------------------------------
-; window_at_point_deep — the DEEPEST mapped window (input-only included) whose
-; ABSOLUTE rect contains (cursor_x, cursor_y). Descends the tree from root,
-; taking the topmost sibling that contains the point at each level and
-; accumulating the absolute origin. Returns the record ptr in rax (0 if over
-; root only); wapd_abs_x/wapd_abs_y hold that window's absolute origin.
-; A real server delivers pointer events here — GTK menu items are input-only
-; child windows, and the click must carry that window as its event-window or
-; GTK can't tell which item was hit.
-; ----------------------------------------------------------------------------
 window_at_point_deep:
     push rbx
     push r12
