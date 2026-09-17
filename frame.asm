@@ -634,6 +634,20 @@ last_enter_win:     resd 1               ; window the pointer was last inside �
                                          ; drives EnterNotify/LeaveNotify. GTK
                                          ; menu items prelight + activate on
                                          ; crossings, not motion.
+; Scratch for the virtual crossing chains (pointer_crossings). In BSS, not
+; registers: send_crossing clobbers every caller-saved register.
+%define XING_MAX 16                      ; ancestors walked per crossing
+xing_old:           resd 1               ; window left
+xing_new:           resd 1               ; window entered
+xing_lca_w:         resd 1               ; their lowest common ancestor
+xing_w:             resd 1               ; chain walker
+xing_stop:          resd 1               ; chain end (exclusive)
+xing_detail:        resd 1               ; detail for the chain's events
+xing_newdet:        resd 1               ; detail for the final Enter
+xing_n:             resd 1               ; entries in xing_chain
+xing_chain:         resd XING_MAX        ; ancestors of the entered window
+    alignb 8
+xing_old_rec:       resq 1               ; record of the window left
 
 ; ---- Phase 4h pixmap table ------------------------------------------------
 ; pixmaps[MAX_PIXMAPS] — offscreen drawables. Like a window's backing
@@ -14527,6 +14541,120 @@ window_is_inferior:
     ret
 
 ; ----------------------------------------------------------------------------
+; Crossing chains (v0.1.5). X sends Enter/Leave not only to the window left
+; and the window entered but to every ancestor in between, with a "virtual"
+; detail. GTK3 decides "the pointer is inside this toplevel" from the
+; TOPLEVEL's own Enter. frame told only the two end windows, so a toplevel
+; whose child took the pointer never heard of it and GDK dropped every
+; motion event on that child: firefox hover dead, one pending hover fired
+; per key press. Until v0.1.2 a workspace round-trip hid this, because the
+; re-mapped toplevel then out-ranked its child and took the events itself;
+; v0.1.3 picked the child every time (correct) and so made it permanent.
+; ----------------------------------------------------------------------------
+; xing_parent — edi = xid. eax = its parent xid, 0 when the window is unknown.
+xing_parent:
+    call window_lookup
+    test rax, rax
+    jz .xp_none
+    mov eax, [rax + 4]
+    ret
+.xp_none:
+    xor eax, eax
+    ret
+
+; xing_leave_chain — edi = start xid, esi = stop xid, edx = detail.
+; LeaveNotify to every ancestor of start below stop, bottom-up.
+xing_leave_chain:
+    mov [xing_stop], esi
+    mov [xing_detail], edx
+    call xing_parent
+.xlc_loop:
+    test eax, eax
+    jz .xlc_done
+    cmp eax, X_ROOT_WINDOW
+    je .xlc_done
+    cmp eax, [xing_stop]
+    je .xlc_done
+    mov [xing_w], eax
+    mov edi, eax
+    call window_lookup
+    test rax, rax
+    jz .xlc_done
+    mov rsi, rax
+    mov edi, 8
+    mov edx, [xing_detail]
+    call send_crossing
+    mov edi, [xing_w]
+    call xing_parent
+    jmp .xlc_loop
+.xlc_done:
+    ret
+
+; xing_enter_chain — edi = entered xid, esi = stop xid, edx = detail.
+; EnterNotify to every ancestor of the entered window below stop, top-down.
+xing_enter_chain:
+    mov [xing_stop], esi
+    mov [xing_detail], edx
+    mov dword [xing_n], 0
+    call xing_parent
+.xec_collect:
+    test eax, eax
+    jz .xec_emit
+    cmp eax, X_ROOT_WINDOW
+    je .xec_emit
+    cmp eax, [xing_stop]
+    je .xec_emit
+    mov ecx, [xing_n]
+    cmp ecx, XING_MAX
+    jae .xec_emit
+    mov [xing_chain + rcx*4], eax
+    inc dword [xing_n]
+    mov edi, eax
+    call xing_parent
+    jmp .xec_collect
+.xec_emit:
+    mov ecx, [xing_n]
+    test ecx, ecx
+    jz .xec_done
+    dec ecx
+    mov [xing_n], ecx
+    mov edi, [xing_chain + rcx*4]
+    call window_lookup
+    test rax, rax
+    jz .xec_emit
+    mov rsi, rax
+    mov edi, 7
+    mov edx, [xing_detail]
+    call send_crossing
+    jmp .xec_emit
+.xec_done:
+    ret
+
+; xing_lca — edi = old xid, esi = new xid. eax = their lowest common
+; ancestor, X_ROOT_WINDOW when they share none below the root.
+xing_lca:
+    mov [xing_w], edi
+    mov [xing_stop], esi
+.xl_up:
+    mov edi, [xing_w]
+    call xing_parent
+    test eax, eax
+    jz .xl_root
+    cmp eax, X_ROOT_WINDOW
+    je .xl_root
+    mov [xing_w], eax
+    mov edi, [xing_stop]                     ; is new below this ancestor too?
+    mov esi, eax
+    call window_is_inferior
+    test al, al
+    jz .xl_up
+    mov eax, [xing_w]
+    ret
+.xl_root:
+    mov eax, X_ROOT_WINDOW
+    ret
+
+; ----------------------------------------------------------------------------
 ; pointer_crossings — rbx = record of the window now under the pointer.
 ; When it changed since last motion: LeaveNotify to the old window,
 ; EnterNotify to the new, with X-correct details: entering an inferior →
@@ -14549,46 +14677,78 @@ pointer_crossings:
     mov eax, [rbx]
     cmp eax, [last_enter_win]
     je .pc_done
-    mov r8d, 3                               ; leave detail = Nonlinear
-    mov r9d, 3                               ; enter detail = Nonlinear
-    mov edi, [last_enter_win]
-    test edi, edi
-    jz .pc_details_done
-    mov edi, [rbx]                           ; new inferior of old?
-    mov esi, [last_enter_win]
+    mov [xing_new], eax
+    mov eax, [last_enter_win]
+    mov [xing_old], eax
+    test eax, eax
+    jz .pc_from_root
+    mov edi, eax
+    call window_lookup
+    test rax, rax
+    jz .pc_from_root                         ; the old window is gone: no Leave
+    mov [xing_old_rec], rax
+    mov edi, [xing_new]                      ; new is an inferior of old?
+    mov esi, [xing_old]
     call window_is_inferior
     test al, al
     jz .pc_chk_up
-    mov r8d, 2                               ; Leave(old, Inferior)
-    xor r9d, r9d                             ; Enter(new, Ancestor)
-    jmp .pc_details_done
+    mov rsi, [xing_old_rec]
+    mov edi, 8
+    mov edx, 2                               ; Leave(old, Inferior)
+    call send_crossing
+    mov edi, [xing_new]
+    mov esi, [xing_old]
+    mov edx, 1                               ; Enter(between, Virtual)
+    call xing_enter_chain
+    mov dword [xing_newdet], 0               ; Enter(new, Ancestor)
+    jmp .pc_enter
 .pc_chk_up:
-    mov edi, [last_enter_win]                ; old inferior of new?
-    mov esi, [rbx]
+    mov edi, [xing_old]                      ; old is an inferior of new?
+    mov esi, [xing_new]
     call window_is_inferior
     test al, al
-    jz .pc_details_done
-    xor r8d, r8d                             ; Leave(old, Ancestor)
-    mov r9d, 2                               ; Enter(new, Inferior)
-.pc_details_done:
-    mov edi, [last_enter_win]
-    test edi, edi
-    jz .pc_enter
-    call window_lookup
-    test rax, rax
-    jz .pc_enter
-    push r9
-    mov rsi, rax
-    mov edi, 8                               ; LeaveNotify
-    mov edx, r8d
+    jz .pc_nonlinear
+    mov rsi, [xing_old_rec]
+    mov edi, 8
+    xor edx, edx                             ; Leave(old, Ancestor)
     call send_crossing
-    pop r9
+    mov edi, [xing_old]
+    mov esi, [xing_new]
+    mov edx, 1                               ; Leave(between, Virtual)
+    call xing_leave_chain
+    mov dword [xing_newdet], 2               ; Enter(new, Inferior)
+    jmp .pc_enter
+.pc_nonlinear:
+    mov edi, [xing_old]
+    mov esi, [xing_new]
+    call xing_lca
+    mov [xing_lca_w], eax
+    mov rsi, [xing_old_rec]
+    mov edi, 8
+    mov edx, 3                               ; Leave(old, Nonlinear)
+    call send_crossing
+    mov edi, [xing_old]
+    mov esi, [xing_lca_w]
+    mov edx, 4                               ; Leave(between, NonlinearVirtual)
+    call xing_leave_chain
+    mov edi, [xing_new]
+    mov esi, [xing_lca_w]
+    mov edx, 4                               ; Enter(between, NonlinearVirtual)
+    call xing_enter_chain
+    mov dword [xing_newdet], 3               ; Enter(new, Nonlinear)
+    jmp .pc_enter
+.pc_from_root:
+    mov edi, [xing_new]                      ; from the bare root: new is its
+    mov esi, X_ROOT_WINDOW                   ; inferior
+    mov edx, 1                               ; Enter(between, Virtual)
+    call xing_enter_chain
+    mov dword [xing_newdet], 0               ; Enter(new, Ancestor)
 .pc_enter:
-    mov eax, [rbx]
+    mov eax, [xing_new]
     mov [last_enter_win], eax
     mov edi, 7                               ; EnterNotify
     mov rsi, rbx
-    mov edx, r9d
+    mov edx, [xing_newdet]
     call send_crossing
     call cursor_sync                         ; new window may define a cursor
 .pc_done:
@@ -14642,13 +14802,18 @@ pointer_left_all:
     mov edi, [last_enter_win]
     test edi, edi
     jz .pla_done
+    mov [xing_old], edi
     call window_lookup
     test rax, rax
     jz .pla_clear
     mov rsi, rax
     mov edi, 8                               ; LeaveNotify
-    mov edx, 3                               ; detail Nonlinear
-    call send_crossing
+    xor edx, edx                             ; Ancestor: the pointer went up to
+    call send_crossing                       ; the root
+    mov edi, [xing_old]
+    mov esi, X_ROOT_WINDOW
+    mov edx, 1                               ; Leave(between, Virtual)
+    call xing_leave_chain
 .pla_clear:
     mov dword [last_enter_win], 0
     call cursor_sync                         ; back to the root cursor
