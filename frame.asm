@@ -10901,6 +10901,16 @@ handle_unmap_window:
     test rax, rax
     jz .uw_done
     mov r12, rax
+    ; X11: UnmapWindow on an already-unmapped window has NO effect: no
+    ; UnmapNotify, no damage. The mirror of the guard in handle_map_window.
+    ; GDK freezes a toplevel on every UnmapNotify and thaws it once per
+    ; MapNotify, so a duplicate leaves the toplevel's frame clock frozen for
+    ; good. GDK then holds back trailing motion events until some other
+    ; event pushes them out: firefox hover died and "any key press" fired
+    ; it once. A restarted tile re-unmaps every window on a hidden
+    ; workspace, which is what sent the duplicates (fixed v0.1.4).
+    cmp byte [r12 + 28], 0
+    je .uw_done
     mov byte [r12 + 28], 0
     mov byte [comp_dirty], 1
     mov rdi, r12
