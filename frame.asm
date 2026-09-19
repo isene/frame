@@ -730,6 +730,7 @@ co_dst_stride:      resd 1
 co_dst_h:           resd 1
 co_fast:            resd 1               ; 1 = scale-only composite fast path
 flush_kind:         resb 1               ; 0 clflush, 1 clflushopt, 2 clwb (cpuid at start)
+rs_rect_opaque:     resb 1               ; this damage rect lies under an opaque window
 tz_dst_ptr:         resq 1               ; render_trapezoids: dst backing
 tz_dst_stride:      resd 1
 tz_dst_h:           resd 1
@@ -18058,6 +18059,53 @@ damage_add_window:
 ; non-root window and draw its rect in a per-XID colour. No-op if
 ; compositor_active is 0.
 ; ----------------------------------------------------------------------------
+; rbx = damage rect (x1, y1, x2, y2). eax = 1 when a mapped, opaque
+; (depth 24), top-level window with a backing covers the whole rect:
+; the wallpaper fill under it would be painted over at once (v0.1.7).
+; A game frame filling a glass window skips a full-window fill a frame.
+rect_covered_opaque:
+    xor ecx, ecx
+.rco_loop:
+    cmp ecx, MAX_WINDOWS
+    jge .rco_no
+    mov rax, rcx
+    imul rax, WINDOW_REC_SIZE
+    lea rax, [windows + rax]
+    cmp dword [rax], 0
+    je .rco_next
+    cmp dword [rax + 4], X_ROOT_WINDOW
+    jne .rco_next
+    cmp byte [rax + 28], 1                    ; mapped
+    jne .rco_next
+    cmp byte [rax + 18], 24                   ; opaque visual
+    jne .rco_next
+    cmp byte [rax + 19], 1                    ; InputOutput
+    jne .rco_next
+    cmp byte [rax + 31], 1                    ; has backing
+    jne .rco_next
+    movsx edx, word [rax + 8]                 ; x
+    cmp edx, [rbx + 0]
+    jg .rco_next
+    movsx r8d, word [rax + 10]                ; y
+    cmp r8d, [rbx + 4]
+    jg .rco_next
+    movzx r9d, word [rax + 12]
+    add edx, r9d                              ; x + w
+    cmp edx, [rbx + 8]
+    jl .rco_next
+    movzx r9d, word [rax + 14]
+    add r8d, r9d                              ; y + h
+    cmp r8d, [rbx + 12]
+    jl .rco_next
+    mov eax, 1
+    ret
+.rco_next:
+    inc ecx
+    jmp .rco_loop
+.rco_no:
+    xor eax, eax
+    ret
+
 ; cpuid leaf 7: pick the cheapest way to push framebuffer lines to RAM.
 detect_flush_kind:
     push rbx
@@ -18149,6 +18197,8 @@ recomposite_screen:
     call rect_unpainted_hold
     test eax, eax
     jnz .rs_rect_next
+    call rect_covered_opaque
+    mov [rs_rect_opaque], al
     mov eax, [rbx + 0]
     mov [bw_clip_x1], eax
     mov edx, [rbx + 4]
@@ -18166,7 +18216,10 @@ recomposite_screen:
     mov esi, edx                              ; y
     mov edi, ecx                              ; w
     mov ecx, r8d                              ; h
+    cmp byte [rs_rect_opaque], 0              ; an opaque window covers it:
+    jne .rs_rect_no_fill                      ; the fill would be painted over
     call bg_fill_rect                         ; wallpaper (or solid) for this rect
+.rs_rect_no_fill:
     call .rs_window_walk
     call xor_band_apply                       ; rubber band rides on top
     call warn_band_apply                      ; and the out-of-slots warning
