@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.5-blue)
+![Version](https://img.shields.io/badge/version-0.1.6-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -51,7 +51,7 @@ keyboard-driven. No libc, no Xlib, no Mesa anywhere in the path.*
 | 6 | SHAPE extension | ✓ shipped (bounding + input regions — spot runs) |
 | 7 | GCs + drawing primitives | |
 | 8 | DRM/KMS atomic modeset upgrade | |
-| 9 | RENDER subset for glass emoji + ARGB | |
+| 9 | RENDER subset for glass emoji + ARGB (v0.1.6: scale-only Composite fast path, framebuffer flush with clwb; a 640x400 game frame scaled over the window at 60 fps is affordable) | |
 | 10 | Cursor sprite + keyboard layout + clipboard | |
 | 11 | XKB (Firefox-compatible) | |
 | 12 | DAMAGE + COMPOSITE + FIXES | |

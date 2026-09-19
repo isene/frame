@@ -728,6 +728,8 @@ co_src_color:       resd 1
 co_dst_ptr:         resq 1
 co_dst_stride:      resd 1
 co_dst_h:           resd 1
+co_fast:            resd 1               ; 1 = scale-only composite fast path
+flush_kind:         resb 1               ; 0 clflush, 1 clflushopt, 2 clwb (cpuid at start)
 tz_dst_ptr:         resq 1               ; render_trapezoids: dst backing
 tz_dst_stride:      resd 1
 tz_dst_h:           resd 1
@@ -2059,6 +2061,7 @@ _start:
     call init_pixmaps
     call init_pictures
     call init_properties
+    call detect_flush_kind
     call install_dump_handler
     call install_wall_handler
     ; Ignore SIGPIPE ALWAYS (both --display and --fbtest / network-only). A
@@ -18055,6 +18058,52 @@ damage_add_window:
 ; non-root window and draw its rect in a per-XID colour. No-op if
 ; compositor_active is 0.
 ; ----------------------------------------------------------------------------
+; cpuid leaf 7: pick the cheapest way to push framebuffer lines to RAM.
+detect_flush_kind:
+    push rbx
+    mov eax, 7
+    xor ecx, ecx
+    cpuid
+    xor eax, eax
+    bt ebx, 23                                ; clflushopt
+    adc eax, 0
+    bt ebx, 24                                ; clwb
+    jnc .dfk_store
+    mov eax, 2
+.dfk_store:
+    mov [flush_kind], al
+    pop rbx
+    ret
+
+; rdi = first cache line, rcx = bytes (a multiple of 64). Writes the
+; lines back so the display engine scans fresh pixels. clflush is
+; serialised and cost most of a core on a full-window 60 fps game frame;
+; clflushopt pipelines, and clwb also keeps the lines cached for the next
+; frame's read-modify-write.
+flush_lines:
+    cmp byte [flush_kind], 2
+    je .fl_clwb
+    cmp byte [flush_kind], 1
+    je .fl_opt
+.fl_plain:
+    clflush [rdi]
+    add rdi, 64
+    sub rcx, 64
+    ja .fl_plain
+    ret
+.fl_opt:
+    clflushopt [rdi]
+    add rdi, 64
+    sub rcx, 64
+    ja .fl_opt
+    ret
+.fl_clwb:
+    clwb [rdi]
+    add rdi, 64
+    sub rcx, 64
+    ja .fl_clwb
+    ret
+
 recomposite_screen:
     cmp byte [compositor_active], 0
     je .rs_done
@@ -18151,11 +18200,7 @@ recomposite_screen:
     sub ecx, edx
     jle .rs_fr_rownext
     add [comp_px_flush], rcx                  ; PERF counter (bytes)
-.rs_fr_line:
-    clflush [rdi]
-    add rdi, 64
-    sub ecx, 64
-    ja .rs_fr_line
+    call flush_lines
 .rs_fr_rownext:
     inc r8d
     jmp .rs_fr_row
@@ -18190,11 +18235,7 @@ recomposite_screen:
     mov rdi, [drm_dumb_addr]
     mov rcx, [drm_dumb_size]
     add [comp_px_flush], rcx                  ; PERF counter
-.rs_flush_all:
-    clflush [rdi]
-    add rdi, 64
-    sub rcx, 64
-    ja .rs_flush_all
+    call flush_lines
     sfence
 
 .rs_present:
@@ -25004,11 +25045,34 @@ render_composite:
 .rc_src_done:
 
     ; --- region loop ---
+    ; Fast path (v0.1.6): an image source with no clip and a transform
+    ; that only scales and shifts (m12 = m21 = 0, identity included).
+    ; One source row per destination row and a fixed-point step per
+    ; column, instead of a matrix multiply and a stride multiply per
+    ; pixel. Every kitty placement glass sends has this shape; a
+    ; 640x400 game frame scaled to the window went from 81% of a core
+    ; at 60 fps to a fraction of it.
+    mov dword [co_fast], 0
+    cmp dword [co_src_solid], 0
+    jne .rc_fast_decided
+    cmp qword [cur_clip], 0
+    jne .rc_fast_decided
+    mov r11, [co_src_xform]
+    test r11, r11
+    jz .rc_fast_yes
+    mov eax, [r11 + 8]                          ; m12
+    or eax, [r11 + 16]                          ; m21
+    jnz .rc_fast_decided
+.rc_fast_yes:
+    mov dword [co_fast], 1
+.rc_fast_decided:
     xor r14d, r14d                              ; dy = 0
 .rc_row:
     movzx eax, word [rbx + 34]                  ; height
     cmp r14d, eax
     jge .rc_finish
+    cmp dword [co_fast], 0
+    jne .rc_fast_row
     xor r15d, r15d                              ; dx = 0
 .rc_col:
     movzx eax, word [rbx + 32]                  ; width
@@ -25128,6 +25192,144 @@ render_composite:
     mov [rdi], eax
     jmp .rc_col_next
 .rc_blend:
+    call rc_blend_pixel
+    jmp .rc_col_next
+.rc_col_next:
+    inc r15d
+    jmp .rc_col
+
+.rc_fast_row:
+    ; dst row base → rbp
+    movsx eax, word [rbx + 30]                  ; yDst
+    add eax, r14d                                ; dsty
+    js .rc_row_next
+    cmp eax, [co_dst_h]
+    jge .rc_row_next
+    imul eax, [co_dst_stride]
+    mov rbp, [co_dst_ptr]
+    lea rbp, [rbp + rax*4]
+    ; src row base → r11: sy = (m22 * (ySrc + dy) + m23) >> 16
+    movsx rax, word [rbx + 22]                  ; ySrc
+    movsxd rcx, r14d
+    add rax, rcx
+    mov r11, [co_src_xform]
+    test r11, r11
+    jz .rc_fast_sy_ok
+    movsxd rcx, dword [r11 + 20]                ; m22
+    imul rax, rcx
+    movsxd rcx, dword [r11 + 24]                ; m23
+    add rax, rcx
+    sar rax, 16
+.rc_fast_sy_ok:
+    test rax, rax
+    js .rc_row_next
+    cmp eax, [co_src_h]
+    jge .rc_row_next
+    imul eax, [co_src_stride]
+    mov r11, [co_src_ptr]
+    lea r11, [r11 + rax*4]
+    ; columns dx in [dx0, dx1) that land inside the destination
+    movsx ecx, word [rbx + 28]                  ; xDst
+    xor eax, eax                                 ; dx0
+    test ecx, ecx
+    jns .rc_fast_dx0_ok
+    mov eax, ecx
+    neg eax
+.rc_fast_dx0_ok:
+    movzx edx, word [rbx + 32]                  ; width = dx1
+    mov r8d, [co_dst_stride]
+    sub r8d, ecx
+    cmp edx, r8d
+    jle .rc_fast_dx1_ok
+    mov edx, r8d
+.rc_fast_dx1_ok:
+    sub edx, eax                                 ; n = dx1 - dx0
+    jle .rc_row_next
+    mov r9d, edx                                 ; n, kept in ecx below
+    add ecx, eax                                 ; dstx0
+    movsxd rcx, ecx
+    lea rbp, [rbp + rcx*4]
+    ; acc = m11 * (xSrc + dx0) + m13, as 48.16; step = m11 → rdx
+    movsx rcx, word [rbx + 20]                  ; xSrc
+    add rcx, rax
+    mov r8, [co_src_xform]
+    test r8, r8
+    jz .rc_fast_ident_x
+    movsxd rdx, dword [r8 + 4]                  ; m11
+    imul rcx, rdx
+    movsxd rax, dword [r8 + 12]                 ; m13
+    add rcx, rax
+    jmp .rc_fast_acc_ok
+.rc_fast_ident_x:
+    mov edx, 0x10000
+    shl rcx, 16
+.rc_fast_acc_ok:
+    mov r15, rcx
+    mov ecx, r9d                                 ; pixels left on the row
+    mov r8d, [co_src_w]
+    ; Loop state stays in registers: a counter in memory here cost a
+    ; store-to-load stall per pixel and made the loop three times slower.
+.rc_fast_col:
+    mov rax, r15
+    sar rax, 16                                  ; sx
+    js .rc_fast_next
+    cmp eax, r8d
+    jge .rc_fast_next
+    mov esi, [r11 + rax*4]                       ; src ARGB
+    cmp r12d, 1                                  ; Src: copy
+    je .rc_fast_store
+    mov eax, esi
+    shr eax, 24                                  ; alpha
+    cmp eax, 255
+    je .rc_fast_store
+    test eax, eax
+    jz .rc_fast_next
+    mov rdi, rbp
+    push rcx
+    push rdx
+    push r8
+    call rc_blend_pixel
+    pop r8
+    pop rdx
+    pop rcx
+    jmp .rc_fast_next
+.rc_fast_store:
+    or esi, 0xFF000000
+    mov [rbp], esi
+.rc_fast_next:
+    add r15, rdx
+    add rbp, 4
+    dec ecx
+    jnz .rc_fast_col
+.rc_row_next:
+    inc r14d
+    jmp .rc_row
+.rc_finish:
+    mov edi, r13d                                ; dst drawable
+    call window_lookup
+    test rax, rax
+    jz .rc_done
+    mov byte [comp_dirty], 1
+    mov rdi, rax                              ; damage the composite dst rect
+    movsx eax, word [rbx + 28]
+    movsx edx, word [rbx + 30]
+    movzx ecx, word [rbx + 32]                ; width
+    movzx r8d, word [rbx + 34]                ; height
+    call damage_add_local
+.rc_done:
+    mov qword [cur_clip], 0
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; esi = source ARGB, eax = its alpha (1..254), rdi = destination pixel.
+; Blends source over destination and stores it. Clobbers eax, ecx, edx,
+; r8, r9, r10. Shared by the generic composite loop and its fast path.
+rc_blend_pixel:
     ; dst = src*a + dst*(255-a), per channel, /255 via (v*257+257)>>16
     mov r8d, eax                                 ; a
     mov r9d, 255
@@ -25177,32 +25379,6 @@ render_composite:
     or ecx, eax
     or ecx, 0xFF000000
     mov [rdi], ecx
-.rc_col_next:
-    inc r15d
-    jmp .rc_col
-.rc_row_next:
-    inc r14d
-    jmp .rc_row
-.rc_finish:
-    mov edi, r13d                                ; dst drawable
-    call window_lookup
-    test rax, rax
-    jz .rc_done
-    mov byte [comp_dirty], 1
-    mov rdi, rax                              ; damage the composite dst rect
-    movsx eax, word [rbx + 28]
-    movsx edx, word [rbx + 30]
-    movzx ecx, word [rbx + 32]                ; width
-    movzx r8d, word [rbx + 34]                ; height
-    call damage_add_local
-.rc_done:
-    mov qword [cur_clip], 0
-    pop rbp
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
     ret
 
 ; ----------------------------------------------------------------------------
