@@ -58,8 +58,25 @@ keyboard-driven. No libc, no Xlib, no Mesa anywhere in the path.*
 | 13 | RANDR + XInput2 + MIT-SHM | RANDR + XI2 + MIT-SHM ✓ shipped |
 | 14 | First Firefox launch | |
 
-Phase 4 is the "tile runs on frame" milestone — self-hosting CHasm.
+Phase 4 is the "tile runs on frame" milestone: self-hosting CHasm.
 Phase 14 is the "Firefox runs on a 50k-line asm X server" milestone.
+
+### GPU, when a need shows (noted 2026-09-19, on hold)
+
+Three rungs, in order of reach:
+
+1. **Display planes** (phase 8, the atomic modeset upgrade): hand a
+   window's buffer to an overlay plane and let the display engine scale
+   and show it. Kernel ioctls only. About 600 to 900 lines. A fullscreen
+   game or a video window at close to zero frame CPU. Needs a fullscreen
+   mode in tile first, since the strip covers part of every screen.
+2. **DRI3 + Present**: clients render on the GPU through Mesa and hand
+   frame their buffers as file descriptors, linear layout requested;
+   frame reads them or puts them on a plane. About 1500 to 2500 lines
+   plus compatibility work. WebGL, GPU video decode, OpenGL games.
+3. **Frame's own drawing on the GPU**: command streams for the render
+   engine, what Mesa and i915 do in hundreds of thousands of lines. Out
+   of reach for an asm server, and not planned.
 
 ## Phase 1: what works
 
