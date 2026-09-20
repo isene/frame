@@ -308,6 +308,7 @@ DEFAULT REL
 %define SYS_RECVMSG          47
 %define SYS_FSTAT            5
 %define SYS_FUTEX            202
+%define SYS_GETDENTS64       217
 %define FUTEX_WAKE           1
 %define SCM_RIGHTS           1
 %define MSG_CMSG_CLOEXEC     0x40000000
@@ -1105,6 +1106,9 @@ dp_args:            resd 8               ; dma_pixmap_create arguments: +0 pid,
                                          ; +4 w, +8 h, +12 stride, +16 offset,
                                          ; +20 fd, +24 depth, +28 minor
 pr_sub_n:           resd 1               ; live Present subscriptions (gate)
+drm_card_num1:      resd 1               ; display card index + 1 (0 = unknown)
+render_path_buf:    resb 64              ; "/dev/dri/renderDNNN" once resolved
+dents_buf:          resb 1024            ; getdents64 scratch
 ; XI2 raw motion: clients that selected XI_RawMotion on the root (GLFW's
 ; mouse look). slot+1 per entry, 0 = empty. raw_n gates the send path.
 raw_slots:          resb 4
@@ -2052,7 +2056,10 @@ glx_fbconfigs:
 glx_fb_bytes        equ $ - glx_fbconfigs
 %define GLX_FB_NATTR  27
 %define GLX_FB_COUNT  12
-render_node_path:   db "/dev/dri/renderD128", 0
+render_node_path:   db "/dev/dri/renderD128", 0   ; fallback when no card is known
+sys_drm_pre:        db "/sys/class/drm/card", 0
+sys_drm_post:       db "/device/drm", 0
+dev_dri_pre:        db "/dev/dri/", 0
 log_pr_full:        db "frame: Present subscription table full", 10
 log_pr_full_len     equ $ - log_pr_full
 
@@ -2844,11 +2851,38 @@ drm_try_open:
     xor edx, edx
     syscall
     test rax, rax
-    jns .dt_ok
+    jns .dt_opened
+.dt_next:
     inc ebx
     jmp .dt_loop
-.dt_ok:
+.dt_opened:
+    ; A card with no connectors cannot show anything: a discrete GPU whose
+    ; outputs are wired nowhere (the NVIDIA card took card0 on kernel
+    ; 7.0.0-31 and frame opened it, found no display and gave up). Ask
+    ; GETRESOURCES for the counts and move on when connectors is 0.
     push rax
+    lea rdi, [drm_res_buf]
+    xor eax, eax
+    mov ecx, 8
+    rep stosq
+    mov rax, SYS_IOCTL
+    mov rdi, [rsp]
+    mov esi, DRM_IOCTL_MODE_GETRESOURCES
+    lea rdx, [drm_res_buf]
+    syscall
+    test rax, rax
+    js .dt_skip
+    cmp dword [drm_res_buf + 40], 0          ; count_connectors
+    jne .dt_ok
+.dt_skip:
+    mov rax, SYS_CLOSE
+    mov rdi, [rsp]
+    syscall
+    pop rax
+    jmp .dt_next
+.dt_ok:
+    lea eax, [rbx + 1]
+    mov [drm_card_num1], eax                 ; remembered for the render node
     mov rsi, probe_open_ok_pre
     call write_str_stderr
     mov rsi, drm_card_path
@@ -26789,11 +26823,7 @@ handle_dri3:
     jmp .d3_done
 
 .d3_open:
-    mov eax, SYS_OPEN
-    lea rdi, [render_node_path]
-    mov esi, O_RDWR | O_CLOEXEC
-    xor edx, edx
-    syscall
+    call render_node_open                    ; the display card's render node
     test rax, rax
     js .d3_open_fail
     mov r13d, eax
@@ -27828,4 +27858,111 @@ raw_motion_send:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; render_node_open — rax = fd of the render node that belongs to the display
+; card, or < 0. The card index comes from drm_try_open (run here once in
+; fbtest mode, where no card is otherwise opened); its render node is the
+; renderD* entry under /sys/class/drm/cardN/device/drm. Card and render
+; minors are numbered by module load order and need not agree (this boot:
+; card0 = NVIDIA, renderD128 = Intel). The path is resolved once.
+; ----------------------------------------------------------------------------
+render_node_open:
+    push rbx
+    push r12
+    cmp byte [render_path_buf], 0
+    jne .rno_open
+    cmp dword [drm_card_num1], 0
+    jne .rno_have_card
+    call drm_try_open
+    test rax, rax
+    js .rno_fallback
+    mov rdi, rax
+    mov rax, SYS_CLOSE
+    syscall
+    lea rsi, [probe_conn_nl]                 ; end the "opened cardN" line
+    mov rdx, 1
+    call write_stderr
+    cmp dword [drm_card_num1], 0
+    je .rno_fallback
+.rno_have_card:
+    ; "/sys/class/drm/card" N "/device/drm"
+    lea rdi, [render_path_buf]
+    lea rsi, [sys_drm_pre]
+    call .rno_strcpy
+    mov eax, [drm_card_num1]
+    dec eax
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    lea rsi, [sys_drm_post]
+    call .rno_strcpy
+    mov byte [rdi], 0
+    mov rax, SYS_OPEN
+    lea rdi, [render_path_buf]
+    mov esi, 0x10000                         ; O_RDONLY | O_DIRECTORY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .rno_fallback
+    mov ebx, eax
+    mov rax, SYS_GETDENTS64
+    mov edi, ebx
+    lea rsi, [dents_buf]
+    mov edx, 1024
+    syscall
+    mov r12, rax                             ; bytes (or error)
+    mov rax, SYS_CLOSE
+    mov edi, ebx
+    syscall
+    test r12, r12
+    jle .rno_fallback
+    xor ebx, ebx                             ; offset
+.rno_scan:
+    cmp rbx, r12
+    jae .rno_fallback
+    lea rsi, [dents_buf + rbx + 19]          ; d_name
+    cmp dword [rsi], 'rend'
+    jne .rno_scan_next
+    cmp word [rsi + 4], 'er'
+    jne .rno_scan_next
+    cmp byte [rsi + 6], 'D'
+    je .rno_found
+.rno_scan_next:
+    movzx eax, word [dents_buf + rbx + 16]   ; d_reclen
+    add rbx, rax
+    jmp .rno_scan
+.rno_found:
+    lea rdi, [render_path_buf]
+    push rsi
+    lea rsi, [dev_dri_pre]
+    call .rno_strcpy
+    pop rsi
+    call .rno_strcpy
+    mov byte [rdi], 0
+    jmp .rno_open
+.rno_fallback:
+    lea rdi, [render_path_buf]
+    lea rsi, [render_node_path]
+    call .rno_strcpy
+    mov byte [rdi], 0
+.rno_open:
+    mov rax, SYS_OPEN
+    lea rdi, [render_path_buf]
+    mov esi, O_RDWR | O_CLOEXEC
+    xor edx, edx
+    syscall
+    pop r12
+    pop rbx
+    ret
+.rno_strcpy:                                 ; rsi → rdi, no NUL, rdi advances
+    mov al, [rsi]
+    test al, al
+    jz .rno_strcpy_done
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    jmp .rno_strcpy
+.rno_strcpy_done:
     ret

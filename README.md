@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.8-blue)
+![Version](https://img.shields.io/badge/version-0.1.9-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -51,7 +51,7 @@ keyboard-driven. No libc, no Xlib, no Mesa anywhere in the path.*
 | 6 | SHAPE extension | ✓ shipped (bounding + input regions — spot runs) |
 | 7 | GCs + drawing primitives | |
 | 8 | DRM/KMS atomic modeset upgrade | |
-| 9 | RENDER subset for glass emoji + ARGB. v0.1.6: scale-only Composite fast path, framebuffer flush with clwb. v0.1.7: no wallpaper fill under an opaque window. A 640x400 game frame over the window at 60 fps is affordable. v0.1.8: GLX + DRI3 + Present + SYNC, so Mesa renders on the GPU and frame copies the frames in (see below) | |
+| 9 | RENDER subset for glass emoji + ARGB. v0.1.6: scale-only Composite fast path, framebuffer flush with clwb. v0.1.7: no wallpaper fill under an opaque window. A 640x400 game frame over the window at 60 fps is affordable. v0.1.8: GLX + DRI3 + Present + SYNC, so Mesa renders on the GPU and frame copies the frames in (see below). v0.1.9: the card probe skips a card with no connectors, and DRI3 hands out that card's own render node | |
 | 10 | Cursor sprite + keyboard layout + clipboard | |
 | 11 | XKB (Firefox-compatible) | |
 | 12 | DAMAGE + COMPOSITE + FIXES | |
@@ -128,7 +128,10 @@ proven and the DRM backend is in.
 ./frame --probe
 ```
 
-Opens `/dev/dri/cardN`, enumerates resources, lists connectors:
+Opens `/dev/dri/cardN`, enumerates resources, lists connectors. A card
+with no connectors is skipped (v0.1.9): a discrete GPU wired to nothing
+can take card0 when its module loads first, as the NVIDIA card did on
+kernel 7.0.0-31.
 
 ```
 frame: opened /dev/dri/card1, driver i915 v1.6.0
