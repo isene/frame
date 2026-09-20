@@ -289,6 +289,43 @@ DEFAULT REL
 %define SHAPE_KIND_INPUT     2
 %define X_RID_MASK           0x001FFFFF
 
+; ---- GPU clients (v0.1.8): GLX + DRI3 + Present + SYNC --------------------
+; Mesa renders on the GPU itself; the server only has to answer the GLX
+; bookkeeping, hand out a render-node fd (DRI3 Open), accept dma-buf
+; backed pixmaps (DRI3 PixmapFromBuffers) and copy them into the window
+; when asked (Present Pixmap). SYNC exists only because Mesa destroys and
+; triggers its shm fences through it — an absent extension there kills
+; the client's whole connection (xcb shuts down on an unknown extension).
+%define GLX_MAJOR            142
+%define GLX_EVENT_BASE       95          ; PbufferClobber, BufferSwapComplete (never sent)
+%define GLX_ERROR_BASE       157         ; GLXBadContext.. 14 codes
+%define DRI3_MAJOR           143         ; no events, no errors
+%define PRESENT_MAJOR        144         ; GenericEvents only
+%define SYNC_MAJOR           145
+%define SYNC_EVENT_BASE      97          ; CounterNotify, AlarmNotify (never sent)
+%define SYNC_ERROR_BASE      171         ; BadCounter, BadAlarm, BadFence
+%define SYS_SENDMSG          46
+%define SYS_RECVMSG          47
+%define SYS_FSTAT            5
+%define SYS_FUTEX            202
+%define FUTEX_WAKE           1
+%define SCM_RIGHTS           1
+%define MSG_CMSG_CLOEXEC     0x40000000
+%define O_CLOEXEC            0x80000
+%define PROT_READ            1
+%define DMA_BUF_IOCTL_SYNC   0x40086200  ; _IOW('b', 0, struct dma_buf_sync)
+%define DMA_BUF_SYNC_READ    1
+%define DMA_BUF_SYNC_END     4
+%define CL_FLAG_DRI3         1           ; client meta +20: read with recvmsg
+%define CL_FD_MAX            4           ; fds queued per client (SCM_RIGHTS)
+%define GLX_WIN_MAX          32          ; GLXWindow → X window + fbconfig
+%define PR_SUB_MAX           16          ; Present SelectInput subscriptions
+%define PR_PEND_MAX          16          ; presents waiting for their vblank
+%define FENCE_MAX            32          ; DRI3 shm fences (4 per GL window)
+%define PR_MASK_CONFIGURE    1
+%define PR_MASK_COMPLETE     2
+%define PR_MASK_IDLE         4
+
 ; ============================================================================
 ; BSS — connection + per-client state
 ; ============================================================================
@@ -1034,6 +1071,46 @@ sig_sa_buf:           resb 32              ; kernel struct sigaction
 input_dev_path:     resb 32
 input_dev_name:     resb 256
 input_event_batch:  resb INPUT_BATCH_BYTES
+
+; ---- GPU clients (v0.1.8) -------------------------------------------------
+; Per-client fd queue: fds a client passed with SCM_RIGHTS, oldest first.
+; They ride on the recvmsg that read the request bytes carrying them, so
+; they are queued at read time and popped by the DRI3 request that owns
+; them (PixmapFromBuffers, FenceFromFD) in the same order.
+cl_fds:             resd MAX_CLIENTS * CL_FD_MAX
+cl_fd_n:            resb MAX_CLIENTS
+alignb 8
+rm_msghdr:          resb 56              ; struct msghdr for recvmsg/sendmsg
+rm_iov:             resq 2               ; one iovec
+rm_cmsg:            resb 32              ; cmsghdr (16) + up to 4 fds
+; GLXWindow records: +0 glxwindow xid, +4 X window xid, +8 fbconfig id.
+glx_wins:           resb GLX_WIN_MAX * 12
+; dma-buf pixmaps, parallel to pixmaps[] by slot: +0 map base (0 = an
+; ordinary pixmap), +8 map length, +16 dma-buf fd, +20 pad.
+px_dma:             resb MAX_PIXMAPS * 24
+; DRI3 shm fences: +0 xid (0 = empty), +4 owner slot+1, +8 mapped int32.
+fences:             resb FENCE_MAX * 16
+; Present subscriptions: +0 slot+1, +4 eid, +8 window, +12 mask.
+pr_subs:            resb PR_SUB_MAX * 16
+; Presents waiting for a vblank: +0 slot+1, +4 window, +8 serial,
+; +12 pixmap, +16 idle_fence, +20 pad, +24 target_msc.
+pr_pend:            resb PR_PEND_MAX * 32
+pr_pend_n:          resd 1               ; live entries (cold-path gate)
+pr_msc:             resq 1               ; frame counter handed to GL clients
+pr_last_tick:       resq 1               ; mono ms of the last tick
+pr_evbuf:           resb 40              ; Present GenericEvent scratch
+dma_sync:           resq 1               ; struct dma_buf_sync { u64 flags }
+fstat_buf:          resb 144             ; struct stat (st_size at +48)
+dp_args:            resd 8               ; dma_pixmap_create arguments: +0 pid,
+                                         ; +4 w, +8 h, +12 stride, +16 offset,
+                                         ; +20 fd, +24 depth, +28 minor
+pr_sub_n:           resd 1               ; live Present subscriptions (gate)
+; XI2 raw motion: clients that selected XI_RawMotion on the root (GLFW's
+; mouse look). slot+1 per entry, 0 = empty. raw_n gates the send path.
+raw_slots:          resb 4
+raw_n:              resb 1
+xise_slot:          resd 1               ; XISelectEvents caller
+raw_delta:          resd 1               ; unscaled evdev delta of this event
 
 ; ============================================================================
 ; RODATA — setup reply template, vendor string, log prefixes
@@ -1899,6 +1976,85 @@ conn_type_table:
     dq conn_type_16, conn_type_17, conn_type_18, conn_type_19
     dq conn_type_20
 conn_type_max equ 20
+
+; ---- Extension table (v0.1.8) ---------------------------------------------
+; QueryExtension and ListExtensions walk this: length byte, name, then
+; major opcode, first event, first error, and a flag saying whether
+; ListExtensions names it (XVideo was never listed; Qt enumerates that
+; list and advertising one obligates serving it). A 0 length ends it.
+ext_table:
+    db 6, "RENDER",          RENDER_MAJOR, 0, RENDER_ERROR_BASE, 1
+    db 5, "RANDR",           RR_MAJOR, RR_EVENT_BASE, RR_ERROR_BASE, 1
+    db 9, "XKEYBOARD",       XKB_MAJOR, XKB_EVENT_BASE, XKB_ERROR_BASE, 1
+    db 15, "XInputExtension", XI_MAJOR, XI_EVENT_BASE, XI_ERROR_BASE, 1
+    db 6, "XFIXES",          XFIXES_MAJOR, XFIXES_EVENT_BASE, XFIXES_ERROR_BASE, 1
+    db 7, "MIT-SHM",         SHM_MAJOR, SHM_EVENT_BASE, SHM_ERROR_BASE, 1
+    db 5, "SHAPE",           SHAPE_MAJOR, SHAPE_EVENT_BASE, 0, 1
+    db 5, "XTEST",           XTEST_MAJOR, 0, 0, 1
+    db 6, "XVideo",          XV_MAJOR, XV_EVENT_BASE, XV_ERROR_BASE, 0
+    db 3, "GLX",             GLX_MAJOR, GLX_EVENT_BASE, GLX_ERROR_BASE, 1
+    db 4, "DRI3",            DRI3_MAJOR, 0, 0, 1
+    db 7, "Present",         PRESENT_MAJOR, 0, 0, 1
+    db 4, "SYNC",            SYNC_MAJOR, SYNC_EVENT_BASE, SYNC_ERROR_BASE, 1
+    db 0
+
+; ---- GLX server strings and configs (v0.1.8) -------------------------------
+; The extension list is what Xorg advertises minus the indirect-only and
+; texture-from-pixmap ones. Mesa combines it with what the driver can do
+; directly, so the client-side list ends up the same as on Xorg.
+glx_vendor_str:     db "CHasm frame", 0
+glx_version_str:    db "1.4", 0
+glx_glvnd_str:      db "mesa", 0         ; GLX_VENDOR_NAMES_EXT: libglvnd picks Mesa
+glx_empty_str:      db 0
+glx_exts_str:       db "GLX_ARB_create_context GLX_ARB_create_context_no_error "
+                    db "GLX_ARB_create_context_profile GLX_ARB_fbconfig_float "
+                    db "GLX_ARB_framebuffer_sRGB GLX_ARB_multisample "
+                    db "GLX_EXT_create_context_es2_profile GLX_EXT_create_context_es_profile "
+                    db "GLX_EXT_fbconfig_packed_float GLX_EXT_framebuffer_sRGB "
+                    db "GLX_EXT_import_context GLX_EXT_libglvnd GLX_EXT_no_config_context "
+                    db "GLX_EXT_visual_info GLX_EXT_visual_rating GLX_OML_swap_method "
+                    db "GLX_SGI_make_current_read GLX_SGI_swap_control GLX_SGIS_multisample "
+                    db "GLX_SGIX_fbconfig GLX_SGIX_pbuffer GLX_SGIX_visual_select_group", 0
+; GetVisualConfigs: 18 fixed properties per visual — id, class, rgba,
+; r g b a bits, accum r g b a, double, stereo, buffer size, depth,
+; stencil, aux, level.
+glx_visuals:
+    dd X_ROOT_VISUAL_24, X_VISUAL_TRUECOLOR, 1, 8, 8, 8, 0, 0, 0, 0, 0, 1, 0, 24, 24, 8, 0, 0
+    dd X_ROOT_VISUAL_32, X_VISUAL_TRUECOLOR, 1, 8, 8, 8, 8, 0, 0, 0, 0, 1, 0, 32, 24, 8, 0, 0
+; GetFBConfigs: (attribute, value) pairs. Mesa keeps a server config only
+; when the driver offers the same sizes, so the list is what iris has:
+; rgb 8/8/8 with or without alpha, depth 24 + stencil 8 or none, double
+; buffered, no multisample. Each comes twice, plain and sRGB-capable;
+; whichever matches the driver survives, and the plain one is listed
+; first so GLFW's picker prefers it. Configs on the depth-24 visual with
+; alpha 8 render into 32-bit buffers whose alpha the window ignores —
+; that is the config GLFW ends up with, the same as on Xorg.
+%define GLX_FB_ID_24  0x60             ; plain window default: rgb, d24 s8
+%define GLX_FB_ID_32  0x64             ; ARGB visual default
+%macro GLXCFG 7                        ; id, visual, buffer, alpha, depth, stencil, srgb
+    dd 0x8013, %1, 0x800B, %2, 0x22, 0x8002, 0x8011, 1, 4, 1, 0x8010, 3, 0x8012, 1
+    dd 5, 1, 6, 0, 2, %3, 3, 0, 7, 0, 8, 8, 9, 8, 10, 8, 11, %4, 12, %5, 13, %6
+    dd 14, 0, 15, 0, 16, 0, 17, 0, 0x20, 0x8000, 0x23, 0x8000, 0x186A0, 0, 0x186A1, 0, 0x20B2, %7
+%endmacro
+glx_fbconfigs:
+    GLXCFG 0x60, X_ROOT_VISUAL_24, 24, 0, 24, 8, 0
+    GLXCFG 0x61, X_ROOT_VISUAL_24, 32, 8, 24, 8, 0
+    GLXCFG 0x62, X_ROOT_VISUAL_24, 24, 0, 0, 0, 0
+    GLXCFG 0x63, X_ROOT_VISUAL_24, 32, 8, 0, 0, 0
+    GLXCFG 0x64, X_ROOT_VISUAL_32, 32, 8, 24, 8, 0
+    GLXCFG 0x65, X_ROOT_VISUAL_32, 32, 8, 0, 0, 0
+    GLXCFG 0x68, X_ROOT_VISUAL_24, 24, 0, 24, 8, 1
+    GLXCFG 0x69, X_ROOT_VISUAL_24, 32, 8, 24, 8, 1
+    GLXCFG 0x6A, X_ROOT_VISUAL_24, 24, 0, 0, 0, 1
+    GLXCFG 0x6B, X_ROOT_VISUAL_24, 32, 8, 0, 0, 1
+    GLXCFG 0x6C, X_ROOT_VISUAL_32, 32, 8, 24, 8, 1
+    GLXCFG 0x6D, X_ROOT_VISUAL_32, 32, 8, 0, 0, 1
+glx_fb_bytes        equ $ - glx_fbconfigs
+%define GLX_FB_NATTR  27
+%define GLX_FB_COUNT  12
+render_node_path:   db "/dev/dri/renderD128", 0
+log_pr_full:        db "frame: Present subscription table full", 10
+log_pr_full_len     equ $ - log_pr_full
 
 ; ============================================================================
 ; TEXT
@@ -3945,6 +4101,8 @@ client_alloc:
     mov dword [clients_meta + rax + 8], 0    ; seq (incremented on first reply)
     mov dword [clients_meta + rax + 12], 0   ; buf_used
     mov dword [clients_meta + rax + 16], 0   ; buf_pos (first unconsumed byte)
+    mov dword [clients_meta + rax + 20], 0   ; flags (CL_FLAG_DRI3)
+    mov byte [cl_fd_n + rbx], 0              ; no passed fds queued
     call slots_watch                         ; DIAG: 3/4-full early warning
     mov eax, ebx
     pop r12
@@ -4295,22 +4453,16 @@ client_cleanup_resources:
     jb .ccr_px_next
     cmp eax, r14d
     jae .ccr_px_next
-    mov rdi, [r15 + 16]
-    test rdi, rdi
-    jz .ccr_px_clear
-    movzx esi, word [r15 + 4]
-    movzx ecx, word [r15 + 6]
-    imul esi, ecx
-    shl esi, 2
-    mov rax, SYS_MUNMAP
-    syscall
-.ccr_px_clear:
-    mov dword [r15], 0
-    mov qword [r15 + 16], 0
+    mov rdi, r15
+    call pixmap_release                       ; munmap (dma-buf aware), clear
 .ccr_px_next:
     inc ebx
     jmp .ccr_px
 .ccr_px_done:
+
+    ; GPU-client tables: queued fds, GLXWindows, fences, Present subs.
+    mov edi, r12d
+    call gpu_client_cleanup
 
     ; GCs (zero the xid AND the clip entry so a reused slot starts clean).
     xor ebx, ebx
@@ -4740,6 +4892,11 @@ serve_loop:
     mov edx, 100                             ; a DRM completion event that never
     jmp .sl_poll_go                          ; arrives would otherwise wedge
 .sl_chk_blank:                               ; flip_pending forever = black screen.
+    cmp dword [pr_pend_n], 0                 ; a GL frame waits for its vblank
+    je .sl_chk_blank_idle                    ; and nothing else will flip: tick
+    mov edx, 16                              ; it from the timeout instead
+    jmp .sl_poll_go
+.sl_chk_blank_idle:
     ; Fully idle. Screen auto-off: wake exactly once, at the blank deadline.
     ; Once blanked (or disabled/fbtest) the timeout stays infinite — zero
     ; idle wakeups either way.
@@ -4780,6 +4937,12 @@ serve_loop:
     js .sl_iter                              ; -EINTR or similar — re-poll
     jmp .sl_poll_done
 .sl_poll_timeout:
+    cmp dword [pr_pend_n], 0                 ; pending presents, no flip in
+    je .sl_pt_no_present                     ; flight: this is their vblank
+    cmp byte [flip_pending], 0
+    jne .sl_pt_no_present
+    call present_tick
+.sl_pt_no_present:
     cmp byte [flip_pending], 0               ; flip was pending → lost-flip path:
     je .sl_poll_done                         ; unstick + re-poll. Else this was the
     mov byte [flip_pending], 0               ; 16ms bg-defer fallback → fall to the
@@ -4966,6 +5129,13 @@ serve_loop:
     cmp byte [flip_pending], 0
     je .sl_drm_ev_next
     dec byte [flip_pending]
+    push rax                                 ; a real vblank: GL frames due
+    push rcx                                 ; now get copied and reported
+    push rdx
+    call present_tick
+    pop rdx
+    pop rcx
+    pop rax
 .sl_drm_ev_next:
     add ecx, edx
     cmp rcx, rax
@@ -5054,11 +5224,14 @@ client_process:
     call client_buf_addr
     lea rsi, [rax + r14]
     pop rax
-    mov rax, SYS_READ
-    mov edi, r13d
     mov edx, CLIENT_BUF_SIZE
     sub edx, r14d                             ; space left
+    test byte [r12 + 20], CL_FLAG_DRI3        ; GPU client: fds ride along
+    jnz .cp_recvmsg
+    mov rax, SYS_READ
+    mov edi, r13d
     syscall
+.cp_read_done:
     test rax, rax
     jle .cp_close                             ; 0=EOF, <0=error
     add r14d, eax
@@ -5142,6 +5315,58 @@ client_process:
     rep movsb
     mov [r12 + 12], r14d
     jmp .cp_drain
+
+.cp_recvmsg:
+    ; Same read, through recvmsg with a control buffer, so fds a DRI3
+    ; client attached (dma-bufs, fences) are queued instead of dropped.
+    ; Only clients that asked for DRI3 pay for it.
+    mov [rm_iov], rsi
+    mov [rm_iov + 8], rdx
+    lea rdi, [rm_msghdr]
+    xor eax, eax
+    mov [rdi], rax                            ; msg_name
+    mov [rdi + 8], rax                        ; msg_namelen
+    lea rax, [rm_iov]
+    mov [rdi + 16], rax                       ; msg_iov
+    mov qword [rdi + 24], 1                   ; msg_iovlen
+    lea rax, [rm_cmsg]
+    mov [rdi + 32], rax                       ; msg_control
+    mov qword [rdi + 40], 32                  ; msg_controllen
+    mov dword [rdi + 48], 0                   ; msg_flags
+    mov edi, r13d
+    lea rsi, [rm_msghdr]
+    mov edx, MSG_CMSG_CLOEXEC
+    mov eax, SYS_RECVMSG
+    syscall
+    test rax, rax
+    jle .cp_close
+    push rax
+    mov rcx, [rm_msghdr + 40]                 ; control bytes returned
+    cmp rcx, 20                               ; cmsghdr + one fd
+    jb .cp_rm_nofd
+    cmp dword [rm_cmsg + 8], SOL_SOCKET
+    jne .cp_rm_nofd
+    cmp dword [rm_cmsg + 12], SCM_RIGHTS
+    jne .cp_rm_nofd
+    mov rcx, [rm_cmsg]                        ; cmsg_len
+    sub rcx, 16
+    shr rcx, 2                                ; fd count
+    xor r8d, r8d
+.cp_rm_fd:
+    cmp r8d, ecx
+    jae .cp_rm_nofd
+    push rcx
+    push r8
+    mov edi, ebx
+    mov esi, [rm_cmsg + 16 + r8*4]
+    call cl_fd_push
+    pop r8
+    pop rcx
+    inc r8d
+    jmp .cp_rm_fd
+.cp_rm_nofd:
+    pop rax
+    jmp .cp_read_done
 
 .cp_setup_bad:
     mov rsi, log_setup_bad
@@ -5340,6 +5565,14 @@ dispatch_request:
     je .dr_shape
     cmp eax, XTEST_MAJOR
     je .dr_xtest
+    cmp eax, GLX_MAJOR
+    je .dr_glx
+    cmp eax, DRI3_MAJOR
+    je .dr_dri3
+    cmp eax, PRESENT_MAJOR
+    je .dr_present
+    cmp eax, SYNC_MAJOR
+    je .dr_sync
     ; Void no-ops — requests with no reply that frame can safely accept and
     ; ignore. Silences the log noise and, for toolkits that follow them with
     ; a blocking round-trip, keeps the stream healthy. 36/37 Grab/UngrabServer
@@ -5356,6 +5589,8 @@ dispatch_request:
     cmp ecx, 4
     jbe .dr_done
     cmp eax, 95
+    je .dr_done
+    cmp eax, 127                             ; NoOperation (Mesa syncs with it)
     je .dr_done
     cmp eax, 94                              ; CreateGlyphCursor
     jne .dr_not_gcur
@@ -5441,6 +5676,30 @@ dispatch_request:
     mov edi, ebx
     mov rsi, r12
     call handle_xtest
+    jmp .dr_done
+
+.dr_glx:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_glx
+    jmp .dr_done
+
+.dr_dri3:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_dri3
+    jmp .dr_done
+
+.dr_present:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_present
+    jmp .dr_done
+
+.dr_sync:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_sync
     jmp .dr_done
 
 .dr_xinput:
@@ -6512,212 +6771,45 @@ xfixes_emit_selection_notify:
     ret
 
 handle_query_extension:
+    ; Table walk over ext_table: match the name length, then the bytes.
     push rbx
     push r12
     push r13
+    push r14
     mov ebx, edi
     mov r13, rsi                             ; req ptr
-    mov eax, ebx
-    call client_meta_addr
-    mov r12, rax
-
-    lea rdi, [reply_buf]
-    mov byte [rdi + 0], 1                    ; reply
-    mov byte [rdi + 1], 0
-    mov ecx, [r12 + 8]                       ; seq
-    mov [rdi + 2], cx
-    mov dword [rdi + 4], 0                   ; reply length 0
-    mov dword [rdi + 8], 0                   ; present(0)=absent + pad
-    mov dword [rdi + 12], 0
-    mov dword [rdi + 16], 0
-    mov dword [rdi + 20], 0
-    mov dword [rdi + 24], 0
-    mov dword [rdi + 28], 0
-
-    ; Recognised extensions: RENDER (len 6), XKEYBOARD (len 9). Else → absent.
-    movzx eax, word [r13 + 4]                ; name-length
-    cmp eax, 6
-    jne .qe_try_xkb
+    mov edi, ebx
+    mov esi, 32
+    call reply_zero                          ; rdi=reply_buf r15d=fd r8d=32
+    movzx r14d, word [r13 + 4]               ; name length
+    lea r12, [ext_table]
+.qe_next:
+    movzx eax, byte [r12]
+    test eax, eax
+    jz .qe_send                              ; end of table → absent
+    cmp eax, r14d
+    jne .qe_skip
     lea rsi, [r13 + 8]
-    lea rdi, [str_render]
-    mov ecx, 6
-.qe_cmp_r:
-    mov dl, [rsi]
-    cmp dl, [rdi]
-    jne .qe_try_xfixes                       ; not RENDER — try XFIXES (also len 6)
-    inc rsi
-    inc rdi
-    dec ecx
-    jnz .qe_cmp_r
+    lea rdi, [r12 + 1]
+    mov ecx, eax
+    repe cmpsb
+    jne .qe_skip
+    lea rsi, [r12 + 1 + rax]                 ; major, first event, first error
     lea rdi, [reply_buf]
     mov byte [rdi + 8], 1                    ; present = True
-    mov byte [rdi + 9], RENDER_MAJOR         ; major-opcode
-    mov byte [rdi + 10], 0                   ; first-event
-    mov byte [rdi + 11], RENDER_ERROR_BASE   ; first-error
+    mov cl, [rsi]
+    mov [rdi + 9], cl
+    mov cl, [rsi + 1]
+    mov [rdi + 10], cl
+    mov cl, [rsi + 2]
+    mov [rdi + 11], cl
     jmp .qe_send
-.qe_try_xfixes:
-    lea rsi, [r13 + 8]
-    lea rdi, [str_xfixes]
-    mov ecx, 6
-.qe_cmp_xf:
-    mov dl, [rsi]
-    cmp dl, [rdi]
-    jne .qe_try_xvideo                        ; len 6 but not XFIXES → try XVideo
-    inc rsi
-    inc rdi
-    dec ecx
-    jnz .qe_cmp_xf
-    lea rdi, [reply_buf]
-    mov byte [rdi + 8], 1                    ; present = True
-    mov byte [rdi + 9], XFIXES_MAJOR
-    mov byte [rdi + 10], XFIXES_EVENT_BASE
-    mov byte [rdi + 11], XFIXES_ERROR_BASE
-    jmp .qe_send
-.qe_try_xvideo:
-    lea rsi, [r13 + 8]
-    lea rdi, [str_xvideo]
-    mov ecx, 6
-.qe_cmp_xv:
-    mov dl, [rsi]
-    cmp dl, [rdi]
-    jne .qe_send
-    inc rsi
-    inc rdi
-    dec ecx
-    jnz .qe_cmp_xv
-    lea rdi, [reply_buf]
-    mov byte [rdi + 8], 1                    ; present = True
-    mov byte [rdi + 9], XV_MAJOR
-    mov byte [rdi + 10], XV_EVENT_BASE
-    mov byte [rdi + 11], XV_ERROR_BASE
-    jmp .qe_send
-.qe_try_xkb:
-    cmp eax, 9
-    jne .qe_try_randr
-    lea rsi, [r13 + 8]
-    lea rdi, [str_xkb]
-    mov ecx, 9
-.qe_cmp_x:
-    mov dl, [rsi]
-    cmp dl, [rdi]
-    jne .qe_send
-    inc rsi
-    inc rdi
-    dec ecx
-    jnz .qe_cmp_x
-    lea rdi, [reply_buf]
-    mov byte [rdi + 8], 1                    ; present = True
-    mov byte [rdi + 9], XKB_MAJOR
-    mov byte [rdi + 10], XKB_EVENT_BASE
-    mov byte [rdi + 11], XKB_ERROR_BASE
-    jmp .qe_send
-.qe_try_randr:
-    cmp eax, 5
-    jne .qe_try_xinput
-    lea rsi, [r13 + 8]
-    lea rdi, [str_randr]
-    mov ecx, 5
-.qe_cmp_rr:
-    mov dl, [rsi]
-    cmp dl, [rdi]
-    jne .qe_try_shape                        ; len 5 but not RANDR → try SHAPE
-    inc rsi
-    inc rdi
-    dec ecx
-    jnz .qe_cmp_rr
-    lea rdi, [reply_buf]
-    mov byte [rdi + 8], 1                    ; present = True
-    mov byte [rdi + 9], RR_MAJOR
-    mov byte [rdi + 10], RR_EVENT_BASE
-    mov byte [rdi + 11], RR_ERROR_BASE
-    jmp .qe_send
-.qe_try_xinput:
-    cmp eax, 15
-    jne .qe_try_shm
-    lea rsi, [r13 + 8]
-    lea rdi, [str_xinput]
-    mov ecx, 15
-.qe_cmp_xi:
-    mov dl, [rsi]
-    cmp dl, [rdi]
-    jne .qe_send
-    inc rsi
-    inc rdi
-    dec ecx
-    jnz .qe_cmp_xi
-    lea rdi, [reply_buf]
-    mov byte [rdi + 8], 1                    ; present = True
-    mov byte [rdi + 9], XI_MAJOR
-    mov byte [rdi + 10], XI_EVENT_BASE
-    mov byte [rdi + 11], XI_ERROR_BASE
-    jmp .qe_send
-.qe_try_shm:
-    cmp eax, 7
-    jne .qe_try_shape
-    lea rsi, [r13 + 8]
-    lea rdi, [str_shm]
-    mov ecx, 7
-.qe_cmp_shm:
-    mov dl, [rsi]
-    cmp dl, [rdi]
-    jne .qe_send
-    inc rsi
-    inc rdi
-    dec ecx
-    jnz .qe_cmp_shm
-    lea rdi, [reply_buf]
-    mov byte [rdi + 8], 1                    ; present = True
-    mov byte [rdi + 9], SHM_MAJOR
-    mov byte [rdi + 10], SHM_EVENT_BASE
-    mov byte [rdi + 11], SHM_ERROR_BASE
-    jmp .qe_send
-
-.qe_try_shape:
-    cmp eax, 5
-    jne .qe_send
-    lea rsi, [r13 + 8]
-    lea rdi, [str_shape]
-    mov ecx, 5
-.qe_cmp_shape:
-    mov dl, [rsi]
-    cmp dl, [rdi]
-    jne .qe_try_xtest                        ; len 5 but not SHAPE → try XTEST
-    inc rsi
-    inc rdi
-    dec ecx
-    jnz .qe_cmp_shape
-    lea rdi, [reply_buf]
-    mov byte [rdi + 8], 1                    ; present = True
-    mov byte [rdi + 9], SHAPE_MAJOR
-    mov byte [rdi + 10], SHAPE_EVENT_BASE
-    mov byte [rdi + 11], 0                   ; SHAPE defines no errors
-    jmp .qe_send
-
-.qe_try_xtest:
-    lea rsi, [r13 + 8]
-    lea rdi, [str_xtest]
-    mov ecx, 5
-.qe_cmp_xtest:
-    mov dl, [rsi]
-    cmp dl, [rdi]
-    jne .qe_send
-    inc rsi
-    inc rdi
-    dec ecx
-    jnz .qe_cmp_xtest
-    lea rdi, [reply_buf]
-    mov byte [rdi + 8], 1                    ; present = True
-    mov byte [rdi + 9], XTEST_MAJOR
-    mov byte [rdi + 10], 0                   ; XTest has no events
-    mov byte [rdi + 11], 0                   ; ...and no errors
-
+.qe_skip:
+    lea r12, [r12 + 5 + rax]                 ; len byte + name + 4 fields
+    jmp .qe_next
 .qe_send:
-    mov edi, [r12]
-    mov rax, SYS_WRITE
-    lea rsi, [reply_buf]
-    mov rdx, 32
-    syscall
-
+    call reply_send
+    pop r14
     pop r13
     pop r12
     pop rbx
@@ -8396,6 +8488,7 @@ handle_xinput:
     push r12
     push r13
     push r14
+    mov [xise_slot], edi
     mov rbx, rsi
     mov edi, [rbx + 4]
     call window_lookup
@@ -8414,7 +8507,7 @@ handle_xinput:
     lea rsi, [rbx + 12]
 .xise_entry:
     test r12d, r12d
-    jz .xise_done
+    jz .xise_raw
     lea rax, [rsi + 4]
     cmp rax, r14                              ; header word in bounds?
     ja .xise_done
@@ -8430,6 +8523,18 @@ handle_xinput:
     lea rsi, [rsi + 4 + rcx*4]
     dec r12d
     jmp .xise_entry
+.xise_raw:
+    ; RawMotion (bit 17) on the root: remember who asked, per client, so a
+    ; game's mouse look gets the unclamped deltas.
+    cmp dword [r13], X_ROOT_WINDOW
+    jne .xise_done
+    mov edi, [xise_slot]
+    bt dword [r13 + 52], 17
+    jc .xise_raw_add
+    call raw_del
+    jmp .xise_done
+.xise_raw_add:
+    call raw_add
 .xise_done:
     pop r14
     pop r13
@@ -9084,41 +9189,43 @@ handle_query_tree:
 ;   +8..31 pad
 ; ============================================================================
 handle_list_extensions:
-    ; Names the four extensions QueryExtension actually serves. Qt's xcb
-    ; platform plugin enumerates via ListExtensions (not QueryExtension),
-    ; so the old empty reply made Qt believe frame had NO extensions.
+    ; Names every ext_table entry flagged for listing. Qt's xcb platform
+    ; plugin enumerates via ListExtensions (not QueryExtension), so an
+    ; empty reply once made Qt believe frame had NO extensions.
     push rbx
     push r12
     mov ebx, edi
-    mov eax, ebx
-    call client_meta_addr
-    mov r12, rax
-
-    lea rdi, [reply_buf]
-    mov byte [rdi + 0], 1
-    mov byte [rdi + 1], 8                    ; nExtensions
-    mov ecx, [r12 + 8]
-    mov [rdi + 2], cx
-    mov dword [rdi + 4], 17                  ; 68 bytes of names (66 + 2 pad)
-    mov dword [rdi + 8], 0
-    mov dword [rdi + 12], 0
-    mov dword [rdi + 16], 0
-    mov dword [rdi + 20], 0
-    mov dword [rdi + 24], 0
-    mov dword [rdi + 28], 0
-    ; STR list: length byte + name, ext_names_len bytes, then pad to 48.
-    lea rsi, [ext_names]
+    mov edi, ebx
+    mov esi, 32
+    call reply_zero                          ; r15d = fd
+    lea r12, [ext_table]
     lea rdi, [reply_buf + 32]
-    mov ecx, ext_names_len
+    xor edx, edx                             ; count
+.le_next:
+    movzx eax, byte [r12]
+    test eax, eax
+    jz .le_done
+    cmp byte [r12 + 4 + rax], 0              ; list flag
+    je .le_skip
+    mov rsi, r12
+    lea ecx, [rax + 1]                       ; length byte + name
     rep movsb
-    mov word [rdi], 0                        ; pad the tail
-
-    mov edi, [r12]
-    mov rax, SYS_WRITE
-    lea rsi, [reply_buf]
-    mov rdx, 100                             ; 32 header + 68 names
-    syscall
-
+    inc edx
+.le_skip:
+    lea r12, [r12 + 5 + rax]
+    jmp .le_next
+.le_done:
+    mov dword [rdi], 0                       ; pad bytes
+    mov [reply_buf + 1], dl                  ; nExtensions
+    lea rax, [reply_buf + 32]
+    sub rdi, rax
+    add edi, 3
+    and edi, ~3                              ; names, padded
+    mov eax, edi
+    shr eax, 2
+    mov [reply_buf + 4], eax                 ; reply length
+    lea r8d, [rdi + 32]
+    call reply_send
     pop r12
     pop rbx
     ret
@@ -11131,6 +11238,11 @@ handle_configure_window:
     mov rdi, r13                              ; raise reveals the whole window
     call damage_add_window
 .cfgw_apply_done:
+    cmp dword [pr_sub_n], 0                  ; GL windows learn their size
+    je .cfgw_no_present                      ; from Present, not core events
+    mov rdi, r13
+    call present_configure_notify
+.cfgw_no_present:
     mov byte [cfgw_resized], 0
     ; If the window resized and has a backing at the old size, REPLACE it
     ; with a fresh back_pixel-filled one and copy the old content's
@@ -13598,7 +13710,24 @@ dispatch_input_event:
     cmp ecx, 8                               ; REL_WHEEL
     je .die_wheel
     jmp .die_done
+.die_rel_y:
+    cmp byte [raw_n], 0
+    je .die_rel_y_go
+    push rdx
+    mov edi, 1
+    mov esi, edx
+    call raw_motion_send
+    pop rdx
+    jmp .die_rel_y_go
 .die_rel_x:
+    cmp byte [raw_n], 0
+    je .die_rel_x_go
+    push rdx
+    xor edi, edi
+    mov esi, edx
+    call raw_motion_send
+    pop rdx
+.die_rel_x_go:
     mov eax, edx
     SCALE_SENS
     add eax, [cursor_x]
@@ -13611,7 +13740,7 @@ dispatch_input_event:
     cmovg eax, ecx
     mov [cursor_x], eax
     jmp .die_motion
-.die_rel_y:
+.die_rel_y_go:
     mov eax, edx
     SCALE_SENS
     add eax, [cursor_y]
@@ -21360,17 +21489,8 @@ handle_free_pixmap:
     call pixmap_lookup
     test rax, rax
     jz .fpx_done
-    mov rbx, rax
-    ; munmap w*h*4
-    mov rdi, [rbx + 16]
-    movzx esi, word [rbx + 4]
-    movzx ecx, word [rbx + 6]
-    imul esi, ecx
-    shl esi, 2
-    mov rax, SYS_MUNMAP
-    syscall
-    mov dword [rbx], 0                        ; clear slot
-    mov qword [rbx + 16], 0
+    mov rdi, rax
+    call pixmap_release                       ; munmap (dma-buf aware), clear
 .fpx_done:
     pop rbx
     ret
@@ -26029,6 +26149,1682 @@ dump_handler:
 .dh_nofb:
     pop r15
     pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; GPU clients (v0.1.8): GLX + DRI3 + Present + SYNC.
+;
+; Mesa does the drawing on the GPU. What the server owes it:
+;   GLX      version, server strings, visual/fbconfig lists, GLXWindow
+;            bookkeeping. Contexts are client-side; the requests that
+;            announce them are accepted and ignored.
+;   DRI3     Open hands the client a render-node fd (sendmsg, SCM_RIGHTS).
+;            PixmapFromBuffers wraps a dma-buf the client passed as a
+;            pixmap (mmap, linear only: GetSupportedModifiers says so).
+;            FenceFromFD maps the client's shm fence.
+;   Present  Pixmap copies that pixmap into the window at its vblank and
+;            reports CompleteNotify + IdleNotify; the fence is tripped so
+;            the client can reuse the buffer.
+;   SYNC     TriggerFence / DestroyFence on those fences.
+; Cold when no GL client exists: every table is gated by a count.
+; ============================================================================
+
+; ----------------------------------------------------------------------------
+; reply_zero — edi = slot, esi = total reply bytes (≥ 32). Clears reply_buf
+; for that many bytes and stamps type, seq and length. Returns rdi =
+; reply_buf, r15d = fd, r8d = total bytes. reply_send writes it.
+; ----------------------------------------------------------------------------
+reply_zero:
+    push rbx
+    mov ebx, edi
+    mov r8d, esi
+    mov eax, ebx
+    call client_meta_addr
+    mov r15d, [rax]                          ; fd
+    mov r9d, [rax + 8]                       ; seq
+    lea rdi, [reply_buf]
+    mov ecx, r8d
+    add ecx, 7
+    shr ecx, 3
+    xor eax, eax
+    push rdi
+    rep stosq
+    pop rdi
+    mov byte [rdi + 0], 1
+    mov [rdi + 2], r9w
+    mov eax, r8d
+    sub eax, 32
+    shr eax, 2
+    mov [rdi + 4], eax
+    pop rbx
+    ret
+
+reply_send:
+    mov edi, r15d
+    lea rsi, [reply_buf]
+    mov edx, r8d
+    mov eax, SYS_WRITE
+    syscall
+    ret
+
+; reply_send_fd — like reply_send, with one fd (esi) attached as SCM_RIGHTS.
+reply_send_fd:
+    mov [rm_cmsg + 16], esi
+    mov qword [rm_cmsg], 20                  ; CMSG_LEN(4)
+    mov dword [rm_cmsg + 8], SOL_SOCKET
+    mov dword [rm_cmsg + 12], SCM_RIGHTS
+    lea rax, [reply_buf]
+    mov [rm_iov], rax
+    mov [rm_iov + 8], r8
+    lea rdi, [rm_msghdr]
+    xor eax, eax
+    mov [rdi], rax
+    mov [rdi + 8], rax
+    lea rax, [rm_iov]
+    mov [rdi + 16], rax
+    mov qword [rdi + 24], 1
+    lea rax, [rm_cmsg]
+    mov [rdi + 32], rax
+    mov qword [rdi + 40], 24                 ; CMSG_SPACE(4)
+    mov dword [rdi + 48], 0
+    mov edi, r15d
+    lea rsi, [rm_msghdr]
+    xor edx, edx
+    mov eax, SYS_SENDMSG
+    syscall
+    ret
+
+; ----------------------------------------------------------------------------
+; send_error — edi = slot, esi = error code, edx = bad value, ecx = minor
+; opcode, r8d = major opcode. 32-byte X error packet.
+; ----------------------------------------------------------------------------
+send_error:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov ebx, edi
+    mov r12d, esi
+    mov r13d, edx
+    mov r14d, ecx
+    mov r15d, r8d
+    mov eax, ebx
+    call client_meta_addr
+    mov rbx, rax
+    lea rdi, [reply_buf]
+    xor eax, eax
+    mov [rdi], rax
+    mov [rdi + 8], rax
+    mov [rdi + 16], rax
+    mov [rdi + 24], rax
+    mov [rdi + 1], r12b
+    mov eax, [rbx + 8]
+    mov [rdi + 2], ax                        ; sequence
+    mov [rdi + 4], r13d                      ; bad value
+    mov [rdi + 8], r14w                      ; minor opcode
+    mov [rdi + 10], r15b                     ; major opcode
+    mov edi, [rbx]
+    mov eax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov edx, 32
+    syscall
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; Passed-fd queue per client. Oldest first; the DRI3 request that needs an
+; fd pops the next one.
+; ----------------------------------------------------------------------------
+cl_fd_push:                                  ; edi = slot, esi = fd
+    movzx eax, byte [cl_fd_n + rdi]
+    cmp eax, CL_FD_MAX
+    jae .cfp_full
+    lea ecx, [rdi*4]
+    add ecx, eax
+    mov [cl_fds + rcx*4], esi
+    inc byte [cl_fd_n + rdi]
+    ret
+.cfp_full:
+    mov edi, esi
+    mov eax, SYS_CLOSE
+    syscall
+    ret
+
+cl_fd_pop:                                   ; edi = slot → eax = fd or -1
+    movzx ecx, byte [cl_fd_n + rdi]
+    test ecx, ecx
+    jz .cfo_none
+    lea rdx, [rdi*4]
+    lea rdx, [cl_fds + rdx*4]
+    mov eax, [rdx]
+    dec ecx
+    mov [cl_fd_n + rdi], cl
+    xor r8d, r8d
+.cfo_shift:
+    cmp r8d, ecx
+    jae .cfo_done
+    mov r9d, [rdx + r8*4 + 4]
+    mov [rdx + r8*4], r9d
+    inc r8d
+    jmp .cfo_shift
+.cfo_done:
+    ret
+.cfo_none:
+    mov eax, -1
+    ret
+
+cl_fd_flush:                                 ; edi = slot: close what is queued
+    push rbx
+    mov ebx, edi
+.cff_loop:
+    mov edi, ebx
+    call cl_fd_pop
+    test eax, eax
+    js .cff_done
+    mov edi, eax
+    mov eax, SYS_CLOSE
+    syscall
+    jmp .cff_loop
+.cff_done:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; pixmap_release — rdi = pixmap record. Unmaps the backing (a dma-buf
+; mapping by its true length, closing the fd) and clears the slot.
+; ----------------------------------------------------------------------------
+pixmap_release:
+    push r12
+    mov r12, rdi
+    mov rax, rdi
+    lea rcx, [pixmaps]
+    sub rax, rcx
+    xor edx, edx
+    mov ecx, PIXMAP_REC_SIZE
+    div rcx                                  ; rax = slot
+    lea rax, [rax + rax*2]
+    lea rcx, [px_dma + rax*8]
+    mov rdi, [rcx]
+    test rdi, rdi
+    jz .pxr_plain
+    push rcx
+    mov rsi, [rcx + 8]
+    mov eax, SYS_MUNMAP
+    syscall
+    pop rcx
+    mov edi, [rcx + 16]
+    push rcx
+    mov eax, SYS_CLOSE
+    syscall
+    pop rcx
+    mov qword [rcx], 0
+    mov qword [rcx + 8], 0
+    mov dword [rcx + 16], 0
+    jmp .pxr_clear
+.pxr_plain:
+    mov rdi, [r12 + 16]
+    test rdi, rdi
+    jz .pxr_clear
+    movzx esi, word [r12 + 4]
+    movzx ecx, word [r12 + 6]
+    imul esi, ecx
+    shl esi, 2
+    mov eax, SYS_MUNMAP
+    syscall
+.pxr_clear:
+    mov dword [r12], 0
+    mov qword [r12 + 16], 0
+    pop r12
+    ret
+
+; ----------------------------------------------------------------------------
+; gpu_client_cleanup — edi = slot. Drops everything the tables hold for a
+; departed client. Fences are unmapped; pixmaps go through the pixmap
+; sweep that runs before this.
+; ----------------------------------------------------------------------------
+gpu_client_cleanup:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12d, edi
+    mov edi, r12d
+    call cl_fd_flush
+    mov edi, r12d
+    call raw_del
+    lea r13d, [r12 + 1]                      ; owner tag slot+1
+    ; GLXWindows: by xid band.
+    mov r14d, r12d
+    shl r14d, 21
+    add r14d, X_RID_BASE                     ; band base
+    xor ebx, ebx
+.gcc_gw:
+    cmp ebx, GLX_WIN_MAX
+    jae .gcc_gw_done
+    lea rax, [rbx + rbx*2]
+    lea rax, [glx_wins + rax*4]
+    mov ecx, [rax]
+    sub ecx, r14d
+    cmp ecx, 0x200000
+    jae .gcc_gw_next
+    mov dword [rax], 0
+.gcc_gw_next:
+    inc ebx
+    jmp .gcc_gw
+.gcc_gw_done:
+    ; Fences: by owner.
+    xor ebx, ebx
+.gcc_fe:
+    cmp ebx, FENCE_MAX
+    jae .gcc_fe_done
+    mov eax, ebx
+    shl eax, 4
+    lea rax, [fences + rax]
+    cmp [rax + 4], r13d
+    jne .gcc_fe_next
+    mov rdi, [rax + 8]
+    mov esi, 4096
+    push rax
+    mov eax, SYS_MUNMAP
+    syscall
+    pop rax
+    mov dword [rax], 0
+    mov dword [rax + 4], 0
+    mov qword [rax + 8], 0
+.gcc_fe_next:
+    inc ebx
+    jmp .gcc_fe
+.gcc_fe_done:
+    ; Present subscriptions and pending presents: by owner.
+    xor ebx, ebx
+.gcc_ps:
+    cmp ebx, PR_SUB_MAX
+    jae .gcc_ps_done
+    mov eax, ebx
+    shl eax, 4
+    cmp [pr_subs + rax], r13d
+    jne .gcc_ps_next
+    mov dword [pr_subs + rax], 0
+    dec dword [pr_sub_n]
+.gcc_ps_next:
+    inc ebx
+    jmp .gcc_ps
+.gcc_ps_done:
+    xor ebx, ebx
+.gcc_pp:
+    cmp ebx, PR_PEND_MAX
+    jae .gcc_done
+    mov eax, ebx
+    shl eax, 5
+    cmp [pr_pend + rax], r13d
+    jne .gcc_pp_next
+    mov dword [pr_pend + rax], 0
+    dec dword [pr_pend_n]
+.gcc_pp_next:
+    inc ebx
+    jmp .gcc_pp
+.gcc_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; glx_win_find — edi = GLXWindow xid → rax = record or 0.
+; fence_find — edi = fence xid → rax = record or 0.
+; ----------------------------------------------------------------------------
+glx_win_find:
+    xor ecx, ecx
+.gwf_loop:
+    cmp ecx, GLX_WIN_MAX
+    jae .gwf_miss
+    lea rax, [rcx + rcx*2]
+    lea rax, [glx_wins + rax*4]
+    cmp [rax], edi
+    je .gwf_hit
+    inc ecx
+    jmp .gwf_loop
+.gwf_miss:
+    xor eax, eax
+.gwf_hit:
+    ret
+
+fence_find:
+    xor ecx, ecx
+.ff_loop:
+    cmp ecx, FENCE_MAX
+    jae .ff_miss
+    mov eax, ecx
+    shl eax, 4
+    lea rax, [fences + rax]
+    cmp [rax], edi
+    je .ff_hit
+    inc ecx
+    jmp .ff_loop
+.ff_miss:
+    xor eax, eax
+.ff_hit:
+    ret
+
+; fence_trigger — rdi = mapped xshmfence. 0 → 1; a waiter (-1) is woken.
+fence_trigger:
+    xor eax, eax
+    mov ecx, 1
+    lock cmpxchg dword [rdi], ecx
+    cmp eax, -1
+    jne .ft_done
+    mov dword [rdi], 1
+    mov eax, SYS_FUTEX
+    mov esi, FUTEX_WAKE
+    mov edx, 0x7FFFFFFF
+    xor r10d, r10d
+    syscall
+.ft_done:
+    ret
+
+; ============================================================================
+; handle_glx — edi = slot, rsi = req. Minor in byte 1.
+; ============================================================================
+handle_glx:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov ebx, edi
+    mov r12, rsi
+    movzx eax, byte [r12 + 1]
+    cmp eax, 7
+    je .glx_query_version
+    cmp eax, 19
+    je .glx_server_string
+    cmp eax, 18
+    je .glx_ext_string
+    cmp eax, 14
+    je .glx_visual_configs
+    cmp eax, 21
+    je .glx_fbconfigs
+    cmp eax, 6
+    je .glx_is_direct
+    cmp eax, 31
+    je .glx_create_window
+    cmp eax, 32
+    je .glx_destroy_window
+    cmp eax, 29
+    je .glx_drawable_attrs
+    cmp eax, 5
+    je .glx_make_current
+    cmp eax, 26
+    je .glx_make_current
+    cmp eax, 25
+    je .glx_query_context
+    cmp eax, 17
+    je .glx_private_reply
+    jmp .glx_done                            ; contexts, client info, swaps: void
+
+.glx_query_version:
+    mov edi, ebx
+    mov esi, 32
+    call reply_zero
+    mov dword [rdi + 8], 1
+    mov dword [rdi + 12], 4
+    call reply_send
+    jmp .glx_done
+
+.glx_ext_string:                             ; +4 screen
+    lea r13, [glx_exts_str]
+    jmp .glx_send_string
+.glx_server_string:                          ; +4 screen, +8 name
+    mov eax, [r12 + 8]
+    lea r13, [glx_vendor_str]
+    cmp eax, 1
+    je .glx_send_string
+    lea r13, [glx_version_str]
+    cmp eax, 2
+    je .glx_send_string
+    lea r13, [glx_exts_str]
+    cmp eax, 3
+    je .glx_send_string
+    lea r13, [glx_glvnd_str]
+    cmp eax, 0x20F6                          ; GLX_VENDOR_NAMES_EXT
+    je .glx_send_string
+    lea r13, [glx_empty_str]
+.glx_send_string:
+    xor ecx, ecx
+.gss_len:
+    cmp byte [r13 + rcx], 0
+    je .gss_len_done
+    inc ecx
+    jmp .gss_len
+.gss_len_done:
+    inc ecx                                  ; n counts the NUL
+    mov r14d, ecx
+    lea esi, [rcx + 35]
+    and esi, ~3                              ; 32 + n, padded
+    mov edi, ebx
+    call reply_zero
+    mov [rdi + 12], r14d                     ; n
+    lea rdi, [reply_buf + 32]
+    mov rsi, r13
+    mov ecx, r14d
+    rep movsb
+    call reply_send
+    jmp .glx_done
+
+.glx_visual_configs:
+    mov edi, ebx
+    mov esi, 32 + 2*18*4
+    call reply_zero
+    mov dword [rdi + 8], 2                   ; numVisuals
+    mov dword [rdi + 12], 18                 ; numProps
+    lea rdi, [reply_buf + 32]
+    lea rsi, [glx_visuals]
+    mov ecx, 36
+    rep movsd
+    call reply_send
+    jmp .glx_done
+
+.glx_fbconfigs:
+    mov edi, ebx
+    mov esi, 32 + glx_fb_bytes
+    call reply_zero
+    mov dword [rdi + 8], GLX_FB_COUNT
+    mov dword [rdi + 12], GLX_FB_NATTR
+    lea rdi, [reply_buf + 32]
+    lea rsi, [glx_fbconfigs]
+    mov ecx, glx_fb_bytes / 4
+    rep movsd
+    call reply_send
+    jmp .glx_done
+
+.glx_is_direct:
+    mov edi, ebx
+    mov esi, 32
+    call reply_zero
+    mov byte [rdi + 8], 1
+    call reply_send
+    jmp .glx_done
+
+.glx_make_current:                           ; indirect only; never from Mesa
+    mov edi, ebx
+    mov esi, 32
+    call reply_zero
+    mov dword [rdi + 8], 1                   ; context tag
+    call reply_send
+    jmp .glx_done
+
+.glx_query_context:
+    mov edi, ebx
+    mov esi, 32
+    call reply_zero                          ; n = 0 attributes
+    call reply_send
+    jmp .glx_done
+
+.glx_private_reply:                          ; VendorPrivateWithReply
+    mov edi, ebx
+    mov esi, GLX_ERROR_BASE + 8              ; GLXUnsupportedPrivateRequest
+    xor edx, edx
+    mov ecx, 17
+    mov r8d, GLX_MAJOR
+    call send_error
+    jmp .glx_done
+
+.glx_create_window:                          ; +8 fbconfig, +12 window, +16 glxwindow
+    xor ecx, ecx
+.gcw_find:
+    cmp ecx, GLX_WIN_MAX
+    jae .glx_done                            ; full: attributes fall back to depth
+    lea rax, [rcx + rcx*2]
+    lea rax, [glx_wins + rax*4]
+    cmp dword [rax], 0
+    je .gcw_take
+    inc ecx
+    jmp .gcw_find
+.gcw_take:
+    mov edx, [r12 + 16]
+    mov [rax], edx
+    mov edx, [r12 + 12]
+    mov [rax + 4], edx
+    mov edx, [r12 + 8]
+    mov [rax + 8], edx
+    jmp .glx_done
+
+.glx_destroy_window:                         ; +4 glxwindow
+    mov edi, [r12 + 4]
+    call glx_win_find
+    test rax, rax
+    jz .glx_done
+    mov dword [rax], 0
+    jmp .glx_done
+
+.glx_drawable_attrs:                         ; +4 drawable → GLX_FBCONFIG_ID
+    mov edi, [r12 + 4]
+    call glx_win_find
+    test rax, rax
+    jz .gda_plain
+    mov r13d, [rax + 8]
+    jmp .gda_reply
+.gda_plain:
+    mov edi, [r12 + 4]
+    call window_lookup
+    test rax, rax
+    jz .gda_bad
+    mov r13d, GLX_FB_ID_24
+    cmp byte [rax + 18], 32
+    jne .gda_reply
+    mov r13d, GLX_FB_ID_32
+.gda_reply:
+    mov edi, ebx
+    mov esi, 40
+    call reply_zero
+    mov dword [rdi + 8], 1                   ; numAttribs
+    mov dword [rdi + 32], 0x8013             ; GLX_FBCONFIG_ID
+    mov [rdi + 36], r13d
+    call reply_send
+    jmp .glx_done
+.gda_bad:
+    mov edi, ebx
+    mov esi, GLX_ERROR_BASE + 2              ; GLXBadDrawable
+    mov edx, [r12 + 4]
+    mov ecx, 29
+    mov r8d, GLX_MAJOR
+    call send_error
+
+.glx_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_dri3 — edi = slot, rsi = req.
+; ============================================================================
+handle_dri3:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov ebx, edi
+    mov r12, rsi
+    movzx eax, byte [r12 + 1]
+    test eax, eax
+    jz .d3_query_version
+    cmp eax, 1
+    je .d3_open
+    cmp eax, 2
+    je .d3_pixmap_from_buffer
+    cmp eax, 7
+    je .d3_pixmap_from_buffers
+    cmp eax, 4
+    je .d3_fence_from_fd
+    cmp eax, 6
+    je .d3_modifiers
+    cmp eax, 3                               ; BufferFromPixmap
+    je .d3_unimpl
+    cmp eax, 5                               ; FDFromFence
+    je .d3_unimpl
+    cmp eax, 8                               ; BuffersFromPixmap
+    je .d3_unimpl
+    jmp .d3_done                             ; SetDRMDeviceInUse etc: void
+
+.d3_query_version:
+    mov eax, ebx
+    call client_meta_addr
+    or byte [rax + 20], CL_FLAG_DRI3         ; from now on read with recvmsg
+    mov edi, ebx
+    mov esi, 32
+    call reply_zero
+    mov dword [rdi + 8], 1
+    mov dword [rdi + 12], 2
+    call reply_send
+    jmp .d3_done
+
+.d3_open:
+    mov eax, SYS_OPEN
+    lea rdi, [render_node_path]
+    mov esi, O_RDWR | O_CLOEXEC
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .d3_open_fail
+    mov r13d, eax
+    mov edi, ebx
+    mov esi, 32
+    call reply_zero
+    mov byte [rdi + 1], 1                    ; nfd
+    mov esi, r13d
+    call reply_send_fd
+    mov edi, r13d                            ; the client holds its own copy
+    mov eax, SYS_CLOSE
+    syscall
+    jmp .d3_done
+.d3_open_fail:
+    mov edi, ebx
+    mov esi, 11                              ; BadAlloc
+    xor edx, edx
+    mov ecx, 1
+    mov r8d, DRI3_MAJOR
+    call send_error
+    jmp .d3_done
+
+.d3_pixmap_from_buffer:                      ; +4 pixmap +8 drawable +12 size
+    mov edi, ebx                             ; +16 w +18 h +20 stride +22 depth
+    call cl_fd_pop
+    test eax, eax
+    js .d3_done                              ; fd never arrived
+    mov [dp_args + 20], eax
+    mov eax, [r12 + 4]
+    mov [dp_args], eax
+    movzx eax, word [r12 + 16]
+    mov [dp_args + 4], eax
+    movzx eax, word [r12 + 18]
+    mov [dp_args + 8], eax
+    movzx eax, word [r12 + 20]
+    mov [dp_args + 12], eax
+    mov dword [dp_args + 16], 0
+    movzx eax, byte [r12 + 22]
+    mov [dp_args + 24], eax
+    mov dword [dp_args + 28], 2
+    mov edi, ebx
+    call dma_pixmap_create
+    jmp .d3_done
+
+.d3_pixmap_from_buffers:                     ; +4 pixmap +8 window +12 nbufs
+    movzx r13d, byte [r12 + 12]              ; +16 w +18 h +20 stride0
+    xor r14d, r14d                           ; +24 offset0 +52 depth +56 modifier
+.d3_pfb_pop:
+    cmp r14d, r13d
+    jae .d3_pfb_popped
+    mov edi, ebx
+    call cl_fd_pop
+    test r14d, r14d
+    jnz .d3_pfb_extra
+    mov [dp_args + 20], eax                  ; first plane's fd
+    inc r14d
+    jmp .d3_pfb_pop
+.d3_pfb_extra:
+    test eax, eax
+    js .d3_pfb_next
+    mov edi, eax                             ; extra planes: not served
+    mov eax, SYS_CLOSE
+    syscall
+.d3_pfb_next:
+    inc r14d
+    jmp .d3_pfb_pop
+.d3_pfb_popped:
+    cmp r13d, 1
+    jne .d3_pfb_bad
+    cmp dword [dp_args + 20], 0
+    jl .d3_done
+    cmp qword [r12 + 56], 0                  ; DRM_FORMAT_MOD_LINEAR only
+    jne .d3_pfb_bad
+    mov eax, [r12 + 4]
+    mov [dp_args], eax
+    movzx eax, word [r12 + 16]
+    mov [dp_args + 4], eax
+    movzx eax, word [r12 + 18]
+    mov [dp_args + 8], eax
+    mov eax, [r12 + 20]
+    mov [dp_args + 12], eax
+    mov eax, [r12 + 24]
+    mov [dp_args + 16], eax
+    movzx eax, byte [r12 + 52]
+    mov [dp_args + 24], eax
+    mov dword [dp_args + 28], 7
+    mov edi, ebx
+    call dma_pixmap_create
+    jmp .d3_done
+.d3_pfb_bad:
+    mov edi, [dp_args + 20]
+    test edi, edi
+    js .d3_pfb_err
+    mov eax, SYS_CLOSE
+    syscall
+.d3_pfb_err:
+    mov edi, ebx
+    mov esi, 2                               ; BadValue
+    mov edx, [r12 + 4]
+    mov ecx, 7
+    mov r8d, DRI3_MAJOR
+    call send_error
+    jmp .d3_done
+
+.d3_fence_from_fd:                           ; +4 drawable +8 fence +12 triggered
+    mov edi, ebx
+    call cl_fd_pop
+    test eax, eax
+    js .d3_done
+    mov r13d, eax
+    mov eax, SYS_MMAP
+    xor edi, edi
+    mov esi, 4096
+    mov edx, PROT_RW
+    mov r10d, MAP_SHARED
+    mov r8d, r13d
+    xor r9d, r9d
+    syscall
+    mov r14, rax
+    mov edi, r13d                            ; the mapping keeps the file
+    mov eax, SYS_CLOSE
+    syscall
+    cmp r14, -4096
+    ja .d3_done
+    xor ecx, ecx
+.d3_ff_find:
+    cmp ecx, FENCE_MAX
+    jae .d3_ff_full
+    mov eax, ecx
+    shl eax, 4
+    lea rax, [fences + rax]
+    cmp dword [rax], 0
+    je .d3_ff_take
+    inc ecx
+    jmp .d3_ff_find
+.d3_ff_take:
+    mov edx, [r12 + 8]
+    mov [rax], edx
+    lea edx, [rbx + 1]
+    mov [rax + 4], edx
+    mov [rax + 8], r14
+    cmp byte [r12 + 12], 0
+    je .d3_done
+    mov dword [r14], 1                       ; initially triggered
+    jmp .d3_done
+.d3_ff_full:
+    mov rdi, r14
+    mov esi, 4096
+    mov eax, SYS_MUNMAP
+    syscall
+    jmp .d3_done
+
+.d3_modifiers:                               ; +4 window +8 depth +9 bpp
+    cmp byte [r12 + 9], 32
+    jne .d3_mods_none
+    mov edi, ebx
+    mov esi, 48
+    call reply_zero
+    mov dword [rdi + 8], 1                   ; window modifiers: LINEAR
+    mov dword [rdi + 12], 1                  ; screen modifiers: LINEAR
+    call reply_send                          ; both u64 zero already
+    jmp .d3_done
+.d3_mods_none:
+    mov edi, ebx
+    mov esi, 32
+    call reply_zero
+    call reply_send
+    jmp .d3_done
+
+.d3_unimpl:
+    mov edi, ebx
+    mov esi, 17                              ; BadImplementation
+    xor edx, edx
+    movzx ecx, byte [r12 + 1]
+    mov r8d, DRI3_MAJOR
+    call send_error
+
+.d3_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; dma_pixmap_create — edi = slot, dp_args filled. Maps the dma-buf and
+; makes a pixmap record over it: width = stride in pixels, so every
+; drawable path reads it like an ordinary pixmap. Failure closes the fd
+; and answers BadAlloc.
+; ----------------------------------------------------------------------------
+dma_pixmap_create:
+    push rbx
+    push r12
+    push r13
+    mov ebx, edi
+    mov edi, [dp_args + 20]
+    lea rsi, [fstat_buf]
+    mov eax, SYS_FSTAT
+    syscall
+    test rax, rax
+    js .dpc_fail
+    mov r12, [fstat_buf + 48]                ; st_size
+    mov eax, [dp_args + 12]
+    imul eax, [dp_args + 8]
+    add eax, [dp_args + 16]                  ; offset + stride*h must fit
+    cmp rax, r12
+    ja .dpc_fail
+    mov eax, SYS_MMAP
+    xor edi, edi
+    mov rsi, r12
+    mov edx, PROT_READ
+    mov r10d, MAP_SHARED
+    mov r8d, [dp_args + 20]
+    xor r9d, r9d
+    syscall
+    cmp rax, -4096
+    ja .dpc_fail
+    mov r13, rax
+    xor ecx, ecx
+.dpc_find:
+    cmp ecx, MAX_PIXMAPS
+    jae .dpc_unmap_fail
+    mov rax, rcx
+    imul rax, PIXMAP_REC_SIZE
+    lea rax, [pixmaps + rax]
+    cmp dword [rax], 0
+    je .dpc_take
+    inc ecx
+    jmp .dpc_find
+.dpc_take:
+    mov edx, [dp_args]
+    mov [rax], edx                           ; pid
+    mov edx, [dp_args + 12]
+    shr edx, 2
+    mov [rax + 4], dx                        ; width = stride / 4
+    mov edx, [dp_args + 8]
+    mov [rax + 6], dx                        ; height
+    mov dl, [dp_args + 24]
+    mov [rax + 8], dl                        ; depth
+    mov edx, [dp_args + 16]
+    add rdx, r13
+    mov [rax + 16], rdx                      ; backing = base + offset
+    lea rax, [rcx + rcx*2]
+    lea rax, [px_dma + rax*8]
+    mov [rax], r13
+    mov [rax + 8], r12
+    mov edx, [dp_args + 20]
+    mov [rax + 16], edx
+    xor eax, eax
+    jmp .dpc_ret
+.dpc_unmap_fail:
+    mov rdi, r13
+    mov rsi, r12
+    mov eax, SYS_MUNMAP
+    syscall
+.dpc_fail:
+    mov edi, [dp_args + 20]
+    mov eax, SYS_CLOSE
+    syscall
+    mov edi, ebx
+    mov esi, 11                              ; BadAlloc
+    mov edx, [dp_args]
+    mov ecx, [dp_args + 28]
+    mov r8d, DRI3_MAJOR
+    call send_error
+    mov eax, 1
+.dpc_ret:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_sync — edi = slot, rsi = req. Only the fence minors do anything.
+; ============================================================================
+handle_sync:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov r12, rsi
+    movzx eax, byte [r12 + 1]
+    test eax, eax
+    jz .sy_init
+    cmp eax, 15
+    je .sy_trigger
+    cmp eax, 16
+    je .sy_reset
+    cmp eax, 17
+    je .sy_destroy
+    cmp eax, 18
+    je .sy_query
+    cmp eax, 1                               ; ListSystemCounters
+    je .sy_unimpl
+    cmp eax, 5                               ; QueryCounter
+    je .sy_unimpl
+    cmp eax, 10                              ; QueryAlarm
+    je .sy_unimpl
+    cmp eax, 13                              ; GetPriority
+    je .sy_unimpl
+    jmp .sy_done
+
+.sy_init:
+    mov edi, ebx
+    mov esi, 32
+    call reply_zero
+    mov byte [rdi + 8], 3                    ; major
+    mov byte [rdi + 9], 1                    ; minor
+    call reply_send
+    jmp .sy_done
+
+.sy_trigger:
+    mov edi, [r12 + 4]
+    call fence_find
+    test rax, rax
+    jz .sy_done
+    mov rdi, [rax + 8]
+    call fence_trigger
+    jmp .sy_done
+
+.sy_reset:
+    mov edi, [r12 + 4]
+    call fence_find
+    test rax, rax
+    jz .sy_done
+    mov rax, [rax + 8]
+    mov dword [rax], 0
+    jmp .sy_done
+
+.sy_destroy:
+    mov edi, [r12 + 4]
+    call fence_find
+    test rax, rax
+    jz .sy_done
+    mov rdi, [rax + 8]
+    mov esi, 4096
+    push rax
+    mov eax, SYS_MUNMAP
+    syscall
+    pop rax
+    mov dword [rax], 0
+    mov dword [rax + 4], 0
+    mov qword [rax + 8], 0
+    jmp .sy_done
+
+.sy_query:
+    mov edi, [r12 + 4]
+    call fence_find
+    xor ecx, ecx
+    test rax, rax
+    jz .sy_query_reply
+    mov rax, [rax + 8]
+    cmp dword [rax], 1
+    sete cl
+.sy_query_reply:
+    push rcx
+    mov edi, ebx
+    mov esi, 32
+    call reply_zero
+    pop rcx
+    mov [rdi + 8], cl                        ; triggered
+    call reply_send
+    jmp .sy_done
+
+.sy_unimpl:
+    mov edi, ebx
+    mov esi, 17                              ; BadImplementation
+    xor edx, edx
+    movzx ecx, byte [r12 + 1]
+    mov r8d, SYNC_MAJOR
+    call send_error
+
+.sy_done:
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_present — edi = slot, rsi = req.
+; ============================================================================
+handle_present:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov ebx, edi
+    mov r12, rsi
+    movzx eax, byte [r12 + 1]
+    test eax, eax
+    jz .pr_query_version
+    cmp eax, 1
+    je .pr_pixmap
+    cmp eax, 2
+    je .pr_notify_msc
+    cmp eax, 3
+    je .pr_select_input
+    cmp eax, 4
+    je .pr_query_caps
+    jmp .pr_done
+
+.pr_query_version:
+    mov edi, ebx
+    mov esi, 32
+    call reply_zero
+    mov dword [rdi + 8], 1
+    mov dword [rdi + 12], 2
+    call reply_send
+    jmp .pr_done
+
+.pr_query_caps:
+    mov edi, ebx
+    mov esi, 32
+    call reply_zero                          ; capabilities = 0
+    call reply_send
+    jmp .pr_done
+
+.pr_select_input:                            ; +4 eid +8 window +12 mask
+    mov edi, [r12 + 8]
+    call window_lookup
+    test rax, rax
+    jz .pr_si_badwin
+    lea r13d, [rbx + 1]
+    mov r14d, -1                             ; first empty slot
+    xor ecx, ecx
+.pr_si_scan:
+    cmp ecx, PR_SUB_MAX
+    jae .pr_si_scan_done
+    mov eax, ecx
+    shl eax, 4
+    lea rdx, [pr_subs + rax]
+    mov eax, [rdx]
+    test eax, eax
+    jnz .pr_si_live
+    cmp r14d, -1
+    jne .pr_si_next
+    mov r14d, ecx
+    jmp .pr_si_next
+.pr_si_live:
+    cmp eax, r13d
+    jne .pr_si_next
+    mov eax, [r12 + 4]
+    cmp [rdx + 4], eax
+    jne .pr_si_next
+    mov eax, [r12 + 12]                      ; same eid: update or clear
+    test eax, eax
+    jz .pr_si_clear
+    mov [rdx + 12], eax
+    mov eax, [r12 + 8]
+    mov [rdx + 8], eax
+    jmp .pr_done
+.pr_si_clear:
+    mov dword [rdx], 0
+    dec dword [pr_sub_n]
+    jmp .pr_done
+.pr_si_next:
+    inc ecx
+    jmp .pr_si_scan
+.pr_si_scan_done:
+    mov eax, [r12 + 12]
+    test eax, eax
+    jz .pr_done                              ; clearing what was never set
+    cmp r14d, -1
+    jne .pr_si_take
+    mov rsi, log_pr_full
+    mov rdx, log_pr_full_len
+    call write_stderr
+    jmp .pr_done
+.pr_si_take:
+    mov eax, r14d
+    shl eax, 4
+    lea rdx, [pr_subs + rax]
+    mov [rdx], r13d
+    mov eax, [r12 + 4]
+    mov [rdx + 4], eax
+    mov eax, [r12 + 8]
+    mov [rdx + 8], eax
+    mov eax, [r12 + 12]
+    mov [rdx + 12], eax
+    inc dword [pr_sub_n]
+    jmp .pr_done
+.pr_si_badwin:
+    mov edi, ebx
+    mov esi, [r12 + 8]
+    mov edx, PRESENT_MAJOR
+    call send_bad_window
+    jmp .pr_done
+
+.pr_notify_msc:                              ; +4 window +8 serial: answer now
+    mov edi, ebx
+    mov esi, [r12 + 4]
+    mov edx, [r12 + 8]
+    mov ecx, 1                               ; kind = NotifyMSC
+    call present_send_complete
+    jmp .pr_done
+
+.pr_pixmap:                                  ; +4 window +8 pixmap +12 serial
+    mov rax, [r12 + 48]                      ; +24 x_off +26 y_off +36 idle_fence
+    cmp byte [compositor_active], 0          ; +48 target_msc
+    je .pr_now                               ; no display: nothing to pace
+    cmp rax, [pr_msc]
+    ja .pr_defer                             ; wait for that frame's tick
+.pr_now:
+    mov edi, ebx
+    mov esi, [r12 + 4]
+    mov edx, [r12 + 12]
+    mov ecx, [r12 + 8]
+    mov r8d, [r12 + 36]
+    mov r9d, [r12 + 24]                      ; x_off | y_off << 16
+    call present_execute
+    jmp .pr_done
+.pr_defer:
+    xor ecx, ecx
+.pr_pd_find:
+    cmp ecx, PR_PEND_MAX
+    jae .pr_now                              ; queue full: show it now
+    mov eax, ecx
+    shl eax, 5
+    lea rdx, [pr_pend + rax]
+    cmp dword [rdx], 0
+    je .pr_pd_take
+    inc ecx
+    jmp .pr_pd_find
+.pr_pd_take:
+    lea eax, [rbx + 1]
+    mov [rdx], eax
+    mov eax, [r12 + 4]
+    mov [rdx + 4], eax
+    mov eax, [r12 + 12]
+    mov [rdx + 8], eax
+    mov eax, [r12 + 8]
+    mov [rdx + 12], eax
+    mov eax, [r12 + 36]
+    mov [rdx + 16], eax
+    mov eax, [r12 + 24]
+    mov [rdx + 20], eax
+    mov rax, [r12 + 48]
+    mov [rdx + 24], rax
+    inc dword [pr_pend_n]
+
+.pr_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; present_tick — one display frame passed. Presents whose target frame has
+; come get copied to their window and reported. Called at every flip
+; completion (and from the poll timeout when nothing flips).
+; ----------------------------------------------------------------------------
+present_tick:
+    inc qword [pr_msc]
+    cmp dword [pr_pend_n], 0
+    je .pt_ret
+    push rbx
+    push r12
+    xor ebx, ebx
+.pt_loop:
+    cmp ebx, PR_PEND_MAX
+    jae .pt_done
+    mov eax, ebx
+    shl eax, 5
+    lea r12, [pr_pend + rax]
+    cmp dword [r12], 0
+    je .pt_next
+    mov rax, [r12 + 24]
+    cmp rax, [pr_msc]
+    ja .pt_next
+    mov edi, [r12]
+    dec edi
+    mov esi, [r12 + 4]
+    mov edx, [r12 + 8]
+    mov ecx, [r12 + 12]
+    mov r8d, [r12 + 16]
+    mov r9d, [r12 + 20]
+    mov dword [r12], 0
+    dec dword [pr_pend_n]
+    call present_execute
+.pt_next:
+    inc ebx
+    jmp .pt_loop
+.pt_done:
+    pop r12
+    pop rbx
+.pt_ret:
+    ret
+
+; ----------------------------------------------------------------------------
+; present_execute — edi = slot, esi = window, edx = serial, ecx = pixmap,
+; r8d = idle fence, r9d = x_off | y_off << 16. Copy, then report.
+; ----------------------------------------------------------------------------
+present_execute:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov ebx, edi
+    mov r12d, esi
+    mov r13d, edx
+    mov r14d, ecx
+    mov r15d, r8d
+    push r9
+    mov esi, r12d
+    mov edx, r14d
+    movsx ecx, r9w
+    sar r9d, 16
+    mov r8d, r9d
+    call present_copy
+    pop r9
+    mov edi, ebx
+    mov esi, r12d
+    mov edx, r13d
+    mov ecx, r14d
+    mov r8d, r15d
+    call present_complete
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; present_copy — esi = window, edx = pixmap, ecx = x_off, r8d = y_off.
+; Rows from the pixmap into the window backing, clipped to both. A dma-buf
+; pixmap is bracketed with DMA_BUF_IOCTL_SYNC so the GPU's writes are done
+; and visible. Then damage.
+; ----------------------------------------------------------------------------
+present_copy:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 32
+    mov r12d, esi
+    mov r13d, edx
+    mov r14d, ecx
+    mov r15d, r8d
+    mov edi, r13d
+    call pixmap_lookup
+    test rax, rax
+    jz .pcp_done
+    mov rbx, rax                             ; pixmap record
+    mov edi, r12d
+    call window_lookup
+    test rax, rax
+    jz .pcp_done
+    mov rbp, rax                             ; window record
+    mov rdi, rbp
+    call window_ensure_backing
+    test rax, rax
+    jz .pcp_done
+    test r14d, r14d
+    jns .pcp_x_ok
+    xor r14d, r14d
+.pcp_x_ok:
+    test r15d, r15d
+    jns .pcp_y_ok
+    xor r15d, r15d
+.pcp_y_ok:
+    movzx ecx, word [rbx + 4]                ; w = min(pixmap w, bw - dx)
+    movzx eax, word [rbp + 40]
+    sub eax, r14d
+    jle .pcp_done
+    cmp ecx, eax
+    cmovg ecx, eax
+    mov [rsp], ecx
+    movzx ecx, word [rbx + 6]                ; h = min(pixmap h, bh - dy)
+    movzx eax, word [rbp + 42]
+    sub eax, r15d
+    jle .pcp_done
+    cmp ecx, eax
+    cmovg ecx, eax
+    mov [rsp + 4], ecx
+    mov rax, rbx                             ; px_dma record for this slot
+    lea rcx, [pixmaps]
+    sub rax, rcx
+    xor edx, edx
+    mov ecx, PIXMAP_REC_SIZE
+    div rcx
+    lea rax, [rax + rax*2]
+    lea r10, [px_dma + rax*8]
+    mov [rsp + 8], r10
+    cmp qword [r10], 0
+    je .pcp_copy
+    mov qword [dma_sync], DMA_BUF_SYNC_READ  ; START | READ
+    mov edi, [r10 + 16]
+    mov esi, DMA_BUF_IOCTL_SYNC
+    lea rdx, [dma_sync]
+    mov eax, SYS_IOCTL
+    syscall
+.pcp_copy:
+    xor r10d, r10d                           ; row
+.pcp_row:
+    cmp r10d, [rsp + 4]
+    jae .pcp_rows_done
+    movzx eax, word [rbx + 4]
+    imul eax, r10d
+    mov rsi, [rbx + 16]
+    lea rsi, [rsi + rax*4]                   ; src row
+    lea eax, [r15 + r10]
+    movzx edx, word [rbp + 40]
+    imul eax, edx
+    add eax, r14d
+    mov rdi, [rbp + 32]
+    lea rdi, [rdi + rax*4]                   ; dst row
+    mov ecx, [rsp]
+    rep movsd
+    inc r10d
+    jmp .pcp_row
+.pcp_rows_done:
+    mov r10, [rsp + 8]
+    cmp qword [r10], 0
+    je .pcp_damage
+    mov qword [dma_sync], DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END
+    mov edi, [r10 + 16]
+    mov esi, DMA_BUF_IOCTL_SYNC
+    lea rdx, [dma_sync]
+    mov eax, SYS_IOCTL
+    syscall
+.pcp_damage:
+    mov rdi, rbp
+    mov eax, r14d
+    mov edx, r15d
+    mov ecx, [rsp]
+    mov r8d, [rsp + 4]
+    call damage_add_local
+    mov byte [comp_dirty], 1
+.pcp_done:
+    add rsp, 32
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; present_complete — edi = slot, esi = window, edx = serial, ecx = pixmap,
+; r8d = idle fence. CompleteNotify + IdleNotify to the subscriber, then the
+; fence is tripped so the client may draw into that buffer again.
+; ----------------------------------------------------------------------------
+present_complete:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov ebx, edi
+    mov r12d, esi
+    mov r13d, edx
+    mov r14d, ecx
+    mov r15d, r8d
+    mov edi, ebx
+    mov esi, r12d
+    mov edx, r13d
+    xor ecx, ecx                             ; kind = Pixmap
+    call present_send_complete
+    ; IdleNotify
+    mov edi, ebx
+    mov esi, r12d
+    call present_sub_find
+    test rax, rax
+    jz .pc_fence
+    test dword [rax + 12], PR_MASK_IDLE
+    jz .pc_fence
+    mov r8d, [rax + 4]                       ; eid
+    lea rdi, [pr_evbuf]
+    xor eax, eax
+    mov [rdi], rax
+    mov [rdi + 8], rax
+    mov [rdi + 16], rax
+    mov [rdi + 24], rax
+    mov byte [rdi + 0], 35                   ; GenericEvent
+    mov byte [rdi + 1], PRESENT_MAJOR
+    mov word [rdi + 8], 2                    ; IdleNotify
+    mov [rdi + 12], r8d
+    mov [rdi + 16], r12d
+    mov [rdi + 20], r13d
+    mov [rdi + 24], r14d
+    mov [rdi + 28], r15d
+    mov edi, ebx
+    lea rsi, [pr_evbuf]
+    mov edx, 32
+    call send_xi2_to_slot
+.pc_fence:
+    test r15d, r15d
+    jz .pc_done
+    mov edi, r15d
+    call fence_find
+    test rax, rax
+    jz .pc_done
+    mov rdi, [rax + 8]
+    call fence_trigger
+.pc_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; present_sub_find — edi = slot, esi = window → rax = subscription or 0.
+present_sub_find:
+    lea r8d, [rdi + 1]
+    xor ecx, ecx
+.psf_loop:
+    cmp ecx, PR_SUB_MAX
+    jae .psf_miss
+    mov eax, ecx
+    shl eax, 4
+    lea rax, [pr_subs + rax]
+    cmp [rax], r8d
+    jne .psf_next
+    cmp [rax + 8], esi
+    je .psf_hit
+.psf_next:
+    inc ecx
+    jmp .psf_loop
+.psf_miss:
+    xor eax, eax
+.psf_hit:
+    ret
+
+; ----------------------------------------------------------------------------
+; present_send_complete — edi = slot, esi = window, edx = serial, ecx =
+; kind (0 Pixmap, 1 NotifyMSC). CompleteNotify with mode Copy, the
+; current msc and the clock in microseconds.
+; ----------------------------------------------------------------------------
+present_send_complete:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov ebx, edi
+    mov r12d, esi
+    mov r13d, edx
+    mov r14d, ecx
+    mov edi, ebx
+    mov esi, r12d
+    call present_sub_find
+    test rax, rax
+    jz .psc_done
+    test dword [rax + 12], PR_MASK_COMPLETE
+    jz .psc_done
+    mov r8d, [rax + 4]                       ; eid
+    lea rdi, [pr_evbuf]
+    xor eax, eax
+    mov [rdi], rax
+    mov [rdi + 8], rax
+    mov [rdi + 16], rax
+    mov [rdi + 24], rax
+    mov [rdi + 32], rax
+    mov byte [rdi + 0], 35
+    mov byte [rdi + 1], PRESENT_MAJOR
+    mov dword [rdi + 4], 2                   ; (40 - 32) / 4
+    mov word [rdi + 8], 1                    ; CompleteNotify
+    mov [rdi + 10], r14b                     ; kind
+    mov [rdi + 12], r8d
+    mov [rdi + 16], r12d
+    mov [rdi + 20], r13d
+    call now_mono_ms
+    imul rax, rax, 1000
+    mov [pr_evbuf + 24], rax                 ; ust
+    mov rax, [pr_msc]
+    mov [pr_evbuf + 32], rax                 ; msc
+    mov edi, ebx
+    lea rsi, [pr_evbuf]
+    mov edx, 40
+    call send_xi2_to_slot
+.psc_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; present_configure_notify — rdi = window record. Every subscriber with
+; the CONFIGURE bit learns the window's new place and size; that is how a
+; DRI3 drawable follows a resize.
+; ----------------------------------------------------------------------------
+present_configure_notify:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi
+    xor ebx, ebx
+.pcn_loop:
+    cmp ebx, PR_SUB_MAX
+    jae .pcn_done
+    mov eax, ebx
+    shl eax, 4
+    lea r13, [pr_subs + rax]
+    cmp dword [r13], 0
+    je .pcn_next
+    mov eax, [r12]
+    cmp [r13 + 8], eax
+    jne .pcn_next
+    test dword [r13 + 12], PR_MASK_CONFIGURE
+    jz .pcn_next
+    lea rdi, [pr_evbuf]
+    xor eax, eax
+    mov [rdi], rax
+    mov [rdi + 8], rax
+    mov [rdi + 16], rax
+    mov [rdi + 24], rax
+    mov [rdi + 32], rax
+    mov byte [rdi + 0], 35
+    mov byte [rdi + 1], PRESENT_MAJOR
+    mov dword [rdi + 4], 2
+    mov eax, [r13 + 4]
+    mov [rdi + 12], eax                      ; eid
+    mov eax, [r12]
+    mov [rdi + 16], eax                      ; window
+    mov eax, [r12 + 8]
+    mov [rdi + 20], eax                      ; x, y
+    mov eax, [r12 + 12]
+    mov [rdi + 24], eax                      ; width, height
+    mov [rdi + 32], eax                      ; pixmap width, height
+    mov edi, [r13]
+    dec edi
+    lea rsi, [pr_evbuf]
+    mov edx, 40
+    call send_xi2_to_slot
+.pcn_next:
+    inc ebx
+    jmp .pcn_loop
+.pcn_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; raw_add / raw_del — edi = slot. The XI_RawMotion subscriber list.
+; ----------------------------------------------------------------------------
+raw_add:
+    inc edi
+    xor ecx, ecx
+.ra_loop:
+    cmp ecx, 4
+    jae .ra_done
+    cmp [raw_slots + rcx], dil
+    je .ra_done                              ; already listed
+    inc ecx
+    jmp .ra_loop
+.ra_done:
+    xor ecx, ecx
+.ra_find:
+    cmp ecx, 4
+    jae .ra_ret
+    cmp byte [raw_slots + rcx], 0
+    jne .ra_next
+    mov [raw_slots + rcx], dil
+    inc byte [raw_n]
+    ret
+.ra_next:
+    inc ecx
+    jmp .ra_find
+.ra_ret:
+    ret
+
+raw_del:
+    inc edi
+    xor ecx, ecx
+.rd_loop:
+    cmp ecx, 4
+    jae .rd_ret
+    cmp [raw_slots + rcx], dil
+    jne .rd_next
+    mov byte [raw_slots + rcx], 0
+    dec byte [raw_n]
+    ret
+.rd_next:
+    inc ecx
+    jmp .rd_loop
+.rd_ret:
+    ret
+
+; ----------------------------------------------------------------------------
+; raw_motion_send — edi = axis (0 x, 1 y), esi = evdev delta. XI_RawMotion
+; GenericEvent (52 bytes): header, one mask word, the value and the raw
+; value as FP3232, to every subscriber.
+; ----------------------------------------------------------------------------
+raw_motion_send:
+    push rbx
+    push r12
+    push r13
+    mov r12d, edi
+    mov r13d, esi
+    lea rdi, [xi2_buf]
+    xor eax, eax
+    mov ecx, 7
+    push rdi
+    rep stosq
+    pop rdi
+    mov byte [rdi + 0], 35
+    mov byte [rdi + 1], XI_MAJOR
+    mov dword [rdi + 4], 5                   ; (52 - 32) / 4
+    mov word [rdi + 8], 17                   ; XI_RawMotion
+    mov word [rdi + 10], 2                   ; master pointer
+    mov eax, [server_time_ms]
+    mov [rdi + 12], eax
+    mov word [rdi + 20], 2                   ; sourceid
+    mov word [rdi + 22], 1                   ; valuators_len (words)
+    mov eax, 1
+    mov ecx, r12d
+    shl eax, cl
+    mov [rdi + 32], eax                      ; valuator mask
+    mov [rdi + 36], r13d                     ; value, integral part
+    mov [rdi + 44], r13d                     ; raw value
+    xor ebx, ebx
+.rms_loop:
+    cmp ebx, 4
+    jae .rms_done
+    movzx edi, byte [raw_slots + rbx]
+    test edi, edi
+    jz .rms_next
+    dec edi
+    lea rsi, [xi2_buf]
+    mov edx, 52
+    call send_xi2_to_slot
+.rms_next:
+    inc ebx
+    jmp .rms_loop
+.rms_done:
     pop r13
     pop r12
     pop rbx

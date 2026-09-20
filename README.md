@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.7-blue)
+![Version](https://img.shields.io/badge/version-0.1.8-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -51,7 +51,7 @@ keyboard-driven. No libc, no Xlib, no Mesa anywhere in the path.*
 | 6 | SHAPE extension | ✓ shipped (bounding + input regions — spot runs) |
 | 7 | GCs + drawing primitives | |
 | 8 | DRM/KMS atomic modeset upgrade | |
-| 9 | RENDER subset for glass emoji + ARGB. v0.1.6: scale-only Composite fast path, framebuffer flush with clwb. v0.1.7: no wallpaper fill under an opaque window. A 640x400 game frame over the window at 60 fps is affordable | |
+| 9 | RENDER subset for glass emoji + ARGB. v0.1.6: scale-only Composite fast path, framebuffer flush with clwb. v0.1.7: no wallpaper fill under an opaque window. A 640x400 game frame over the window at 60 fps is affordable. v0.1.8: GLX + DRI3 + Present + SYNC, so Mesa renders on the GPU and frame copies the frames in (see below) | |
 | 10 | Cursor sprite + keyboard layout + clipboard | |
 | 11 | XKB (Firefox-compatible) | |
 | 12 | DAMAGE + COMPOSITE + FIXES | |
@@ -61,22 +61,45 @@ keyboard-driven. No libc, no Xlib, no Mesa anywhere in the path.*
 Phase 4 is the "tile runs on frame" milestone: self-hosting CHasm.
 Phase 14 is the "Firefox runs on a 50k-line asm X server" milestone.
 
-### GPU, when a need shows (noted 2026-09-19, on hold)
+### GPU clients (v0.1.8)
 
-Three rungs, in order of reach:
+Clients render on the GPU through Mesa; frame never touches the GPU
+itself. What it serves, and what each part does:
 
-1. **Display planes** (phase 8, the atomic modeset upgrade): hand a
-   window's buffer to an overlay plane and let the display engine scale
-   and show it. Kernel ioctls only. About 600 to 900 lines. A fullscreen
-   game or a video window at close to zero frame CPU. Needs a fullscreen
-   mode in tile first, since the strip covers part of every screen.
-2. **DRI3 + Present**: clients render on the GPU through Mesa and hand
-   frame their buffers as file descriptors, linear layout requested;
-   frame reads them or puts them on a plane. About 1500 to 2500 lines
-   plus compatibility work. WebGL, GPU video decode, OpenGL games.
-3. **Frame's own drawing on the GPU**: command streams for the render
-   engine, what Mesa and i915 do in hundreds of thousands of lines. Out
-   of reach for an asm server, and not planned.
+- **GLX 1.4**: version, server strings, the visual and fbconfig lists
+  (rgb 8/8/8, alpha 0 or 8, depth 24 + stencil 8 or none, double
+  buffered, plain and sRGB twins), GLXWindow bookkeeping. Contexts are
+  client-side; the requests that announce them are accepted and ignored.
+  `GLX_EXT_libglvnd` names `mesa`, so libglvnd picks the right library.
+- **DRI3 1.2**: `Open` hands the client `/dev/dri/renderD128` over the
+  socket (sendmsg with SCM_RIGHTS). `GetSupportedModifiers` answers
+  LINEAR only, so Mesa allocates buffers the CPU can read.
+  `PixmapFromBuffers` maps the dma-buf as a pixmap; `FenceFromFD` maps
+  the client's shm fence. Requests from a DRI3 client are read with
+  recvmsg so the fds ride along; other clients keep the plain read.
+- **Present 1.2**: `PresentPixmap` copies the pixmap into the window
+  at its target frame (a page-flip completion, or a 16 ms timer when
+  nothing else flips), bracketed by `DMA_BUF_IOCTL_SYNC`, then sends
+  CompleteNotify and IdleNotify and trips the fence. A resize sends
+  ConfigureNotify, which is how a DRI3 drawable follows the window.
+- **SYNC**: only the fence minors (trigger, reset, destroy, query).
+  Mesa destroys its fences through SYNC, and an absent extension there
+  makes xcb close the whole connection.
+- **XI2 RawMotion** on the root: the unclamped mouse deltas GLFW uses
+  for mouse look in games.
+
+Cost: one window-sized copy per presented frame, then the normal
+composite. Nothing runs when no GL client exists; every table is
+gated by a count. Verified with Mesa 26.0.8 on Intel: `glxinfo` says
+accelerated, `eglinfo` initialises the X11 platform, `glxgears` runs
+at 60 fps paced by the server.
+
+Needs: when frame runs as a user, that user in the `render` group
+(`sudo usermod -aG render $USER`, then log in again). As root from a
+VT it just works.
+
+Still open: a display plane for a fullscreen window (phase 8), which
+would drop the copy. Needs a fullscreen mode in tile first.
 
 ## Phase 1: what works
 
