@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.9-blue)
+![Version](https://img.shields.io/badge/version-0.1.10-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -82,6 +82,9 @@ itself. What it serves, and what each part does:
   nothing else flips), bracketed by `DMA_BUF_IOCTL_SYNC`, then sends
   CompleteNotify and IdleNotify and trips the fence. A resize sends
   ConfigureNotify, which is how a DRI3 drawable follows the window.
+  Every subscription on the window gets its events (v0.1.10): Mesa's
+  EGL path registers twice, and answering only the first left mpv's
+  window black after one frame.
 - **SYNC**: only the fence minors (trigger, reset, destroy, query).
   Mesa destroys its fences through SYNC, and an absent extension there
   makes xcb close the whole connection.

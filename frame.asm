@@ -5626,6 +5626,8 @@ dispatch_request:
     je .dr_done
     cmp eax, 127                             ; NoOperation (Mesa syncs with it)
     je .dr_done
+    cmp eax, 115                             ; ForceScreenSaver (mpv's inhibit)
+    je .dr_done
     cmp eax, 94                              ; CreateGlyphCursor
     jne .dr_not_gcur
     mov rsi, r12
@@ -27586,15 +27588,28 @@ present_complete:
     mov edx, r13d
     xor ecx, ecx                             ; kind = Pixmap
     call present_send_complete
-    ; IdleNotify
-    mov edi, ebx
-    mov esi, r12d
-    call present_sub_find
-    test rax, rax
-    jz .pc_fence
-    test dword [rax + 12], PR_MASK_IDLE
-    jz .pc_fence
-    mov r8d, [rax + 4]                       ; eid
+    ; IdleNotify to every subscription of this window that asked for it.
+    ; Mesa's EGL path registers twice on one window (one id for the
+    ; swap-interval waiter, one for the buffer loader); answering only
+    ; the first left the loader waiting forever and mpv's window black.
+    push rbx
+    push r12
+    lea eax, [rbx + 1]
+    xor ecx, ecx
+.pc_idle_loop:
+    cmp ecx, PR_SUB_MAX
+    jae .pc_idle_done
+    mov edx, ecx
+    shl edx, 4
+    cmp [pr_subs + rdx], eax
+    jne .pc_idle_next
+    cmp [pr_subs + rdx + 8], r12d
+    jne .pc_idle_next
+    test dword [pr_subs + rdx + 12], PR_MASK_IDLE
+    jz .pc_idle_next
+    push rax
+    push rcx
+    mov r8d, [pr_subs + rdx + 4]             ; eid
     lea rdi, [pr_evbuf]
     xor eax, eax
     mov [rdi], rax
@@ -27613,6 +27628,14 @@ present_complete:
     lea rsi, [pr_evbuf]
     mov edx, 32
     call send_xi2_to_slot
+    pop rcx
+    pop rax
+.pc_idle_next:
+    inc ecx
+    jmp .pc_idle_loop
+.pc_idle_done:
+    pop r12
+    pop rbx
 .pc_fence:
     test r15d, r15d
     jz .pc_done
@@ -27666,14 +27689,22 @@ present_send_complete:
     mov r12d, esi
     mov r13d, edx
     mov r14d, ecx
-    mov edi, ebx
-    mov esi, r12d
-    call present_sub_find
-    test rax, rax
-    jz .psc_done
-    test dword [rax + 12], PR_MASK_COMPLETE
-    jz .psc_done
-    mov r8d, [rax + 4]                       ; eid
+    push r15
+    lea r15d, [rbx + 1]                      ; owner tag
+    xor ecx, ecx
+.psc_loop:
+    cmp ecx, PR_SUB_MAX
+    jae .psc_done
+    mov edx, ecx
+    shl edx, 4
+    cmp [pr_subs + rdx], r15d
+    jne .psc_next
+    cmp [pr_subs + rdx + 8], r12d
+    jne .psc_next
+    test dword [pr_subs + rdx + 12], PR_MASK_COMPLETE
+    jz .psc_next
+    push rcx
+    mov r8d, [pr_subs + rdx + 4]             ; eid
     lea rdi, [pr_evbuf]
     xor eax, eax
     mov [rdi], rax
@@ -27698,7 +27729,12 @@ present_send_complete:
     lea rsi, [pr_evbuf]
     mov edx, 40
     call send_xi2_to_slot
+    pop rcx
+.psc_next:
+    inc ecx
+    jmp .psc_loop
 .psc_done:
+    pop r15
     pop r14
     pop r13
     pop r12
