@@ -99,7 +99,10 @@ at 60 fps paced by the server.
 
 Needs: when frame runs as a user, that user in the `render` group
 (`sudo usermod -aG render $USER`, then log in again). As root from a
-VT it just works.
+VT it just works. On a laptop with a second GPU, pin Vulkan to the one
+driving the panel (`VK_DRIVER_FILES=/usr/share/vulkan/icd.d/intel_icd.json`
+or the like): a Vulkan app that picks the other card renders there,
+and frame then reads every frame back over PCIe at about one a second.
 
 Still open: a display plane for a fullscreen window (phase 8), which
 would drop the copy. Needs a fullscreen mode in tile first.
