@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.11-blue)
+![Version](https://img.shields.io/badge/version-0.1.12-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -116,6 +116,12 @@ DISPLAY=:7 xdpyinfo     # connects, gets setup reply, sends QueryExtension
 ./frame --help          # the flags; any unknown --flag prints this and exits
 ./frame --version
 ```
+
+`kill -USR1 <pid>` dumps the compositor state: both framebuffers to
+`/tmp/frame<N>_fbA.raw` and `_fbB.raw`, and every window's backing to
+`/tmp/frame<N>_win_<xid>.raw`, all BGRX at the buffer's own width. `<N>`
+is the display number (v0.1.12), so a scratch server and a live one
+never overwrite each other's dumps.
 
 `frame` accepts an X11 client, validates its 12-byte connection-setup
 request (byte-order `l`, protocol 11.0, drains any auth tail), and

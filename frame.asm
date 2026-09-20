@@ -1106,6 +1106,9 @@ dp_args:            resd 8               ; dma_pixmap_create arguments: +0 pid,
                                          ; +4 w, +8 h, +12 stride, +16 offset,
                                          ; +20 fd, +24 depth, +28 minor
 pr_sub_n:           resd 1               ; live Present subscriptions (gate)
+dump_prefix:        resb 32              ; "/tmp/frame<N>_win_"
+dump_fb0_path:      resb 32              ; "/tmp/frame<N>_fbA.raw"
+dump_fb1_path:      resb 32              ; "/tmp/frame<N>_fbB.raw"
 drm_card_num1:      resd 1               ; display card index + 1 (0 = unknown)
 render_path_buf:    resb 64              ; "/dev/dri/renderDNNN" once resolved
 dents_buf:          resb 1024            ; getdents64 scratch
@@ -1700,9 +1703,14 @@ dbg_sp:             db " "
 dbg_dump_tag:       db "DUMP xid/w/h/nonbg: "
 dbg_dump_tag_len    equ $ - dbg_dump_tag
 dump_path:          db "/tmp/frame_win.raw", 0
-dump_prefix:        db "/tmp/frame_win_", 0
-dump_fb0_path:      db "/tmp/frame_fbA.raw", 0
-dump_fb1_path:      db "/tmp/frame_fbB.raw", 0
+; SIGUSR1 dump paths carry the display number, composed at startup by
+; init_dump_paths. Two frames on one machine used to write the same
+; files: a scratch server's dump overwrote the live one's and a rig
+; cleanup deleted it, which cost a session a whole measurement.
+dump_head:          db "/tmp/frame", 0
+dump_tail_win:      db "_win_", 0
+dump_tail_fba:      db "_fbA.raw", 0
+dump_tail_fbb:      db "_fbB.raw", 0
 dbg_fbstate:        db "FBSTATE back=", 0
 dbg_curstate:       db "CURSTATE shape=", 0
 dbg_cs_sc:          db " scale=", 0
@@ -1919,7 +1927,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.11", 10
+version_str:        db "frame 0.1.12", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -2244,6 +2252,7 @@ _start:
     jmp .flag_scan
 
 .main:
+    call init_dump_paths
     call announce_listening
     call socket_setup
     test rax, rax
@@ -28039,4 +28048,57 @@ render_node_open:
     inc rdi
     jmp .rno_strcpy
 .rno_strcpy_done:
+    ret
+
+; ----------------------------------------------------------------------------
+; dump_path_make — rdi = destination buffer, rsi = tail string. Writes
+; "/tmp/frame" + display number + tail, NUL-terminated.
+; ----------------------------------------------------------------------------
+dump_path_make:
+    push rbx
+    push r12
+    mov rbx, rdi
+    mov r12, rsi
+    lea rsi, [dump_head]
+.dpm_head:
+    mov al, [rsi]
+    test al, al
+    jz .dpm_num
+    mov [rbx], al
+    inc rsi
+    inc rbx
+    jmp .dpm_head
+.dpm_num:
+    mov rax, [display_num]
+    mov rdi, rbx
+    call u64_to_ascii                        ; returns rdi past last digit
+    mov rbx, rdi
+    mov rsi, r12
+.dpm_tail:
+    mov al, [rsi]
+    mov [rbx], al
+    test al, al
+    jz .dpm_done
+    inc rsi
+    inc rbx
+    jmp .dpm_tail
+.dpm_done:
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; init_dump_paths — compose the three SIGUSR1 dump paths once, after the
+; display number is known.
+; ----------------------------------------------------------------------------
+init_dump_paths:
+    lea rdi, [dump_prefix]
+    lea rsi, [dump_tail_win]
+    call dump_path_make
+    lea rdi, [dump_fb0_path]
+    lea rsi, [dump_tail_fba]
+    call dump_path_make
+    lea rdi, [dump_fb1_path]
+    lea rsi, [dump_tail_fbb]
+    call dump_path_make
     ret
