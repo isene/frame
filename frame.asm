@@ -1927,7 +1927,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.14", 10
+version_str:        db "frame 0.1.15", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -25632,51 +25632,69 @@ render_composite:
 ; Blends source over destination and stores it. Clobbers eax, ecx, edx,
 ; r8, r9, r10. Shared by the generic composite loop and its fast path.
 rc_blend_pixel:
-    ; dst = src*a + dst*(255-a), per channel, /255 via (v*257+257)>>16
-    mov r8d, eax                                 ; a
+    ; RENDER's over operator on a PREMULTIPLIED source:
+    ;   dst = src + dst * (255 - a) / 255
+    ;
+    ; frame used to compute src*a + dst*(255-a), which is the straight
+    ; alpha form. Every toolkit hands X premultiplied pixels (cairo,
+    ; Mesa, glass's own emoji path), so their partial alpha was scaled
+    ; by alpha twice and came out too dark. Soft edges suffered most.
+    ;
+    ; /255 via (v*257+257)>>16. The sum is clamped: a source that is not
+    ; properly premultiplied can push a channel past 255, and wrapping
+    ; there turns a bright edge into a dark one.
     mov r9d, 255
     sub r9d, eax                                 ; 255-a
-    mov edx, [rdi]                                ; dst pixel
+    mov edx, [rdi]                               ; dst pixel
     ; blue
-    mov eax, esi
+    mov eax, edx
     and eax, 0xff
-    imul eax, r8d
-    mov ecx, edx
-    and ecx, 0xff
-    imul ecx, r9d
-    add eax, ecx
+    imul eax, r9d
     imul eax, 257
     add eax, 257
     shr eax, 16
+    mov r10d, esi
+    and r10d, 0xff
+    add eax, r10d
+    cmp eax, 255
+    jbe .rbp_b_ok
+    mov eax, 255
+.rbp_b_ok:
     mov ecx, eax                                 ; result accumulator (B)
     ; green
-    mov eax, esi
+    mov eax, edx
     shr eax, 8
     and eax, 0xff
-    imul eax, r8d
-    mov r10d, edx
-    shr r10d, 8
-    and r10d, 0xff
-    imul r10d, r9d
-    add eax, r10d
+    imul eax, r9d
     imul eax, 257
     add eax, 257
     shr eax, 16
+    mov r10d, esi
+    shr r10d, 8
+    and r10d, 0xff
+    add eax, r10d
+    cmp eax, 255
+    jbe .rbp_g_ok
+    mov eax, 255
+.rbp_g_ok:
     shl eax, 8
     or ecx, eax
     ; red
-    mov eax, esi
+    mov eax, edx
     shr eax, 16
     and eax, 0xff
-    imul eax, r8d
-    mov r10d, edx
-    shr r10d, 16
-    and r10d, 0xff
-    imul r10d, r9d
-    add eax, r10d
+    imul eax, r9d
     imul eax, 257
     add eax, 257
     shr eax, 16
+    mov r10d, esi
+    shr r10d, 16
+    and r10d, 0xff
+    add eax, r10d
+    cmp eax, 255
+    jbe .rbp_r_ok
+    mov eax, 255
+.rbp_r_ok:
     shl eax, 16
     or ecx, eax
     or ecx, 0xFF000000
