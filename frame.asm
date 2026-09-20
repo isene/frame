@@ -1927,7 +1927,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.12", 10
+version_str:        db "frame 0.1.13", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -18408,7 +18408,7 @@ recomposite_screen:
     mov ecx, [rbx + 12]
     call rect_unpainted_hold
     test eax, eax
-    jnz .rs_rect_next
+    jnz .rs_rect_hold
     call rect_covered_opaque
     mov [rs_rect_opaque], al
     mov eax, [rbx + 0]
@@ -18435,6 +18435,23 @@ recomposite_screen:
     call .rs_window_walk
     call xor_band_apply                       ; rubber band rides on top
     call warn_band_apply                      ; and the out-of-slots warning
+    jmp .rs_rect_next
+.rs_rect_hold:
+    ; The window owning this rect is mapped but has never drawn, and it
+    ; has no background of its own. Paint opaque black rather than
+    ; leaving what was there: those pixels belong to whatever this window
+    ; replaced, and another window's text inside a new window reads as
+    ; corruption (seen 2026-09-20, a fresh tile split showing the old
+    ; terminal's line ends). Black is also what the client is about to
+    ; draw in nearly every case, so it costs no extra flicker.
+    mov eax, [rbx + 0]
+    mov esi, [rbx + 4]
+    mov edi, [rbx + 8]
+    sub edi, eax                              ; w
+    mov ecx, [rbx + 12]
+    sub ecx, esi                              ; h
+    mov edx, 0xFF000000
+    call draw_rect
 .rs_rect_next:
     add rbx, 16
     dec r13d
