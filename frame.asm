@@ -1927,7 +1927,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.13", 10
+version_str:        db "frame 0.1.14", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -10466,6 +10466,16 @@ window_destroy:
     push r13
     cmp edi, X_ROOT_WINDOW
     je .wd_done
+    ; The focused window is going away. X reverts the focus when its
+    ; window is destroyed; frame only did so when the whole CLIENT died,
+    ; so a client that destroyed its own focused window left the focus
+    ; pointing at a dead XID. Keys then went to whatever first_mapped
+    ; found, and the user's terminal looked deaf until a workspace
+    ; switch made the WM set the focus again (v0.1.14).
+    cmp edi, [focus_window]
+    jne .wd_focus_ok
+    mov dword [focus_window], 1              ; PointerRoot
+.wd_focus_ok:
     call shape_free_window                   ; drop any SHAPE regions (preserves regs)
     mov r12d, edi                            ; xid being destroyed
     xor ebx, ebx
@@ -11120,6 +11130,11 @@ handle_unmap_window:
     cmp byte [r12 + 28], 0
     je .uw_done
     mov byte [r12 + 28], 0
+    mov eax, [r12]                            ; focus follows the window off
+    cmp eax, [focus_window]                   ; screen: an unviewable focus
+    jne .uw_focus_ok                          ; swallows every key
+    mov dword [focus_window], 1               ; PointerRoot
+.uw_focus_ok:
     mov byte [comp_dirty], 1
     mov rdi, r12
     call damage_add_window
@@ -15754,6 +15769,20 @@ deliver_to_focus:
     mov ebx, ecx                              ; target xid
     jmp .dtf_have
 .dtf_default:
+    ; PointerRoot, or a focus that no longer exists: X delivers the key
+    ; to the window the pointer is in. That is also the right recovery
+    ; after the focused window was destroyed.
+    push r12
+    push r13
+    call window_at_point
+    pop r13
+    pop r12
+    test rax, rax
+    jz .dtf_first
+    mov ebx, [rax]
+    cmp ebx, X_ROOT_WINDOW
+    jne .dtf_have
+.dtf_first:
     call first_mapped_window
     test eax, eax
     jz .dtf_done
