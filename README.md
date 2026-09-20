@@ -131,7 +131,9 @@ proven and the DRM backend is in.
 Opens `/dev/dri/cardN`, enumerates resources, lists connectors. A card
 with no connectors is skipped (v0.1.9): a discrete GPU wired to nothing
 can take card0 when its module loads first, as the NVIDIA card did on
-kernel 7.0.0-31.
+kernel 7.0.0-31. Known limit: a discrete card whose outputs exist but
+have nothing plugged in still wins when it is card0. Open an issue if
+your laptop routes HDMI through the discrete card and frame picks it.
 
 ```
 frame: opened /dev/dri/card1, driver i915 v1.6.0
