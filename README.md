@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.10-blue)
+![Version](https://img.shields.io/badge/version-0.1.11-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -113,6 +113,8 @@ would drop the copy. Needs a fullscreen mode in tile first.
 make
 ./frame                 # listens on display :7 (configurable: ./frame N)
 DISPLAY=:7 xdpyinfo     # connects, gets setup reply, sends QueryExtension
+./frame --help          # the flags; any unknown --flag prints this and exits
+./frame --version
 ```
 
 `frame` accepts an X11 client, validates its 12-byte connection-setup

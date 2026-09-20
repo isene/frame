@@ -1919,6 +1919,13 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
+version_str:        db "frame 0.1.11", 10
+version_str_len     equ $ - version_str
+usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
+                    db "             [--testinput FIFO] [--probe] [--probe-input]", 10
+                    db "             [--watch-input DEV] [--modeset] [--version]", 10
+                    db "  N is the display number (default 7); --display drives the panel.", 10
+usage_str_len       equ $ - usage_str
 input_watch_oerr:   db "frame: open failed (need 'input' group membership, or run with sudo)", 10
 input_watch_oerr_len equ $ - input_watch_oerr
 input_probe_none:   db "  (none opened — run with sudo, or add yourself to the 'input' group)", 10
@@ -2195,12 +2202,43 @@ _start:
     jmp .flag_scan_next
 .flag_not_testinput:
     cmp dword [rdi], '--di'
-    jne .flag_scan_next
+    jne .flag_not_display
     cmp dword [rdi + 4], 'spla'
-    jne .flag_scan_next
+    jne .flag_not_display
     cmp word [rdi + 8], 'y'
-    jne .flag_scan_next
+    jne .flag_not_display
     mov byte [compositor_requested], 1
+    jmp .flag_scan_next
+.flag_not_display:
+    ; --version prints and exits. Any other "--" word is a mistake:
+    ; before v0.1.11 "frame --help" started a server on :7 and opened
+    ; every input device, twice in one day. Usage, exit 1.
+    cmp word [rdi], '--'
+    jne .flag_scan_next
+    cmp dword [rdi], '--ve'
+    jne .flag_usage
+    cmp dword [rdi + 4], 'rsio'
+    jne .flag_usage
+    cmp word [rdi + 8], 'n'
+    jne .flag_usage
+    mov rsi, version_str
+    mov rdx, version_str_len
+    call write_stderr
+    xor edi, edi
+    mov rax, SYS_EXIT
+    syscall
+.flag_usage:
+    mov r12d, 1                              ; exit status: a mistake...
+    cmp dword [rdi], '--he'                  ; ...unless --help asked for it
+    jne .flag_usage_write
+    xor r12d, r12d
+.flag_usage_write:
+    mov rsi, usage_str
+    mov rdx, usage_str_len
+    call write_stderr
+    mov edi, r12d
+    mov rax, SYS_EXIT
+    syscall
 .flag_scan_next:
     inc rcx
     jmp .flag_scan
