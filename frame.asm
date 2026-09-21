@@ -637,6 +637,7 @@ gcs:                resb MAX_GCS * GC_REC_SIZE
 ; rubber-band idiom (scrot -s live selection) and toggles xb_* below
 ; instead of touching any backing.
 gc_funcs:           resb MAX_GCS
+gc_gfx_exp:         resb MAX_GCS           ; GCGraphicsExposures, X default 1
 
 ; XOR rubber band — compositor overlay state. XOR pairs (draw, then
 ; identical draw to erase) toggle it; the compositor re-applies the
@@ -1927,7 +1928,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.16", 10
+version_str:        db "frame 0.1.17", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -14292,6 +14293,36 @@ send_expose:
     ret
 
 ; ----------------------------------------------------------------------------
+; send_no_expose — edi = client slot, esi = drawable. Emits a 32-byte
+; NoExposure (code 14) naming CopyArea as the request that caused it.
+; ----------------------------------------------------------------------------
+send_no_expose:
+    push rbx
+    push r12
+    mov r12d, esi                            ; drawable
+    mov eax, edi                             ; slot
+    call client_meta_addr                    ; rax = meta (+0 fd, +8 seq)
+    mov rbx, rax
+    lea rsi, [reply_buf]
+    xor eax, eax
+    mov [rsi + 0], rax
+    mov [rsi + 8], rax
+    mov [rsi + 16], rax
+    mov [rsi + 24], rax
+    mov byte [rsi + 0], 14                    ; NoExposure
+    mov eax, [rbx + 8]
+    mov [rsi + 2], ax                         ; seq
+    mov [rsi + 4], r12d                       ; drawable
+    mov word [rsi + 8], 0                     ; minor-opcode (core request)
+    mov byte [rsi + 10], 62                   ; major-opcode = CopyArea
+    mov edi, [rbx]                            ; fd
+    mov edx, 32
+    EV_SEND
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
 ; send_visibility_notify — edi = client slot, esi = window xid. Emits a
 ; 32-byte VisibilityNotify (code 15) with state Unobscured (0). Sent on
 ; map to VisibilityChangeMask selectors: xfreerdp3's xf_CreateDesktopWindow
@@ -20033,6 +20064,7 @@ gc_alloc:
     sub rax, rcx
     shr rax, 4
     mov byte [gc_funcs + rax], 3              ; default function = GXcopy
+    mov byte [gc_gfx_exp + rax], 1            ; graphics-exposures: X default True
     imul rax, CLIP_ENTRY_SIZE
     lea rcx, [gc_clips]
     mov dword [rcx + rax], 0                  ; count 0 = no clip
@@ -20076,8 +20108,17 @@ apply_gc_values:
     je .agv_bg
     cmp r14d, 4
     je .agv_lw
+    cmp r14d, 16
+    je .agv_gfxexp
     cmp r14d, 19
     je .agv_clipmask
+    jmp .agv_adv
+.agv_gfxexp:
+    mov rcx, r13                             ; slot = (rec - gcs) / 16
+    lea rdx, [gcs]
+    sub rcx, rdx
+    shr rcx, 4
+    mov [gc_gfx_exp + rcx], al
     jmp .agv_adv
 .agv_func:
     mov rcx, r13                             ; slot = (rec - gcs) / 16
@@ -21898,7 +21939,7 @@ handle_clear_area:
     mov rdi, r12
     mov esi, eax
     call window_apply_back_pixmap            ; whole-window restore + damage
-    jmp .ca_done
+    jmp .ca_expose
 .ca_flatfill:
     mov rdi, r13
     movzx esi, word [r12 + 40]               ; backing_w (stride)
@@ -21912,6 +21953,33 @@ handle_clear_area:
     mov ecx, [dmg_lat + 8]
     mov r8d, [dmg_lat + 12]
     call damage_add_local
+.ca_expose:
+    ; The exposures flag is a REQUEST FOR AN EXPOSE: the spec has the server
+    ; generate one for the cleared rectangle. frame read the flag nowhere and
+    ; sent nothing.
+    ;
+    ; rofi clears with exposures=1 right after mapping, and runs its FIRST
+    ; filter pass from its event loop. With no event it painted its prompt
+    ; row, reported "0/4" with an empty filter, and left the menu blank until
+    ; any key arrived. A bare Shift was enough, which is what gave it away.
+    cmp byte [rbx + 1], 0                    ; exposures requested?
+    je .ca_done
+    test dword [r12 + 24], 0x8000            ; ExposureMask selected?
+    jz .ca_done
+    mov eax, [r12]
+    cmp eax, X_RID_BASE
+    jb .ca_done
+    sub eax, X_RID_BASE
+    shr eax, 21                              ; owner slot, as at map
+    cmp eax, MAX_CLIENTS
+    jae .ca_done
+    mov edi, eax
+    mov esi, [r12]                           ; window
+    mov edx, [dmg_lat + 0]                   ; the rect we just cleared
+    mov ecx, [dmg_lat + 4]
+    mov r8d, [dmg_lat + 8]
+    mov r9d, [dmg_lat + 12]
+    call send_expose
 .ca_done:
     pop r13
     pop r12
@@ -22147,6 +22215,35 @@ handle_copy_area:
     mov r8d, [rbp + 88]                       ; copy_h
     call damage_add_local
 .cpa_done:
+    ; With graphics-exposures set (the X default) the requesting client
+    ; expects one event per CopyArea. frame keeps every window's content,
+    ; so no source region is ever unavailable and the answer is always
+    ; NoExposure. It goes to the GC's owner, which is always the caller.
+    ;
+    ; rofi runs its FIRST filter pass from its event loop, and copies its
+    ; buffer to the window at the end of a paint. With no event the loop
+    ; never ran again: the menu drew its prompt row, reported "0/4" on an
+    ; empty filter, and stayed blank until any key arrived. A bare Shift
+    ; was enough to fix it, which is what gave the event away.
+    mov edi, [rbx + 12]                      ; gc id
+    call gc_lookup
+    test rax, rax
+    jz .cpa_ret
+    lea rcx, [gcs]
+    sub rax, rcx
+    shr rax, 4
+    cmp byte [gc_gfx_exp + rax], 0
+    je .cpa_ret
+    mov eax, [rbx + 12]
+    sub eax, X_RID_BASE
+    jb .cpa_ret
+    shr eax, 21                              ; owner slot, from the GC's xid
+    cmp eax, MAX_CLIENTS
+    jae .cpa_ret
+    mov edi, eax
+    mov esi, [rbx + 8]                       ; dst drawable
+    call send_no_expose
+.cpa_ret:
     add rsp, 160
     pop rbp
     pop r15
