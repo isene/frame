@@ -1928,7 +1928,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.17", 10
+version_str:        db "frame 0.1.18", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -11563,6 +11563,18 @@ property_alloc:
 .pa_take:
     mov [rax], r12d
     mov [rax + 4], r13d
+    ; The slot may be RECYCLED. window_props_clear zeroes only the xid, so
+    ; nbytes and value_off still describe the dead property. Without this,
+    ; the same-size Replace path below overwrites THOSE bytes in place and
+    ; keeps the stale offset, so the new property reads whatever lives
+    ; there now. Once a compaction has packed live values down, that is
+    ; another window's data: a glass window reported _NET_WM_PID 0 and a
+    ; WM_CLASS full of window geometry, and fleet read it as a dead
+    ; session and started a second one (2026-09-21).
+    mov dword [rax + 8], 0                   ; type
+    mov dword [rax + 12], 0                  ; format + pad
+    mov dword [rax + 16], 0                  ; nbytes
+    mov dword [rax + 20], 0                  ; value_off
 .pa_done:
     pop r13
     pop r12
