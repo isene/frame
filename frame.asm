@@ -1927,7 +1927,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.15", 10
+version_str:        db "frame 0.1.16", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -23026,7 +23026,64 @@ handle_render:
     je .hr_set_pic_transform
     cmp eax, 27
     je .hr_create_cursor
+    cmp eax, 2
+    je .hr_query_pict_index_values
+    cmp eax, 29
+    je .hr_query_filters
     ; Unhandled minor — leave it (logged by the generic request logger).
+    ; Every RENDER request that CARRIES A REPLY must be answered above:
+    ; a client that waits for one blocks forever. QueryFilters (29) hung
+    ; xdpyinfo -ext RENDER for exactly that reason.
+    jmp .hr_done
+
+.hr_query_filters:
+    ; QueryFilters (29) — the filters this server can set on a picture.
+    ; frame scales nearest-neighbour and implements no SetPictureFilter,
+    ; so it names "nearest" and no aliases. Reply: 32-byte header, then
+    ; numAliases CARD16s, then numFilters STR8s, each padded to 4.
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+    lea rdi, [reply_buf]
+    xor eax, eax
+    mov ecx, 5
+    rep stosq                                 ; zero 40 bytes
+    mov byte  [reply_buf + 0], 1              ; reply
+    mov ecx, [r12 + 8]                        ; seq
+    mov [reply_buf + 2], cx
+    mov dword [reply_buf + 4], 2              ; 8 more bytes = 2 units
+    mov dword [reply_buf + 8], 0              ; numAliases
+    mov dword [reply_buf + 12], 1             ; numFilters
+    mov byte  [reply_buf + 32], 7             ; STR8 length
+    mov dword [reply_buf + 33], 'near'
+    mov word  [reply_buf + 37], 'es'
+    mov byte  [reply_buf + 39], 't'
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 40
+    syscall
+    jmp .hr_done
+
+.hr_query_pict_index_values:
+    ; QueryPictIndexValues (2) — only meaningful for an indexed format.
+    ; frame is truecolor throughout, so the list is empty. It still needs
+    ; the reply: same waiting-client trap as QueryFilters.
+    mov eax, ebx
+    call client_meta_addr
+    mov r12, rax
+    lea rdi, [reply_buf]
+    xor eax, eax
+    mov ecx, 4
+    rep stosq                                 ; zero 32 bytes
+    mov byte  [reply_buf + 0], 1
+    mov ecx, [r12 + 8]
+    mov [reply_buf + 2], cx
+    mov edi, [r12]
+    mov rax, SYS_WRITE
+    lea rsi, [reply_buf]
+    mov rdx, 32
+    syscall
     jmp .hr_done
 
 .hr_create_cursor:
