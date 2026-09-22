@@ -302,6 +302,7 @@ DEFAULT REL
 %define DRI3_MAJOR           143         ; no events, no errors
 %define PRESENT_MAJOR        144         ; GenericEvents only
 %define SYNC_MAJOR           145
+%define VIDMODE_MAJOR        146         ; XFree86-VidModeExtension, no events
 %define SYNC_EVENT_BASE      97          ; CounterNotify, AlarmNotify (never sent)
 %define SYNC_ERROR_BASE      171         ; BadCounter, BadAlarm, BadFence
 %define SYS_SENDMSG          46
@@ -1928,7 +1929,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.19", 10
+version_str:        db "frame 0.1.20", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -2016,6 +2017,7 @@ ext_table:
     db 4, "DRI3",            DRI3_MAJOR, 0, 0, 1
     db 7, "Present",         PRESENT_MAJOR, 0, 0, 1
     db 4, "SYNC",            SYNC_MAJOR, SYNC_EVENT_BASE, SYNC_ERROR_BASE, 1
+    db 24, "XFree86-VidModeExtension", VIDMODE_MAJOR, 0, 0, 1
     db 0
 
 ; ---- GLX server strings and configs (v0.1.8) -------------------------------
@@ -5655,6 +5657,8 @@ dispatch_request:
     je .dr_present
     cmp eax, SYNC_MAJOR
     je .dr_sync
+    cmp eax, VIDMODE_MAJOR
+    je .dr_vidmode
     ; Void no-ops — requests with no reply that frame can safely accept and
     ; ignore. Silences the log noise and, for toolkits that follow them with
     ; a blocking round-trip, keeps the stream healthy. 36/37 Grab/UngrabServer
@@ -5784,6 +5788,12 @@ dispatch_request:
     mov edi, ebx
     mov rsi, r12
     call handle_sync
+    jmp .dr_done
+
+.dr_vidmode:
+    mov edi, ebx
+    mov rsi, r12
+    call handle_vidmode
     jmp .dr_done
 
 .dr_xinput:
@@ -8053,6 +8063,79 @@ handle_translate_coordinates:
 ; CRTC + one output + one mode, so toolkits see a real screen (not "fake").
 ; Reuses xkb_reply_zero for the common header (then overwrites byte[1]).
 ; ============================================================================
+; ============================================================================
+; handle_vidmode — XFree86-VidModeExtension. edi = slot, rsi = req ptr.
+;
+; Mesa's __glxGetMscRate asks for the refresh rate through THIS extension and
+; nothing else: XF86VidModeQueryVersion, then XF86VidModeGetModeLine, and it
+; gives up if either fails. It never looks at RandR, which is why frame's
+; complete RandR mode did not help.
+;
+; Chromium, and so every Electron app, calls that through eglGetMscRateANGLE.
+; Getting no answer it invented a refresh interval of 1.012 s and paced its
+; compositor at one frame a second: a half-drawn window sat on screen for
+; about a second on every open (found 2026-09-23, 132 failures in 100 s).
+;
+; Only the two Mesa needs are served. Everything else carrying a reply gets
+; BadImplementation rather than silence, so no client can hang the way
+; xdpyinfo did on RENDER and xrandr did on RandR.
+; ============================================================================
+handle_vidmode:
+    movzx eax, byte [rsi + 1]                ; vidmode minor opcode
+    cmp eax, 0                               ; QueryVersion
+    je .vm_query_version
+    cmp eax, 1                               ; GetModeLine
+    je .vm_get_modeline
+    cmp eax, 14                              ; SetClientVersion: void, and the
+    je .vm_void                              ; first thing xvidtune sends
+    movzx ecx, byte [rsi + 1]                ; read the minor BEFORE esi goes
+    mov esi, 17                              ; BadImplementation
+    xor edx, edx
+    mov r8d, VIDMODE_MAJOR
+    call send_error
+    ret
+
+.vm_void:
+    ret
+
+.vm_query_version:
+    mov esi, 32
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0
+    mov word [rdi + 8], 2                     ; majorVersion
+    mov word [rdi + 10], 2                    ; minorVersion
+    jmp .vm_write
+
+.vm_get_modeline:
+    ; 52 bytes; xkb_reply_zero sets length = (52-32)/4 = 5 itself.
+    ; dotclock is in kHz here while RandR reports Hz, so the two agree:
+    ; 148500 kHz over 2200 x 1125 is 60.00 Hz, the same mode RandR names.
+    mov esi, 52
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0
+    mov dword [rdi + 8], 148500               ; dotclock, kHz
+    mov ax, [screen_w]
+    mov [rdi + 12], ax                        ; hdisplay
+    mov word [rdi + 14], 2008                 ; hsyncstart
+    mov word [rdi + 16], 2052                 ; hsyncend
+    mov word [rdi + 18], 2200                 ; htotal
+    mov word [rdi + 20], 0                    ; hskew
+    mov ax, [screen_h]
+    mov [rdi + 22], ax                        ; vdisplay
+    mov word [rdi + 24], 1084                 ; vsyncstart
+    mov word [rdi + 26], 1089                 ; vsyncend
+    mov word [rdi + 28], 1125                 ; vtotal
+    mov dword [rdi + 48], 0                   ; privsize: no private data
+    jmp .vm_write
+
+.vm_write:
+    lea rsi, [reply_buf]
+    mov edi, r15d
+    mov edx, r8d
+    mov eax, SYS_WRITE
+    syscall
+    ret
+
 handle_randr:
     movzx eax, byte [rsi + 1]                ; RANDR minor opcode
     cmp eax, 0                               ; QueryVersion
