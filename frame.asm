@@ -1928,7 +1928,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.18", 10
+version_str:        db "frame 0.1.19", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -8079,6 +8079,10 @@ handle_randr:
     je .rr_select_input                      ; but record the notify window
     cmp eax, 32                              ; GetProviders (RandR 1.4) — Firefox
     je .rr_get_providers                     ; probes GPU providers; empty is fine
+    cmp eax, 10                              ; ListOutputProperties — xrandr
+    je .rr_list_output_props                 ; --verbose BLOCKS on this
+    cmp eax, 11                              ; QueryOutputProperty — the usual
+    je .rr_query_output_prop                 ; follow-up, same trap
     cmp eax, 28                              ; GetPanning — xrandr 1.5 asks per
     je .rr_get_panning                       ; crtc and blocks; zeros = disabled
     cmp eax, 27                              ; GetCrtcTransform — ditto; reply
@@ -8197,6 +8201,28 @@ handle_randr:
     call xkb_reply_zero
     mov byte [rdi + 1], 0                    ; status = Success
     mov dword [rdi + 8], 1                   ; timestamp
+    jmp .rr_write
+
+.rr_list_output_props:
+    ; RRListOutputProperties reply: +8 nAtoms (u16 = 0). frame's one output
+    ; carries no RandR properties, so an empty list is the truthful answer.
+    ; Without it `xrandr --verbose` hung against frame every time: the
+    ; request carries a reply and the client waits forever for it.
+    mov esi, 32
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0
+    mov word [rdi + 8], 0                     ; nAtoms
+    jmp .rr_write
+
+.rr_query_output_prop:
+    ; RRQueryOutputProperty reply: +8 pending, +9 range, +10 immutable, then
+    ; the valid values. No properties exist, so all false and none.
+    mov esi, 32
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0
+    mov byte [rdi + 8], 0                     ; pending
+    mov byte [rdi + 9], 0                     ; range
+    mov byte [rdi + 10], 0                    ; immutable
     jmp .rr_write
 
 .rr_get_providers:
