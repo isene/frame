@@ -1929,7 +1929,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.21", 10
+version_str:        db "frame 0.1.22", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -5601,6 +5601,8 @@ dispatch_request:
     je .dr_alloc_color                       ; reply-carrying; scrot -s blocks
     cmp eax, 85                              ; on 'gray' for its rubber band
     je .dr_alloc_named_color
+    cmp eax, 92                              ; LookupColor: same name table
+    je .dr_alloc_named_color
     cmp eax, 38
     je .dr_query_pointer
     cmp eax, 40
@@ -5680,6 +5682,8 @@ dispatch_request:
     je .dr_done
     cmp eax, 115                             ; ForceScreenSaver (mpv's inhibit)
     je .dr_done
+    cmp eax, 104                             ; Bell: no speaker to ring
+    je .dr_done
     cmp eax, 94                              ; CreateGlyphCursor
     jne .dr_not_gcur
     mov rsi, r12
@@ -5692,6 +5696,12 @@ dispatch_request:
     call handle_create_pixmap_cursor
     jmp .dr_done
 .dr_not_pcur:
+    mov edi, ebx
+    mov rsi, r12
+    call core_reply_fallback
+    test eax, eax
+    jnz .dr_done
+    movzx eax, byte [r12]
     ; Unhandled — log it (the only requests still logged; each one is a
     ; protocol gap worth knowing about).
     push rax
@@ -7709,6 +7719,10 @@ handle_xkb:
     mov esi, 92                              ; fixed size incl. perKeyRepeat[32]
     call xkb_reply_zero
     mov byte [rdi + 9], 1                    ; numGroups = 1
+    ; Key repeat comes from the kernel (evdev defaults 250 ms / 33 ms).
+    ; An interval of 0 crashed `xset q`, which divides 1000 by it.
+    mov word [rdi + 20], 250                 ; repeatDelay
+    mov word [rdi + 22], 33                  ; repeatInterval
     jmp .xkb_reply_write
 .xkb_get_compat_map:
     mov esi, 32                              ; groups=0, nSI=0 → no body
@@ -8080,6 +8094,113 @@ handle_translate_coordinates:
 ; BadImplementation rather than silence, so no client can hang the way
 ; xdpyinfo did on RENDER and xrandr did on RandR.
 ; ============================================================================
+; ----------------------------------------------------------------------------
+; core_reply_fallback — edi = slot, rsi = req. The core requests frame does
+; not implement but that carry a reply. An unanswered one hangs the client
+; for good (import hung on QueryColors), so each gets the answer a server
+; with no core fonts and one TrueColor visual would give. Errors only where
+; Xlib expects one and returns failure quietly (BadAlloc here); any other
+; error makes Xlib's default handler exit the app. eax = 1 if answered.
+; ----------------------------------------------------------------------------
+core_reply_fallback:
+    push rbx
+    push r12
+    push r15
+    mov ebx, edi
+    mov r12, rsi
+    movzx eax, byte [rsi]
+    cmp eax, 91                              ; QueryColors
+    je .crf_query_colors
+    mov esi, 60
+    cmp eax, 50                              ; ListFontsWithInfo: end of list
+    je .crf_empty
+    mov esi, 32
+    cmp eax, 39                              ; GetMotionEvents: no history
+    je .crf_empty
+    cmp eax, 48                              ; QueryTextExtents: zero size
+    je .crf_empty
+    cmp eax, 49                              ; ListFonts: no fonts
+    je .crf_empty
+    cmp eax, 52                              ; GetFontPath: empty
+    je .crf_empty
+    cmp eax, 116                             ; SetPointerMapping: Success
+    je .crf_empty
+    mov esi, 11                              ; BadAlloc
+    cmp eax, 86                              ; AllocColorCells
+    je .crf_error
+    cmp eax, 87                              ; AllocColorPlanes
+    je .crf_error
+    xor eax, eax
+    jmp .crf_ret
+
+.crf_error:
+    mov r8d, eax                             ; major = the core opcode
+    mov edi, ebx
+    xor edx, edx
+    xor ecx, ecx
+    call send_error
+    jmp .crf_yes
+
+.crf_empty:
+    mov edi, ebx
+    call xkb_reply_zero
+    mov byte [rdi + 1], 0
+    jmp .crf_write
+
+.crf_query_colors:
+    ; One TrueColor visual: a pixel IS its colour, 0xRRGGBB.
+    movzx ecx, word [r12 + 2]
+    sub ecx, 2                               ; pixels after the 8-byte header
+    jns .crf_qc_n
+    xor ecx, ecx
+.crf_qc_n:
+    cmp ecx, 2000                            ; 32 + 8n must fit reply_buf
+    jbe .crf_qc_fit
+    mov ecx, 2000
+.crf_qc_fit:
+    push rcx
+    lea esi, [rcx*8 + 32]
+    mov edi, ebx
+    call xkb_reply_zero
+    pop rcx
+    mov byte [rdi + 1], 0
+    mov [rdi + 8], cx                        ; nColors
+    lea rsi, [r12 + 8]
+    lea rdx, [rdi + 32]
+.crf_qc_loop:
+    test ecx, ecx
+    jz .crf_write
+    mov eax, [rsi]
+    movzx r9d, al
+    imul r9d, 257
+    mov [rdx + 4], r9w                       ; blue
+    shr eax, 8
+    movzx r9d, al
+    imul r9d, 257
+    mov [rdx + 2], r9w                       ; green
+    shr eax, 8
+    movzx r9d, al
+    imul r9d, 257
+    mov [rdx], r9w                           ; red
+    add rsi, 4
+    add rdx, 8
+    dec ecx
+    jmp .crf_qc_loop
+
+.crf_write:
+    lea rsi, [reply_buf]
+    mov edi, r15d
+    mov edx, r8d
+    mov eax, SYS_WRITE
+    syscall
+.crf_yes:
+    mov eax, 1
+.crf_ret:
+    pop r15
+    pop r12
+    pop rbx
+    ret
+
 handle_vidmode:
     movzx eax, byte [rsi + 1]                ; vidmode minor opcode
     cmp eax, 0                               ; QueryVersion
@@ -9679,6 +9800,9 @@ handle_alloc_color:
 ;   reply: pixel@8, exactR/G/B@12,14,16, visualR/G/B@18,20,22
 ; Small name table (X11 rgb.txt values); unknown names resolve to white —
 ; a wrong colour beats a hung client (scrot -s asks for "gray").
+; Also serves LookupColor (92): same request layout, the reply drops the
+; pixel so the channels start at 8, and an unknown name is BadName, which
+; Xlib turns into a quiet "unknown colour" instead of exiting.
 handle_alloc_named_color:
     push rbx
     push r12
@@ -9688,8 +9812,7 @@ handle_alloc_named_color:
     movzx ecx, word [r12 + 8]                ; name length
     lea rsi, [r12 + 12]                      ; name bytes
     lea rdi, [color_names]
-    xor r13d, r13d                           ; default: white (table entry 0 fallback)
-    mov r13d, 0xFFFFFF
+    mov r13d, -1                             ; not found yet
 .anc_scan:
     movzx eax, byte [rdi]                    ; table entry name length (0 = end)
     test eax, eax
@@ -9725,6 +9848,20 @@ handle_alloc_named_color:
     lea rdi, [rdi + rax + 1 + 4]             ; skip name + rgb dword
     jmp .anc_scan
 .anc_have:
+    cmp r13d, -1
+    jne .anc_found
+    cmp byte [r12], 92
+    jne .anc_white
+    mov edi, ebx
+    mov esi, 15                              ; BadName
+    xor edx, edx
+    xor ecx, ecx
+    mov r8d, 92
+    call send_error
+    jmp .anc_ret
+.anc_white:
+    mov r13d, 0xFFFFFF                       ; AllocNamedColor: white
+.anc_found:
     mov eax, ebx
     call client_meta_addr
     push rax
@@ -9740,30 +9877,36 @@ handle_alloc_named_color:
     mov [rdi + 2], cx
     push rax
     mov [rdi + 8], r13d                      ; pixel
+    lea rdx, [rdi + 4]                       ; AllocNamedColor: channels at 12
+    cmp byte [r12], 92
+    jne .anc_layout
+    mov rdx, rdi                             ; LookupColor: channels at 8
+.anc_layout:
     ; 16-bit channel values = 8-bit << 8 (echoed as both exact and visual)
     mov ecx, r13d
     shr ecx, 16
     and ecx, 0xFF
     mov ch, cl                               ; r*0x101 ≈ r<<8|r
-    mov [rdi + 12], cx                       ; exactRed
-    mov [rdi + 18], cx                       ; visualRed
+    mov [rdx + 8], cx                        ; exactRed
+    mov [rdx + 14], cx                       ; visualRed
     mov ecx, r13d
     shr ecx, 8
     and ecx, 0xFF
     mov ch, cl
-    mov [rdi + 14], cx                       ; exactGreen
-    mov [rdi + 20], cx                       ; visualGreen
+    mov [rdx + 10], cx                       ; exactGreen
+    mov [rdx + 16], cx                       ; visualGreen
     mov ecx, r13d
     and ecx, 0xFF
     mov ch, cl
-    mov [rdi + 16], cx                       ; exactBlue
-    mov [rdi + 22], cx                       ; visualBlue
+    mov [rdx + 12], cx                       ; exactBlue
+    mov [rdx + 18], cx                       ; visualBlue
     pop rax
     mov edi, [rax]
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
     mov edx, 32
     syscall
+.anc_ret:
     pop r13
     pop r12
     pop rbx
