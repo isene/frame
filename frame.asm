@@ -1929,7 +1929,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.20", 10
+version_str:        db "frame 0.1.21", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -27836,6 +27836,49 @@ present_execute:
     ret
 
 ; ----------------------------------------------------------------------------
+; dma_flush_rows — rdi = pixmap record, esi = w, edx = h. Drops the CPU's
+; cached copy of the rows about to be read. On chips where the GPU does not
+; share the CPU cache (Arrow Lake, Meteor Lake), the kernel's sync call
+; leaves old lines in the cache, and a scrolling Firefox or Chromium showed
+; dashes of earlier frames. clwb would keep the stale line, so this uses
+; clflushopt when detect_flush_kind found it (kind 1 or 2), else clflush.
+; ----------------------------------------------------------------------------
+dma_flush_rows:
+    mov r9, rdi
+    mov r10d, edx
+    mov r11d, esi
+    movzx r8d, word [r9 + 4]
+    shl r8, 2                                ; row pitch in bytes
+    mov rdi, [r9 + 16]                       ; first row
+    lea rsi, [r11*4]                         ; bytes per row to flush
+.dfr_row:
+    test r10d, r10d
+    jz .dfr_done
+    mov rax, rdi
+    and rax, -64
+    lea rdx, [rdi + rsi]
+    cmp byte [flush_kind], 0
+    je .dfr_plain
+.dfr_opt:
+    clflushopt [rax]
+    add rax, 64
+    cmp rax, rdx
+    jb .dfr_opt
+    jmp .dfr_next
+.dfr_plain:
+    clflush [rax]
+    add rax, 64
+    cmp rax, rdx
+    jb .dfr_plain
+.dfr_next:
+    add rdi, r8
+    dec r10d
+    jmp .dfr_row
+.dfr_done:
+    mfence
+    ret
+
+; ----------------------------------------------------------------------------
 ; present_copy — esi = window, edx = pixmap, ecx = x_off, r8d = y_off.
 ; Rows from the pixmap into the window backing, clipped to both. A dma-buf
 ; pixmap is bracketed with DMA_BUF_IOCTL_SYNC so the GPU's writes are done
@@ -27906,6 +27949,10 @@ present_copy:
     lea rdx, [dma_sync]
     mov eax, SYS_IOCTL
     syscall
+    mov rdi, rbx
+    mov esi, [rsp]
+    mov edx, [rsp + 4]
+    call dma_flush_rows
 .pcp_copy:
     xor r10d, r10d                           ; row
 .pcp_row:
