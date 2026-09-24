@@ -1930,7 +1930,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.23", 10
+version_str:        db "frame 0.1.24", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -8989,10 +8989,18 @@ handle_xinput:
 
 .xi_query_pointer:                            ; XI2 form of QueryPointer (56-byte reply)
     push rbx
+    push r12
     push r13
     push r14
     mov ebx, edi                              ; slot
     mov edi, [rsi + 4]                        ; queried window
+    ; child, as in core QueryPointer. It was always None: after every
+    ; click GTK3 asks this to find the toplevel under the pointer, got
+    ; "none", and dropped every wheel event until the pointer re-entered.
+    push rdi
+    call child_of_under_pointer               ; eax = child xid (0 = none)
+    mov r12d, eax
+    pop rdi
     call window_abs_xy                        ; r10d=abs x, r11d=abs y
     mov r13d, [cursor_x]
     sub r13d, r10d                            ; win_x (pixels)
@@ -9007,7 +9015,7 @@ handle_xinput:
     pop r13
     mov byte [rdi + 1], 0
     mov dword [rdi + 8], X_ROOT_WINDOW         ; root
-    mov dword [rdi + 12], 0                    ; child = None
+    mov [rdi + 12], r12d                       ; child
     mov eax, [cursor_x]
     shl eax, 16
     mov [rdi + 16], eax                        ; root_x (FP1616)
@@ -9030,6 +9038,7 @@ handle_xinput:
     syscall
     pop r14
     pop r13
+    pop r12
     pop rbx
     ret
 
