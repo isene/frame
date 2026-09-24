@@ -1103,6 +1103,7 @@ pr_msc:             resq 1               ; frame counter handed to GL clients
 pr_last_tick:       resq 1               ; mono ms of the last tick
 pr_evbuf:           resb 40              ; Present GenericEvent scratch
 dma_sync:           resq 1               ; struct dma_buf_sync { u64 flags }
+root_prop_sel:      resb MAX_CLIENTS     ; 1 = client selected PropertyChange on root
 fstat_buf:          resb 144             ; struct stat (st_size at +48)
 dp_args:            resd 8               ; dma_pixmap_create arguments: +0 pid,
                                          ; +4 w, +8 h, +12 stride, +16 offset,
@@ -1929,7 +1930,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.22", 10
+version_str:        db "frame 0.1.23", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -4187,6 +4188,7 @@ client_alloc:
     mov dword [clients_meta + rax + 16], 0   ; buf_pos (first unconsumed byte)
     mov dword [clients_meta + rax + 20], 0   ; flags (CL_FLAG_DRI3)
     mov byte [cl_fd_n + rbx], 0              ; no passed fds queued
+    mov byte [root_prop_sel + rbx], 0        ; a new client has selected nothing
     call slots_watch                         ; DIAG: 3/4-full early warning
     mov eax, ebx
     pop r12
@@ -11046,6 +11048,15 @@ handle_change_window_attributes:
     ; fortitray on the panel).
     test dword [r12 + 8], 0x800              ; CW_EVENT_MASK in value-mask?
     jz .cwa_done
+    ; Root's mask is shared, so remember per client who asked for root
+    ; PropertyNotify; send_property_notify sends only to those.
+    cmp dword [r13], X_ROOT_WINDOW
+    jne .cwa_not_root_prop
+    xor eax, eax
+    test r8d, EM_PROPERTY_CHANGE
+    setnz al
+    mov [root_prop_sel + rbx], al
+.cwa_not_root_prop:
     test r8d, EM_SUBSTRUCTURE_REDIRECT
     jz .cwa_clear_redirect
     movsx eax, byte [r13 + 30]
@@ -12095,9 +12106,10 @@ handle_delete_property:
 ; send_property_notify — edi = window xid, esi = atom, edx = state (0/1).
 ; PropertyNotify (28): +4 window, +8 atom, +12 time, +16 state.
 ; Emits to the window's owner client if PropertyChangeMask is in the
-; window's (combined) event mask. Root properties broadcast to every
-; live client (frame keeps one mask per window; root has many
-; listeners, e.g. strip watching tile's EWMH properties).
+; window's (combined) event mask. Root properties go to every client
+; that selected PropertyChange on root (root_prop_sel; frame keeps one
+; mask per window, and root has many listeners, e.g. strip watching
+; tile's EWMH properties).
 ; ----------------------------------------------------------------------------
 send_property_notify:
     push rbx
@@ -12157,6 +12169,11 @@ send_property_notify:
     je .spn_root_next
     cmp byte [rax + 4], CSTATE_RUNNING       ; never write events into a
     jne .spn_root_next                       ; handshake still in progress
+    ; Only clients that selected PropertyChange on root. The broadcast
+    ; to every client woke each glass on every focus change, and landed
+    ; in a new glass's first round trip, which then spun forever.
+    cmp byte [root_prop_sel + rbx], 0
+    je .spn_root_next
     mov edi, ebx
     lea rsi, [pn_buf]
     call send_event_to_slot
