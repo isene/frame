@@ -70,7 +70,11 @@ DEFAULT REL
 %define SIGHUP          1
 %define SIGUSR1         10
 %define SIGUSR2         12
+%define SIGILL          4
+%define SIGBUS          7
+%define SIGSEGV         11
 %define SA_RESTORER     0x04000000
+%define SA_RESETHAND    0x80000000
 %define SYS_SOCKET      41
 %define SYS_BIND        49
 %define SYS_LISTEN      50
@@ -495,7 +499,9 @@ bws_abs_y:          resd 1
 sih_result:         resb 1                 ; shape_input_hit scratch flag
 framerc_path:       resb 256               ; "$HOME/.framerc"
 framerc_buf:        resb 2048              ; ~/.framerc contents
-WALL_MAX            equ 1920*1200*4        ; max backing for the wallpaper (panel res)
+WALL_MAX            equ 7680*2160*4        ; max backing for the wallpaper: the whole
+                                           ; fb, so two 4K outputs side by side. BSS
+                                           ; pages cost nothing until a wallpaper loads
 wallpaper_buf:      resb WALL_MAX          ; the raw BGRX pixels, read from the file once
 rc_remaps:          resb 16 * 28           ; staged `keycode` lines: keycode
                                            ; dword + 6 keysym dwords each
@@ -1930,7 +1936,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.24", 10
+version_str:        db "frame 0.1.25", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -6178,6 +6184,18 @@ handle_intern_atom:
     add rax, rcx                             ; earlier requests in the buffer
     mov r13, rax                             ; request ptr
     movzx r14d, word [r13 + 4]               ; n
+    ; Clamp n to the bytes the request holds, so a lying n cannot intern
+    ; stale buffer bytes past the request's end (AntiqueH, frame PR #2).
+    movzx eax, word [r13 + 2]
+    shl eax, 2
+    sub eax, 8                               ; bytes after the 8-byte header
+    jge .ha_avail
+    xor eax, eax
+.ha_avail:
+    cmp r14d, eax
+    jbe .ha_n_ok
+    mov r14d, eax
+.ha_n_ok:
     lea r15, [r13 + 8]                       ; name ptr
     movzx ecx, byte [r13 + 1]                ; only-if-exists
 
@@ -10066,6 +10084,19 @@ handle_get_keyboard_mapping:
 
     movzx r14d, byte [r13 + 4]               ; first-keycode
     movzx ecx, byte [r13 + 5]                ; count
+    ; Clamp the range to keysym_table. first < 8 underflowed the index, and
+    ; first+count > 256 read past the table (AntiqueH, frame PR #2).
+    cmp r14d, X_MIN_KEYCODE
+    jae .gkm_first_ok
+    xor ecx, ecx
+    jmp .gkm_range_ok
+.gkm_first_ok:
+    mov eax, X_MAX_KEYCODE + 1
+    sub eax, r14d                            ; keycodes left in the table
+    cmp ecx, eax
+    jbe .gkm_range_ok
+    mov ecx, eax
+.gkm_range_ok:
 
     ; Header.
     lea rdi, [reply_buf]
@@ -11971,6 +12002,18 @@ handle_change_property:
     shl ecx, 2
 .cp_n_set:
     mov r13d, ecx                            ; nbytes for new data
+    ; Clamp nbytes to the bytes the request holds, so a lying length cannot
+    ; copy stale buffer bytes into a property (AntiqueH, frame PR #2).
+    movzx eax, word [r12 + 2]
+    shl eax, 2
+    sub eax, 24                              ; bytes after the 24-byte header
+    jge .cp_avail
+    xor eax, eax
+.cp_avail:
+    cmp r13d, eax
+    jbe .cp_len_ok
+    mov r13d, eax
+.cp_len_ok:
 
     ; Allocate / fetch record.
     mov edi, [r12 + 4]                       ; window
@@ -13481,6 +13524,13 @@ init_keysyms:
 ; the lid still suspends (battery). Kernel releases the grab on fd close.
 ; ----------------------------------------------------------------------------
 maybe_grab_input:
+    ; Grab only when frame owns the real panel (--display, no --fbtest). A
+    ; headless or fbtest frame grabbing the live keyboard froze the console
+    ; (AntiqueH, frame PR #2). Ungrabbed devices still feed both.
+    cmp byte [compositor_requested], 0
+    je .mg_ret
+    cmp byte [fbtest_mode], 0
+    jne .mg_ret
     push rbx
     mov ebx, edi                             ; save fd
     ; EVIOCGBIT(0, 4): supported event-type bitmap → byte 0.
@@ -13516,6 +13566,7 @@ maybe_grab_input:
     syscall
 .mg_done:
     pop rbx
+.mg_ret:
     ret
 
 ; ----------------------------------------------------------------------------
@@ -17006,6 +17057,14 @@ init_compositor:
     call install_exit_handler
     mov edi, SIGHUP
     call install_exit_handler
+    ; A crash while we hold DRM master left the panel black. Restore the
+    ; console first, then die of the same signal (AntiqueH, frame PR #2).
+    mov edi, SIGSEGV
+    call install_crash_handler
+    mov edi, SIGBUS
+    call install_crash_handler
+    mov edi, SIGILL
+    call install_crash_handler
 
     ; Log what we got so we can verify mode/pitch/size after the fact.
     mov rsi, log_prefix
@@ -19163,7 +19222,8 @@ load_wallpaper:
     mov eax, [screen_w]
     imul eax, [screen_h]
     cmp eax, WALL_MAX / 4
-    ja .lw_close_none                         ; panel bigger than our buffer
+    ja .lw_none                               ; panel bigger than our buffer (no fd
+                                              ; yet, so never the close path)
     shl eax, 2
     mov r12d, eax                             ; r12 = expected bytes
     mov rax, SYS_OPEN
@@ -19934,22 +19994,31 @@ comp_unblank:
 ; since we're libc-free).
 ; ----------------------------------------------------------------------------
 install_exit_handler:
-    push rdi
-    lea rdi, [sig_sa_buf]
     lea rax, [exit_handler]
-    mov [rdi + 0], rax                       ; sa_handler
-    mov qword [rdi + 8], SA_RESTORER         ; sa_flags
-    lea rax, [sig_restorer]
-    mov [rdi + 16], rax                      ; sa_restorer
-    mov qword [rdi + 24], 0                  ; sa_mask
-    pop rdi                                   ; signum
-    mov rax, SYS_RT_SIGACTION
-    ; rdi = signum already
+    mov edx, SA_RESTORER
+    jmp install_handler
+; install_crash_handler — edi = signum. SA_RESETHAND puts the default action
+; back on entry, so crash_handler's return re-runs the faulting instruction:
+; the kernel logs the fault, dumps core, and frame dies of the real signal.
+install_crash_handler:
+    lea rax, [crash_handler]
+    mov edx, SA_RESTORER | SA_RESETHAND      ; imm32, zero-extends into rdx
+install_handler:                             ; edi = signum, rax = handler, rdx = flags
     lea rsi, [sig_sa_buf]
+    mov [rsi + 0], rax                       ; sa_handler
+    mov [rsi + 8], rdx                       ; sa_flags
+    lea rax, [sig_restorer]
+    mov [rsi + 16], rax                      ; sa_restorer
+    mov qword [rsi + 24], 0                  ; sa_mask
+    mov eax, SYS_RT_SIGACTION
     xor edx, edx                             ; oldact = NULL
-    mov r10, 8                               ; sigsetsize
+    mov r10d, 8                              ; sigsetsize
     syscall
     ret
+
+crash_handler:
+    call compositor_shutdown                 ; console CRTC back, DRM master dropped
+    ret                                      ; → sig_restorer → re-fault, default action
 
 sig_restorer:
     mov rax, SYS_RT_SIGRETURN
