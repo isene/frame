@@ -1124,6 +1124,7 @@ dents_buf:          resb 1024            ; getdents64 scratch
 ; XI2 raw motion: clients that selected XI_RawMotion on the root (GLFW's
 ; mouse look). slot+1 per entry, 0 = empty. raw_n gates the send path.
 raw_slots:          resb 4
+raw_devs:           resw 4               ; deviceid each raw selection named
 raw_n:              resb 1
 xise_slot:          resd 1               ; XISelectEvents caller
 raw_delta:          resd 1               ; unscaled evdev delta of this event
@@ -1936,7 +1937,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.25", 10
+version_str:        db "frame 0.1.26", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -8766,6 +8767,8 @@ handle_xinput:
     je .xi_query_pointer
     cmp eax, 42                              ; XIChangeCursor — GTK's set_cursor
     je .xi_change_cursor                     ; (XI2 mode never sends core CWA)
+    cmp eax, 41                              ; XIWarpPointer — SDL3 (Minecraft)
+    je .xi_warp_pointer
     ; --- DIAG (temp): log unhandled XI minor opcode ---
     push rax
     mov rsi, log_xi_minor
@@ -8777,6 +8780,16 @@ handle_xinput:
     mov edx, 1
     call write_stderr
     ret
+
+.xi_warp_pointer:
+    ; XIWarpPointer (41, void): +8 dst window, +24 dst_x and +28 dst_y as
+    ; FP16.16. The same move as core WarpPointer.
+    mov eax, [rsi + 8]
+    mov ecx, [rsi + 24]
+    sar ecx, 16
+    mov edx, [rsi + 28]
+    sar edx, 16
+    jmp warp_pointer_to
 
 .xi_change_cursor:
     ; XIChangeCursor (42, void): +4 window, +8 cursor, +12 deviceid u16.
@@ -8841,34 +8854,44 @@ handle_xinput:
     lea rsi, [rbx + 12]
 .xise_entry:
     test r12d, r12d
-    jz .xise_raw
+    jz .xise_done
     lea rax, [rsi + 4]
     cmp rax, r14                              ; header word in bounds?
     ja .xise_done
     movzx ecx, word [rsi + 2]                ; mask_len (words)
+    xor eax, eax                             ; no mask = deselect this device
     test ecx, ecx
-    jz .xise_next
+    jz .xise_have_mask
     lea rax, [rsi + 4 + rcx*4]
     cmp rax, r14                              ; mask body in bounds?
     ja .xise_done
     mov eax, [rsi + 4]                       ; mask word 0
     or [r13 + 52], eax
+.xise_have_mask:
+    ; RawMotion (bit 17) on the root, kept per client AND device, so a
+    ; game's mouse look gets the unclamped deltas. SDL3 selects raw motion
+    ; for AllMasterDevices, then HierarchyChanged alone for AllDevices; X
+    ; keeps those apart. Judging the window's one mask dropped the first
+    ; and killed Minecraft's mouse look.
+    cmp dword [r13], X_ROOT_WINDOW
+    jne .xise_next
+    push rsi
+    push rcx
+    mov edi, [xise_slot]
+    movzx esi, word [rsi]                    ; deviceid
+    bt eax, 17
+    jc .xise_raw_add
+    call raw_del
+    jmp .xise_raw_done
+.xise_raw_add:
+    call raw_add
+.xise_raw_done:
+    pop rcx
+    pop rsi
 .xise_next:
     lea rsi, [rsi + 4 + rcx*4]
     dec r12d
     jmp .xise_entry
-.xise_raw:
-    ; RawMotion (bit 17) on the root: remember who asked, per client, so a
-    ; game's mouse look gets the unclamped deltas.
-    cmp dword [r13], X_ROOT_WINDOW
-    jne .xise_done
-    mov edi, [xise_slot]
-    bt dword [r13 + 52], 17
-    jc .xise_raw_add
-    call raw_del
-    jmp .xise_done
-.xise_raw_add:
-    call raw_add
 .xise_done:
     pop r14
     pop r13
@@ -9980,10 +10003,13 @@ handle_query_keymap:
 ; synthetic absolute pointer move a silent no-op. Moves the sprite and
 ; delivers MotionNotify like real motion (src-window confinement ignored).
 handle_warp_pointer:
-    push rbx
     mov eax, [rsi + 8]                       ; dst window
     movsx ecx, word [rsi + 20]               ; dst-x
     movsx edx, word [rsi + 22]               ; dst-y
+; warp_pointer_to — eax = dst window (0 = relative move), ecx/edx = x/y.
+; XIWarpPointer enters here too.
+warp_pointer_to:
+    push rbx
     test eax, eax
     jz .hwp_relative
     push rcx
@@ -27059,6 +27085,7 @@ gpu_client_cleanup:
     mov edi, r12d
     call cl_fd_flush
     mov edi, r12d
+    mov esi, -1                              ; whatever device it named
     call raw_del
     lea r13d, [r12 + 1]                      ; owner tag slot+1
     ; GLXWindows: by xid band.
@@ -28470,7 +28497,8 @@ present_configure_notify:
     ret
 
 ; ----------------------------------------------------------------------------
-; raw_add / raw_del — edi = slot. The XI_RawMotion subscriber list.
+; raw_add / raw_del — edi = slot, esi = the deviceid the selection names
+; (raw_del: -1 = any, for a client that left). The XI_RawMotion list.
 ; ----------------------------------------------------------------------------
 raw_add:
     inc edi
@@ -28479,9 +28507,9 @@ raw_add:
     cmp ecx, 4
     jae .ra_done
     cmp [raw_slots + rcx], dil
-    je .ra_done                              ; already listed
-    inc ecx
-    jmp .ra_loop
+    je .ra_set_dev                           ; already listed (it used to be
+    inc ecx                                  ; listed twice: every event sent
+    jmp .ra_loop                             ; twice)
 .ra_done:
     xor ecx, ecx
 .ra_find:
@@ -28491,6 +28519,8 @@ raw_add:
     jne .ra_next
     mov [raw_slots + rcx], dil
     inc byte [raw_n]
+.ra_set_dev:
+    mov [raw_devs + rcx*2], si
     ret
 .ra_next:
     inc ecx
@@ -28506,6 +28536,11 @@ raw_del:
     jae .rd_ret
     cmp [raw_slots + rcx], dil
     jne .rd_next
+    cmp esi, -1
+    je .rd_drop
+    cmp [raw_devs + rcx*2], si
+    jne .rd_ret                              ; raw motion rides another device
+.rd_drop:
     mov byte [raw_slots + rcx], 0
     dec byte [raw_n]
     ret
