@@ -786,6 +786,9 @@ co_dst_ptr:         resq 1
 co_dst_stride:      resd 1
 co_dst_h:           resd 1
 co_fast:            resd 1               ; 1 = scale-only composite fast path
+co_prev_src:        resq 1               ; fast path: source row the row above
+                                         ; sampled, 0 = not reusable
+co_prev_dst:        resq 1               ; fast path: where that row went
 flush_kind:         resb 1               ; 0 clflush, 1 clflushopt, 2 clwb (cpuid at start)
 rs_rect_opaque:     resb 1               ; this damage rect lies under an opaque window
 tz_dst_ptr:         resq 1               ; render_trapezoids: dst backing
@@ -1968,7 +1971,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.29", 10
+version_str:        db "frame 0.1.30", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -26021,6 +26024,7 @@ render_composite:
 .rc_fast_yes:
     mov dword [co_fast], 1
 .rc_fast_decided:
+    mov qword [co_prev_src], 0
     xor r14d, r14d                              ; dy = 0
 .rc_row:
     movzx eax, word [rbx + 34]                  ; height
@@ -26157,9 +26161,9 @@ render_composite:
     ; dst row base → rbp
     movsx eax, word [rbx + 30]                  ; yDst
     add eax, r14d                                ; dsty
-    js .rc_row_next
+    js .rc_fast_skip_row
     cmp eax, [co_dst_h]
-    jge .rc_row_next
+    jge .rc_fast_skip_row
     imul eax, [co_dst_stride]
     mov rbp, [co_dst_ptr]
     lea rbp, [rbp + rax*4]
@@ -26177,9 +26181,9 @@ render_composite:
     sar rax, 16
 .rc_fast_sy_ok:
     test rax, rax
-    js .rc_row_next
+    js .rc_fast_skip_row
     cmp eax, [co_src_h]
-    jge .rc_row_next
+    jge .rc_fast_skip_row
     imul eax, [co_src_stride]
     mov r11, [co_src_ptr]
     lea r11, [r11 + rax*4]
@@ -26199,11 +26203,31 @@ render_composite:
     mov edx, r8d
 .rc_fast_dx1_ok:
     sub edx, eax                                 ; n = dx1 - dx0
-    jle .rc_row_next
+    jle .rc_fast_skip_row
     mov r9d, edx                                 ; n, kept in ecx below
     add ecx, eax                                 ; dstx0
     movsxd rcx, ecx
     lea rbp, [rbp + rcx*4]
+    ; Scaling up repeats each source row over several destination rows.
+    ; When the row above sampled this same source row and stored every
+    ; pixel as it was (no blend, nothing skipped), this row equals it:
+    ; copy it instead of sampling again.
+    cmp r11, [co_prev_src]
+    jne .rc_fast_fresh
+    mov rsi, [co_prev_dst]
+    mov rdi, rbp
+    mov ecx, r9d
+    rep movsd
+    mov [co_prev_dst], rbp
+    jmp .rc_row_next
+.rc_fast_fresh:
+    mov qword [co_prev_src], 0
+    mov rcx, [co_src_ptr]                        ; a copy within one buffer
+    cmp rcx, [co_dst_ptr]                        ; may read what it wrote
+    je .rc_fast_acc
+    mov [co_prev_src], r11
+    mov [co_prev_dst], rbp
+.rc_fast_acc:
     ; acc = m11 * (xSrc + dx0) + m13, as 48.16; step = m11 → rdx
     movsx rcx, word [rbx + 20]                  ; xSrc
     add rcx, rax
@@ -26227,9 +26251,9 @@ render_composite:
 .rc_fast_col:
     mov rax, r15
     sar rax, 16                                  ; sx
-    js .rc_fast_next
+    js .rc_fast_impure
     cmp eax, r8d
-    jge .rc_fast_next
+    jge .rc_fast_impure
     mov esi, [r11 + rax*4]                       ; src ARGB
     cmp r12d, 1                                  ; Src: copy
     je .rc_fast_store
@@ -26238,7 +26262,8 @@ render_composite:
     cmp eax, 255
     je .rc_fast_store
     test eax, eax
-    jz .rc_fast_next
+    jz .rc_fast_impure
+    mov qword [co_prev_src], 0                   ; blended: not a copy
     mov rdi, rbp
     push rcx
     push rdx
@@ -26256,6 +26281,12 @@ render_composite:
     add rbp, 4
     dec ecx
     jnz .rc_fast_col
+    jmp .rc_row_next
+.rc_fast_impure:
+    mov qword [co_prev_src], 0                   ; left a pixel as it was
+    jmp .rc_fast_next
+.rc_fast_skip_row:
+    mov qword [co_prev_src], 0
 .rc_row_next:
     inc r14d
     jmp .rc_row
