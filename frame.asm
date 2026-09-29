@@ -114,6 +114,12 @@ DEFAULT REL
 %define DRM_IOCTL_MODE_GETCONNECTOR    0xC05064A7
 %define DRM_IOCTL_MODE_ADDFB           0xC01C64AE
 %define DRM_IOCTL_MODE_RMFB            0xC00464AF
+%define DRM_IOCTL_MODE_ADDFB2          0xC06864B8   ; _IOWR('d',0xB8,104)
+%define DRM_IOCTL_PRIME_FD_TO_HANDLE   0xC00C642E   ; _IOWR('d',0x2E,12)
+%define DRM_IOCTL_GEM_CLOSE            0x40086409   ; _IOW('d',0x09,8)
+%define DRM_FORMAT_XRGB8888            0x34325258   ; 'XR24'
+%define DRM_MODE_FB_MODIFIERS          2
+%define DS_REC                         24           ; direct-scanout record
 %define DRM_IOCTL_MODE_DIRTYFB         0xC01864B7
 %define DRM_IOCTL_MODE_PAGE_FLIP       0xC01864B0
 %define DRM_MODE_PAGE_FLIP_EVENT       0x01
@@ -1065,6 +1071,22 @@ fbtest_mode:        resb 1               ; --fbtest: composite into plain
 comp_px_blit:       resq 1               ; PERF counters (SIGUSR1 report):
 comp_px_fill:       resq 1               ; pixels blitted / bg-filled /
 comp_px_flush:      resq 1               ; bytes cache-flushed since start
+; Direct scanout (framerc direct_scanout = 1): see ds_hold.
+cfg_direct:         resb 1               ; direct_scanout = 1
+ds_off:             resb 1               ; the kernel refused a direct flip:
+                                         ; off until frame restarts
+ds_leave_req:       resb 1               ; ds_win's newest picture is in its
+                                         ; own buffer now: composite again
+ds_win:             resd 1               ; window on the panel directly (0 none)
+ds_arg:             resd 2               ; RMFB / GEM_CLOSE argument
+ds_prime:           resd 3               ; drm_prime_handle: handle, flags, fd
+ds_fbcmd:           resb 104             ; drm_mode_fb_cmd2
+ds_flips:           resq 1               ; direct flips since start (SIGUSR1)
+; Held Present buffers: +0 pixmap (0 = none, or freed while held), +4 client
+; slot, +8 window, +12 serial, +16 idle fence, +20 fb id.
+ds_next:            resb DS_REC          ; presented, not on the panel yet
+ds_front:           resb DS_REC          ; on the panel, or its flip in flight
+ds_old:             resb DS_REC          ; off the panel when that flip lands
 
 ; ---- Phase 4f compositor state --------------------------------------------
 compositor_requested: resb 1               ; set by --display argv flag
@@ -1736,6 +1758,9 @@ dbg_cs_gc:          db " grabcur=", 0
 dbg_cs_en:          db " enter=", 0
 dbg_cs_ec:          db " entercur=", 0
 dbg_evdrop:         db " evdrop=", 0
+dbg_direct:         db " direct=", 0
+log_ds_first:       db "frame: direct scanout, first flip rc=", 0
+log_ds_refused:     db "frame: direct scanout refused, off until restart, rc=", 0
 dbg_pxblit:         db " blit=", 0
 dbg_pxfill:         db " fill=", 0
 dbg_pxflush:        db " flush=", 0
@@ -1943,7 +1968,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.28", 10
+version_str:        db "frame 0.1.29", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -5049,7 +5074,8 @@ serve_loop:
     cmp byte [flip_pending], 0               ; flip was pending → lost-flip path:
     je .sl_poll_done                         ; unstick + re-poll. Else this was the
     mov byte [flip_pending], 0               ; 16ms bg-defer fallback → fall to the
-    jmp .sl_iter                             ; composite check and paint it.
+    call ds_landed                           ; composite check and paint it.
+    jmp .sl_iter
 .sl_poll_done:
 
     ; --- Listen fd ready: accept all pending connections. The loop is the
@@ -5235,6 +5261,7 @@ serve_loop:
     push rax                                 ; a real vblank: GL frames due
     push rcx                                 ; now get copied and reported
     push rdx
+    call ds_landed
     call present_tick
     pop rdx
     pop rcx
@@ -12907,7 +12934,7 @@ parse_framerc:
     ; cursor_color = RRGGBB / cursor_transparency = N / cursor_accent = RRGGBB
     mov eax, [rsi]
     cmp eax, 'curs'
-    jne .pf_chk_blank
+    jne .pf_chk_direct
     mov al, [rsi + 7]                          ; cursor_[c]olor / [t]ransp / [a]ccent
     cmp al, 'c'
     je .pf_cur_color
@@ -12929,6 +12956,17 @@ parse_framerc:
     call pf_parse_hex
     or  eax, 0xFF000000                        ; opaque (premult = itself)
     mov [cfg_cursor_accent], eax
+    jmp .pf_next_line
+.pf_chk_direct:
+    ; direct_scanout = 1: a GL window that fills the panel is shown from
+    ; its own buffers, no copy (default 0 while it is new)
+    mov eax, [rsi]
+    cmp eax, 'dire'
+    jne .pf_chk_blank
+    call pf_to_value
+    call pf_parse_dec
+    test eax, eax
+    setnz byte [cfg_direct]
     jmp .pf_next_line
 .pf_chk_blank:
     ; blank_timeout = N (seconds of idle before the panel powers off;
@@ -17690,6 +17728,8 @@ compositor_reconfigure:
     jne .crc_awake                           ; CRTCs would fight the blank
     call comp_unblank
 .crc_awake:
+    call ds_drop                             ; sizes may change: every client
+    call ds_forget_fbs                       ; fb is rebuilt on demand
     ; Snapshot the output config. VT reacquire's own SETCRTC fires a DRM
     ; change uevent; a reconfigure that changes NOTHING must not rebuild —
     ; the RRScreenChangeNotify makes strip exit(0) to re-init, dropping
@@ -18860,6 +18900,12 @@ flush_lines:
 recomposite_screen:
     cmp byte [compositor_active], 0
     je .rs_done
+    cmp dword [ds_win], 0                     ; a GL window owns the panel?
+    je .rs_composite
+    call ds_composite
+    test eax, eax
+    jnz .rs_done
+.rs_composite:
     push rbx
     push r12
     push r13
@@ -20032,6 +20078,7 @@ comp_blank:
     lea rdx, [blank_crtc_cmd]
     syscall
 .cb_one:
+    call ds_drop                             ; the panel shows no client buffer
     mov byte [blank_state], 1
     call log_stamp
     lea rsi, [log_blank]
@@ -20252,6 +20299,7 @@ vt_release_display:
     mov esi, DRM_IOCTL_MODE_SETCRTC
     lea rdx, [drm_crtc_save]                 ; console's saved CRTC state
     syscall
+    call ds_drop                             ; no client buffer on the panel now
     mov rax, SYS_IOCTL
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_DROP_MASTER
@@ -26862,6 +26910,10 @@ dump_handler:
     call write_str_stderr
     mov eax, [ev_dropped]
     call write_u64_stderr
+    lea rsi, [dbg_direct]
+    call write_str_stderr
+    mov rax, [ds_flips]
+    call write_u64_stderr
     lea rsi, [probe_conn_nl]
     mov edx, 1
     call write_stderr
@@ -27107,6 +27159,15 @@ pixmap_release:
     mov rdi, [rcx]
     test rdi, rdi
     jz .pxr_plain
+    cmp byte [cfg_direct], 0
+    je .pxr_dma
+    push rcx
+    mov rdi, r12
+    mov rsi, rcx
+    call ds_pixmap_gone
+    pop rcx
+    mov rdi, [rcx]
+.pxr_dma:
     push rcx
     mov rsi, [rcx + 8]
     mov eax, SYS_MUNMAP
@@ -28146,6 +28207,15 @@ present_execute:
     mov r14d, ecx
     mov r15d, r8d
     push r9
+    cmp byte [cfg_direct], 0                 ; straight to the panel?
+    je .pe_copy
+    call ds_hold                             ; (arguments still as received)
+    test eax, eax
+    jz .pe_copy
+    pop r9
+    jmp .pe_ret
+.pe_copy:
+    mov r9, [rsp]
     mov esi, r12d
     mov edx, r14d
     movsx ecx, r9w
@@ -28159,6 +28229,7 @@ present_execute:
     mov ecx, r14d
     mov r8d, r15d
     call present_complete
+.pe_ret:
     pop r15
     pop r14
     pop r13
@@ -28366,6 +28437,610 @@ present_copy:
     pop rbx
     ret
 
+; ============================================================================
+; Direct scanout (framerc direct_scanout = 1). A GL window that fills the
+; panel, with nothing drawn over it, has its Present buffers flipped to the
+; panel as they are: no copy into the window, no composite, no flush.
+; frame holds each such buffer until the panel stops showing it, then sends
+; IdleNotify. When the rule breaks (a popup, a move, the panel going dark),
+; the newest buffer is copied into the window once and compositing resumes.
+; The buffers move ds_next → ds_front → ds_old, one record each (DS_REC).
+; ============================================================================
+
+; ds_hold — edi = slot, esi = window, edx = serial, ecx = pixmap, r8d =
+; idle fence, r9d = x_off | y_off << 16. eax = 1: the buffer waits for the
+; panel and CompleteNotify is sent; 0: copy it as before.
+ds_hold:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov ebx, edi
+    mov r12d, esi
+    mov r13d, edx
+    mov r14d, ecx
+    mov r15d, r8d
+    test r9d, r9d                            ; drawn at 0,0 only
+    jnz .dh_no
+    mov eax, [ds_win]
+    test eax, eax
+    jz .dh_win_ok
+    cmp eax, r12d
+    jne .dh_no                               ; another window is still leaving
+.dh_win_ok:
+    mov edi, r12d
+    call ds_covers
+    test eax, eax
+    jz .dh_no
+    mov edi, r14d
+    call pixmap_lookup
+    test rax, rax
+    jz .dh_no
+    mov rbp, rax
+    movzx eax, word [rbp + 4]                ; the buffer covers the panel
+    cmp eax, [screen_w]
+    jb .dh_no
+    movzx eax, word [rbp + 6]
+    cmp eax, [screen_h]
+    jb .dh_no
+    mov al, [rbp + 8]
+    cmp al, 24
+    je .dh_depth_ok
+    cmp al, 32
+    jne .dh_no
+.dh_depth_ok:
+    mov rdi, rbp
+    call ds_fb
+    test eax, eax
+    jz .dh_no
+    push rax
+    lea rdi, [ds_next]                       ; a newer frame replaces one the
+    call ds_release                          ; panel never showed
+    pop rax
+    mov [ds_next], r14d
+    mov [ds_next + 4], ebx
+    mov [ds_next + 8], r12d
+    mov [ds_next + 12], r13d
+    mov [ds_next + 16], r15d
+    mov [ds_next + 20], eax
+    mov [ds_win], r12d
+    mov byte [comp_dirty], 1
+    mov edi, ebx
+    mov esi, r12d
+    mov edx, r13d
+    mov ecx, 0x100                           ; kind Pixmap, mode Flip
+    call present_send_complete
+    mov eax, 1
+    jmp .dh_ret
+.dh_no:
+    ; This frame gets copied. If its window was on the panel, the copy now
+    ; holds its newest picture: drop the unshown buffer, composite again.
+    cmp [ds_win], r12d
+    jne .dh_zero
+    lea rdi, [ds_next]
+    call ds_release
+    mov byte [ds_leave_req], 1
+.dh_zero:
+    xor eax, eax
+.dh_ret:
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ds_covers — edi = window xid. eax = 1 when that window can own the panel:
+; top-level, at 0,0, panel-sized, no border, opaque, nothing above it, and
+; nothing frame itself paints on top (rubber band, slot warning, lens).
+ds_covers:
+    xor eax, eax
+    cmp byte [ds_off], 0
+    jne .dco_ret
+    cmp byte [compositor_active], 0
+    je .dco_ret
+    cmp byte [blank_state], 0
+    jne .dco_ret
+    cmp byte [vt_away], 0
+    jne .dco_ret
+    cmp byte [ext_active], 0                 ; one panel only
+    jne .dco_ret
+    cmp byte [xb_on], 0
+    jne .dco_ret
+    cmp byte [slots_full], 0
+    jne .dco_ret
+    cmp dword [lens_active], 0
+    jne .dco_ret
+    push rdi
+    call window_lookup
+    pop rdi
+    test rax, rax
+    jz .dco_no
+    mov rsi, rax
+    cmp byte [rsi + 28], 1                   ; mapped
+    jne .dco_no
+    cmp dword [rsi + 4], X_ROOT_WINDOW       ; top-level
+    jne .dco_no
+    cmp dword [rsi + 8], 0                   ; x = y = 0
+    jne .dco_no
+    movzx eax, word [rsi + 12]
+    cmp eax, [screen_w]
+    jne .dco_no
+    movzx eax, word [rsi + 14]
+    cmp eax, [screen_h]
+    jne .dco_no
+    cmp word [rsi + 16], 0                   ; no border
+    jne .dco_no
+    cmp byte [rsi + 18], 24                  ; opaque, or its opaque region
+    je .dco_stack                            ; covers it whole
+    mov rax, rsi
+    lea rdx, [windows]
+    sub rax, rdx
+    shr eax, 6                               ; slot (WINDOW_REC_SIZE = 64)
+    mov eax, [win_opq + rax*4]
+    cmp eax, [rsi + 12]
+    jne .dco_no
+.dco_stack:
+    ; No mapped top-level stacked higher, and no mapped child of its own.
+    ; InputOnly windows draw nothing and do not count.
+    mov r8d, [rsi + 48]                      ; its stk
+    xor ecx, ecx
+.dco_loop:
+    cmp ecx, MAX_WINDOWS
+    jae .dco_yes
+    mov eax, ecx
+    shl eax, 6
+    lea rax, [windows + rax]
+    mov edx, [rax]
+    test edx, edx
+    jz .dco_next
+    cmp edx, edi
+    je .dco_next
+    cmp byte [rax + 28], 1
+    jne .dco_next
+    cmp byte [rax + 19], 2                   ; InputOnly
+    je .dco_next
+    mov edx, [rax + 4]
+    cmp edx, edi
+    je .dco_no                               ; its own child draws on top
+    cmp edx, X_ROOT_WINDOW
+    jne .dco_next
+    cmp [rax + 48], r8d
+    ja .dco_no                               ; a top-level above it
+.dco_next:
+    inc ecx
+    jmp .dco_loop
+.dco_yes:
+    mov eax, 1
+    ret
+.dco_no:
+    xor eax, eax
+.dco_ret:
+    ret
+
+; ds_fb — rdi = pixmap record. eax = a DRM framebuffer id for that buffer,
+; made once and kept in px_dma +20; 0 when it cannot go to the panel.
+ds_fb:
+    push rbx
+    push r12
+    mov r12, rdi
+    mov rax, rdi
+    lea rcx, [pixmaps]
+    sub rax, rcx
+    xor edx, edx
+    mov ecx, PIXMAP_REC_SIZE
+    div rcx
+    lea rax, [rax + rax*2]
+    lea rbx, [px_dma + rax*8]
+    xor eax, eax
+    cmp qword [rbx], 0                       ; only a dma-buf can
+    je .dfb_ret
+    mov eax, [rbx + 20]
+    cmp eax, -1
+    je .dfb_no
+    test eax, eax
+    jnz .dfb_ret                             ; made before
+    mov eax, 1                               ; --fbtest: no DRM, a stand-in id
+    cmp byte [fbtest_mode], 0
+    jne .dfb_store
+    mov dword [ds_prime], 0                  ; dma-buf → GEM handle
+    mov dword [ds_prime + 4], 0
+    mov eax, [rbx + 16]
+    mov [ds_prime + 8], eax
+    mov eax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_PRIME_FD_TO_HANDLE
+    lea rdx, [ds_prime]
+    syscall
+    test rax, rax
+    jnz .dfb_fail
+    lea rdi, [ds_fbcmd]                      ; panel-sized, XRGB8888, linear
+    xor eax, eax
+    mov ecx, 13
+    rep stosq
+    mov eax, [screen_w]
+    mov [ds_fbcmd + 4], eax
+    mov eax, [screen_h]
+    mov [ds_fbcmd + 8], eax
+    mov dword [ds_fbcmd + 12], DRM_FORMAT_XRGB8888
+    mov dword [ds_fbcmd + 16], DRM_MODE_FB_MODIFIERS
+    mov eax, [ds_prime]
+    mov [ds_fbcmd + 20], eax                 ; handles[0]
+    movzx eax, word [r12 + 4]
+    shl eax, 2
+    mov [ds_fbcmd + 36], eax                 ; pitches[0] (width = stride / 4)
+    mov rax, [r12 + 16]
+    sub rax, [rbx]
+    mov [ds_fbcmd + 52], eax                 ; offsets[0]; modifier[0] = 0
+    mov eax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_ADDFB2
+    lea rdx, [ds_fbcmd]
+    syscall
+    push rax
+    mov eax, [ds_prime]                      ; the fb keeps its own reference
+    mov [ds_arg], eax
+    mov dword [ds_arg + 4], 0
+    mov eax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_GEM_CLOSE
+    lea rdx, [ds_arg]
+    syscall
+    pop rax
+    test rax, rax
+    jnz .dfb_fail
+    mov eax, [ds_fbcmd]
+.dfb_store:
+    mov [rbx + 20], eax
+    jmp .dfb_ret
+.dfb_fail:
+    mov dword [rbx + 20], -1                 ; never try this buffer again
+.dfb_no:
+    xor eax, eax
+.dfb_ret:
+    pop r12
+    pop rbx
+    ret
+
+; ds_composite — recomposite_screen asks first while ds_win is set (no flip
+; is in flight then). eax = 1: the panel is handled (flipped, or the window
+; hides every other change); 0: composite as usual.
+ds_composite:
+    push rbx
+    cmp byte [ds_leave_req], 0
+    jne .dc_leave
+    mov edi, [ds_win]
+    call ds_covers
+    test eax, eax
+    jz .dc_materialize
+    cmp dword [ds_next], 0
+    je .dc_handled                           ; no new frame, the rest is hidden
+    cmp byte [fbtest_mode], 0
+    jne .dc_fake_flip
+    lea rdi, [drm_page_flip]
+    mov eax, [drm_chosen_crtc]
+    mov [rdi + 0], eax
+    mov eax, [ds_next + 20]
+    mov [rdi + 4], eax
+    mov dword [rdi + 8], DRM_MODE_PAGE_FLIP_EVENT
+    mov dword [rdi + 12], 0
+    mov qword [rdi + 16], 0
+    mov eax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_PAGE_FLIP
+    lea rdx, [drm_page_flip]
+    syscall
+    cmp qword [ds_flips], 0                  ; log the first one's rc
+    jne .dc_rc
+    push rax
+    call log_stamp
+    lea rsi, [log_ds_first]
+    call write_str_stderr
+    mov rax, [rsp]
+    call write_i64_stderr
+    lea rsi, [probe_conn_nl]
+    mov edx, 1
+    call write_stderr
+    pop rax
+.dc_rc:
+    test rax, rax
+    jnz .dc_refused
+    cmp byte [drm_poll_dead], 0              ; no completion events: it counts
+    jne .dc_flipped                          ; as landed at once
+    mov byte [flip_pending], 1
+.dc_flipped:
+    lea rdi, [ds_old]                        ; the buffer on the panel leaves
+    lea rsi, [ds_front]                      ; it when this flip lands
+    call ds_move
+    lea rdi, [ds_front]
+    lea rsi, [ds_next]
+    call ds_move
+    inc qword [ds_flips]
+    cmp byte [flip_pending], 0
+    jne .dc_handled
+    call ds_landed
+.dc_handled:
+    mov eax, 1
+    pop rbx
+    ret
+.dc_fake_flip:
+    ; --fbtest has no panel: copy the buffer into frame's back buffer and
+    ; swap, so a dump shows what the panel would. Rig only.
+    mov edi, [ds_next]
+    call pixmap_lookup
+    test rax, rax
+    jz .dc_flipped
+    mov rbx, rax
+    lea rcx, [pixmaps]
+    sub rax, rcx
+    xor edx, edx
+    mov ecx, PIXMAP_REC_SIZE
+    div rcx
+    lea rax, [rax + rax*2]
+    lea rax, [px_dma + rax*8]
+    push rax
+    mov qword [dma_sync], DMA_BUF_SYNC_READ
+    mov edi, [rax + 16]
+    mov esi, DMA_BUF_IOCTL_SYNC
+    lea rdx, [dma_sync]
+    mov eax, SYS_IOCTL
+    syscall
+    mov rdi, rbx
+    mov esi, [screen_w]
+    mov edx, [screen_h]
+    call dma_flush_rows
+    mov eax, [comp_back]
+    mov rdi, [comp_addr + rax*8]
+    mov rsi, [rbx + 16]
+    xor r8d, r8d
+.dc_ff_row:
+    cmp r8d, [screen_h]
+    jae .dc_ff_done
+    push rdi
+    push rsi
+    mov ecx, [screen_w]
+    rep movsd
+    pop rsi
+    pop rdi
+    movzx eax, word [rbx + 4]
+    lea rsi, [rsi + rax*4]
+    mov eax, [drm_dumb_pitch]
+    add rdi, rax
+    inc r8d
+    jmp .dc_ff_row
+.dc_ff_done:
+    pop rax
+    mov qword [dma_sync], DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END
+    mov edi, [rax + 16]
+    mov esi, DMA_BUF_IOCTL_SYNC
+    lea rdx, [dma_sync]
+    mov eax, SYS_IOCTL
+    syscall
+    cmp dword [comp_back], 0                 ; that buffer holds the client's
+    jne .dc_ff_b1                            ; picture now: stale for frame
+    mov dword [dmg_count0], -1
+    jmp .dc_ff_swap
+.dc_ff_b1:
+    mov dword [dmg_count1], -1
+.dc_ff_swap:
+    xor dword [comp_back], 1
+    jmp .dc_flipped
+.dc_refused:
+    ; The kernel would not show a client buffer. Say so once and stop
+    ; trying until frame restarts.
+    mov byte [ds_off], 1
+    push rax
+    call log_stamp
+    lea rsi, [log_ds_refused]
+    call write_str_stderr
+    pop rax
+    call write_i64_stderr
+    lea rsi, [probe_conn_nl]
+    mov edx, 1
+    call write_stderr
+.dc_materialize:
+    ; Something draws over the window now, or it moved: its newest frame
+    ; goes into its own buffer, where compositing reads it.
+    mov edx, [ds_next]
+    test edx, edx
+    jnz .dc_mat
+    mov edx, [ds_front]
+    test edx, edx
+    jz .dc_leave
+.dc_mat:
+    mov esi, [ds_win]
+    xor ecx, ecx
+    xor r8d, r8d
+    call present_copy
+.dc_leave:
+    lea rdi, [ds_next]
+    call ds_release
+    lea rdi, [ds_old]                        ; (empty: no flip is in flight)
+    lea rsi, [ds_front]
+    call ds_move
+    mov dword [ds_win], 0
+    mov byte [ds_leave_req], 0
+    mov eax, [ds_old]                        ; a client buffer is on the panel:
+    or eax, [ds_old + 20]                    ; repaint frame's buffer whole and
+    jz .dc_back                              ; flip it, which lets it go
+    mov dword [dmg_count0], -1
+    mov dword [dmg_count1], -1
+.dc_back:
+    xor eax, eax
+    pop rbx
+    ret
+
+; ds_landed — a flip landed: the buffer it replaced is off the panel.
+ds_landed:
+    cmp byte [cfg_direct], 0
+    je .dl_ret
+    lea rdi, [ds_old]
+    jmp ds_release
+.dl_ret:
+    ret
+
+; ds_drop — the panel shows no client buffer any more (blank, console,
+; output change): the newest frame goes into its window, and every held
+; buffer is released now.
+ds_drop:
+    cmp dword [ds_win], 0
+    je .dd_ret
+    cmp byte [ds_leave_req], 0               ; its own buffer is newer already
+    jne .dd_rel
+    mov edx, [ds_next]
+    test edx, edx
+    jnz .dd_mat
+    mov edx, [ds_front]
+    test edx, edx
+    jz .dd_rel
+.dd_mat:
+    mov esi, [ds_win]
+    xor ecx, ecx
+    xor r8d, r8d
+    call present_copy
+.dd_rel:
+    lea rdi, [ds_next]
+    call ds_release
+    lea rdi, [ds_front]
+    call ds_release
+    lea rdi, [ds_old]
+    call ds_release
+    mov dword [ds_win], 0
+    mov byte [ds_leave_req], 0
+.dd_ret:
+    ret
+
+; ds_forget_fbs — every cached client fb removed (the panel size may have
+; changed); each is made again when next needed.
+ds_forget_fbs:
+    cmp byte [cfg_direct], 0
+    je .dff_ret
+    push rbx
+    xor ebx, ebx
+.dff_loop:
+    cmp ebx, MAX_PIXMAPS
+    jae .dff_done
+    lea rax, [rbx + rbx*2]
+    lea rax, [px_dma + rax*8]
+    mov edi, [rax + 20]
+    mov dword [rax + 20], 0
+    cmp edi, 0
+    jle .dff_next                            ; none (0) or refused (-1)
+    call ds_rmfb
+.dff_next:
+    inc ebx
+    jmp .dff_loop
+.dff_done:
+    pop rbx
+.dff_ret:
+    ret
+
+; ds_pixmap_gone — rdi = pixmap record, rsi = its px_dma record, as the
+; buffer is freed. A buffer the panel may still show keeps its fb until a
+; flip takes it off.
+ds_pixmap_gone:
+    mov eax, [rsi + 20]
+    mov dword [rsi + 20], 0
+    test eax, eax
+    jle .dpg_ret                             ; no fb made (0) or refused (-1)
+    push rbx
+    push r12
+    mov r12d, eax
+    mov ebx, [rdi]                           ; pixmap xid
+    cmp [ds_next], ebx
+    jne .dpg_front
+    mov dword [ds_next], 0                   ; never shown: fb goes with it
+    lea rdi, [ds_next]
+    call ds_release
+    jmp .dpg_done
+.dpg_front:
+    cmp [ds_front], ebx
+    jne .dpg_old
+    mov dword [ds_front], 0                  ; RMFB once a flip replaces it
+    cmp dword [ds_next], 0
+    jne .dpg_done                            ; a newer frame replaces it
+    cmp byte [ds_leave_req], 0
+    jne .dpg_leave
+    mov esi, [ds_win]                        ; its window's newest picture:
+    mov edx, ebx                             ; copy it while still mapped
+    xor ecx, ecx
+    xor r8d, r8d
+    call present_copy
+.dpg_leave:
+    mov byte [ds_leave_req], 1
+    mov byte [comp_dirty], 1
+    jmp .dpg_done
+.dpg_old:
+    cmp [ds_old], ebx
+    jne .dpg_rmfb
+    mov dword [ds_old], 0                    ; RMFB when its flip lands
+    jmp .dpg_done
+.dpg_rmfb:
+    mov edi, r12d
+    call ds_rmfb
+.dpg_done:
+    pop r12
+    pop rbx
+.dpg_ret:
+    ret
+
+; ds_release — rdi = record. IdleNotify if the buffer lives, RMFB if it
+; was freed while held; the record is cleared.
+ds_release:
+    push rbx
+    mov rbx, rdi
+    mov ecx, [rbx]
+    test ecx, ecx
+    jz .dr_freed
+    mov edi, [rbx + 4]
+    mov esi, [rbx + 8]
+    mov edx, [rbx + 12]
+    mov r8d, [rbx + 16]
+    call present_idle
+    jmp .dr_clear
+.dr_freed:
+    mov edi, [rbx + 20]
+    call ds_rmfb
+.dr_clear:
+    xor eax, eax
+    mov [rbx], rax
+    mov [rbx + 8], rax
+    mov [rbx + 16], rax
+    pop rbx
+    ret
+
+; ds_move — rdi = empty record, rsi = record: moved, source cleared.
+ds_move:
+    mov rax, [rsi]
+    mov [rdi], rax
+    mov rax, [rsi + 8]
+    mov [rdi + 8], rax
+    mov rax, [rsi + 16]
+    mov [rdi + 16], rax
+    xor eax, eax
+    mov [rsi], rax
+    mov [rsi + 8], rax
+    mov [rsi + 16], rax
+    ret
+
+; ds_rmfb — edi = fb id (0: none; --fbtest made none).
+ds_rmfb:
+    test edi, edi
+    jz .drf_ret
+    cmp byte [fbtest_mode], 0
+    jne .drf_ret
+    mov [ds_arg], edi
+    mov eax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_RMFB
+    lea rdx, [ds_arg]
+    syscall
+.drf_ret:
+    ret
+
 ; row_equal — rsi, rdi = two rows, ecx = pixels. ZF=1 when they match.
 ; 16 bytes a step. Clobbers rax, rcx, rdx, rsi, rdi, xmm0, xmm1.
 row_equal:
@@ -28396,6 +29071,21 @@ row_equal:
 ; fence is tripped so the client may draw into that buffer again.
 ; ----------------------------------------------------------------------------
 present_complete:
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push r8
+    xor ecx, ecx                             ; kind Pixmap, mode Copy
+    call present_send_complete
+    pop r8
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
+; present_idle — same arguments. IdleNotify, then the idle fence: the
+; client may draw into that buffer again.
+present_idle:
     push rbx
     push r12
     push r13
@@ -28406,11 +29096,6 @@ present_complete:
     mov r13d, edx
     mov r14d, ecx
     mov r15d, r8d
-    mov edi, ebx
-    mov esi, r12d
-    mov edx, r13d
-    xor ecx, ecx                             ; kind = Pixmap
-    call present_send_complete
     ; IdleNotify to every subscription of this window that asked for it.
     ; Mesa's EGL path registers twice on one window (one id for the
     ; swap-interval waiter, one for the buffer loader); answering only
@@ -28500,8 +29185,8 @@ present_sub_find:
 
 ; ----------------------------------------------------------------------------
 ; present_send_complete — edi = slot, esi = window, edx = serial, ecx =
-; kind (0 Pixmap, 1 NotifyMSC). CompleteNotify with mode Copy, the
-; current msc and the clock in microseconds.
+; kind (0 Pixmap, 1 NotifyMSC) | mode << 8 (0 Copy, 1 Flip). CompleteNotify
+; with the current msc and the clock in microseconds.
 ; ----------------------------------------------------------------------------
 present_send_complete:
     push rbx
@@ -28539,7 +29224,7 @@ present_send_complete:
     mov byte [rdi + 1], PRESENT_MAJOR
     mov dword [rdi + 4], 2                   ; (40 - 32) / 4
     mov word [rdi + 8], 1                    ; CompleteNotify
-    mov [rdi + 10], r14b                     ; kind
+    mov [rdi + 10], r14w                     ; kind, then mode (ch)
     mov [rdi + 12], r8d
     mov [rdi + 16], r12d
     mov [rdi + 20], r13d

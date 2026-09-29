@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.28-blue)
+![Version](https://img.shields.io/badge/version-0.1.29-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -294,6 +294,7 @@ cursor_accent = 00c800     # arrow fill over pressable items, RRGGBB (default gr
 background = ~/.framebg    # desktop wallpaper: a raw BGRX file at panel res
 blank_timeout = 600        # idle seconds before the panel powers off (0 = never)
 blank_key = Mod4+Escape    # hotkey that powers the panel off NOW (none = off)
+direct_scanout = 1         # full-panel GL windows go to the panel uncopied (default 0)
 ```
 
 `keymap`: `us` (the default, or no file) is the standard US layout. `no`
@@ -361,6 +362,18 @@ lines). Handled server-side like the Ctrl+Alt+Fn VT switch, so it works
 regardless of focus or grabs and the combo never reaches clients. Any
 key press or pointer motion re-lights the panel. Default `Mod4+Escape`;
 `none` disables.
+
+`direct_scanout`: a GL or Vulkan window that fills the panel is shown
+straight from its own buffers with a page flip. That means mpv, Minecraft
+or a browser at 0,0 with nothing over it (tile's `Mod4+f`). frame then
+copies, composites and flushes nothing for it.
+
+On the scratch display a 60 fps video took frame from 22-27% of a core to
+under 1%. A popup, a resize or the panel going dark puts the newest frame
+into the window once, and compositing takes over again.
+
+Limits: one active output only, and a root screenshot meanwhile shows the
+last composited frame. Default `0` while it is new.
 
 `background`: a desktop wallpaper, drawn natively by the compositor (no feh,
 no root-pixmap). frame carries no image decoder, so the value points at a
