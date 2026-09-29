@@ -1943,7 +1943,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.27", 10
+version_str:        db "frame 0.1.28", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -28214,6 +28214,11 @@ dma_flush_rows:
 ; Rows from the pixmap into the window backing, clipped to both. A dma-buf
 ; pixmap is bracketed with DMA_BUF_IOCTL_SYNC so the GPU's writes are done
 ; and visible. Then damage.
+; Clients send the whole window each frame even when a small spinner is all
+; that moved (GTK4 hands WebKit's page over as one picture). So the rows
+; that match the backing are skipped from the top and from the bottom, and
+; only the band between them is copied and damaged. A frame that changed
+; nothing is not copied or damaged at all.
 ; ----------------------------------------------------------------------------
 present_copy:
     push rbx
@@ -28285,10 +28290,41 @@ present_copy:
     mov edx, [rsp + 4]
     call dma_flush_rows
 .pcp_copy:
-    xor r10d, r10d                           ; row
+    mov dword [rsp + 16], 0                  ; band height (0 = no change)
+    xor r12d, r12d                           ; first changed row
+.pcp_top:
+    cmp r12d, [rsp + 4]
+    jae .pcp_rows_done                       ; every row matches
+    mov r10d, r12d
+    call .pcp_row_ptrs
+    mov ecx, [rsp]                           ; w
+    call row_equal
+    jne .pcp_bottom
+    inc r12d
+    jmp .pcp_top
+.pcp_bottom:
+    mov r13d, [rsp + 4]                      ; last changed row: row r12
+.pcp_bot_loop:                               ; differs, so this stops there
+    dec r13d
+    mov r10d, r13d
+    call .pcp_row_ptrs
+    mov ecx, [rsp]
+    call row_equal
+    je .pcp_bot_loop
+    mov eax, r13d
+    sub eax, r12d
+    inc eax
+    mov [rsp + 16], eax
+    mov r10d, r12d                           ; row
 .pcp_row:
-    cmp r10d, [rsp + 4]
-    jae .pcp_rows_done
+    cmp r10d, r13d
+    ja .pcp_rows_done
+    call .pcp_row_ptrs
+    mov ecx, [rsp]
+    rep movsd
+    inc r10d
+    jmp .pcp_row
+.pcp_row_ptrs:                               ; r10d = row → rsi src, rdi dst
     movzx eax, word [rbx + 4]
     imul eax, r10d
     mov rsi, [rbx + 16]
@@ -28299,10 +28335,7 @@ present_copy:
     add eax, r14d
     mov rdi, [rbp + 32]
     lea rdi, [rdi + rax*4]                   ; dst row
-    mov ecx, [rsp]
-    rep movsd
-    inc r10d
-    jmp .pcp_row
+    ret
 .pcp_rows_done:
     mov r10, [rsp + 8]
     cmp qword [r10], 0
@@ -28314,11 +28347,13 @@ present_copy:
     mov eax, SYS_IOCTL
     syscall
 .pcp_damage:
+    mov r8d, [rsp + 16]                      ; band height
+    test r8d, r8d
+    jz .pcp_done
     mov rdi, rbp
     mov eax, r14d
-    mov edx, r15d
+    lea edx, [r15 + r12]                     ; band top
     mov ecx, [rsp]
-    mov r8d, [rsp + 4]
     call damage_add_local
     mov byte [comp_dirty], 1
 .pcp_done:
@@ -28329,6 +28364,30 @@ present_copy:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; row_equal — rsi, rdi = two rows, ecx = pixels. ZF=1 when they match.
+; 16 bytes a step. Clobbers rax, rcx, rdx, rsi, rdi, xmm0, xmm1.
+row_equal:
+    mov edx, ecx
+    shr edx, 2
+    jz .re_tail
+.re_loop:
+    movdqu xmm0, [rsi]
+    movdqu xmm1, [rdi]
+    pcmpeqb xmm0, xmm1
+    pmovmskb eax, xmm0
+    cmp eax, 0xFFFF
+    jne .re_ret                              ; ZF=0: differs
+    add rsi, 16
+    add rdi, 16
+    dec edx
+    jnz .re_loop
+.re_tail:
+    and ecx, 3
+    jz .re_ret                               ; ZF=1: all matched
+    repe cmpsd
+.re_ret:
     ret
 
 ; ----------------------------------------------------------------------------
