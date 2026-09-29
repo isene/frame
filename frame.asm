@@ -423,6 +423,7 @@ magnify_deadline:   resd 1                 ; server_time_ms to shrink at
 cfg_cursor_accent:  resd 1                 ; ~/.framerc cursor_accent RRGGBB
 ptr_grab_cursor:    resd 1                 ; GrabPointer's cursor arg (scrot)
 netwm_cm_atom_srv:  resd 1                 ; _NET_WM_CM_S0 (frame = compositor)
+opq_atom:           resd 1                 ; _NET_WM_OPAQUE_REGION
 ; XVideo (mpv --vo=xv). One adaptor, one port.
 xv_port_client:     resd 1                 ; slot holding the port (-1 = free)
 xv_port_draw:       resd 1                 ; drawable the port last drew to
@@ -610,6 +611,10 @@ win_painted:        resb MAX_WINDOWS      ; 1 once the CLIENT has drawn into
                                           ; fill frame does on map)
                                           ; (0=none). ClearArea restores from it
                                           ; instead of painting back_pixel.
+win_opq:            resd MAX_WINDOWS      ; w | h << 16 when the client's
+                                          ; _NET_WM_OPAQUE_REGION is one rect
+                                          ; over the whole window (GTK sets it
+                                          ; on its ARGB toplevels); 0 = none
 pl_backing:         resq 1                ; PolyLine draw scratch
 pl_stride:          resd 1
 pl_h:               resd 1
@@ -1137,6 +1142,7 @@ x11_sock_dir:       db "/tmp/.X11-unix/X", 0
 str_framerc:        db "/.framerc", 0
 str_dev_tty0:       db "/dev/tty0", 0
 str_netwm_cm:       db "_NET_WM_CM_S0"      ; compositor-manager selection
+str_opq_region:     db "_NET_WM_OPAQUE_REGION"
 const_100:          dd 100
 vendor_str:         db "frame"
 
@@ -1937,7 +1943,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.26", 10
+version_str:        db "frame 0.1.27", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -2277,6 +2283,10 @@ _start:
     mov esi, 13
     call atom_create
     mov [netwm_cm_atom_srv], eax
+    lea rdi, [str_opq_region]
+    mov esi, 21
+    call atom_create
+    mov [opq_atom], eax
     call init_clients
     call init_windows
     call init_gcs
@@ -10838,6 +10848,7 @@ window_destroy:
 .wd_kill_clear:
     mov dword [win_bgpix + rbx*4], 0         ; drop bg-pixmap ref (slot reuse)
     mov byte [win_painted + rbx], 0          ; ditto the has-drawn flag
+    mov dword [win_opq + rbx*4], 0           ; and the opaque region
     mov edi, [r13]                           ; free its property records too:
     call window_props_clear                  ; Xlib XID reuse is deterministic,
                                              ; so stale records would resurrect
@@ -12140,6 +12151,27 @@ handle_change_property:
     mov [r14 + 12], cl                       ; format
 
 .cp_notify:
+    ; _NET_WM_OPAQUE_REGION as one rect at 0,0 → keep its w | h << 16, so
+    ; the compositor can copy that ARGB window instead of blending it.
+    mov eax, [r12 + 8]
+    cmp eax, [opq_atom]
+    jne .cp_send
+    xor esi, esi                             ; anything else → 0 (blend)
+    cmp byte [r14 + 12], 32
+    jne .cp_opq
+    cmp dword [r14 + 16], 16                 ; exactly one x, y, w, h
+    jne .cp_opq
+    mov eax, [r14 + 20]
+    lea rax, [property_values + rax]
+    cmp qword [rax], 0                       ; x = y = 0
+    jne .cp_opq
+    movzx esi, word [rax + 12]               ; h
+    shl esi, 16
+    mov si, [rax + 8]                        ; w
+.cp_opq:
+    mov edi, [r12 + 4]
+    call opq_set
+.cp_send:
     mov edi, [r12 + 4]                       ; window
     mov esi, [r12 + 8]                       ; atom
     xor edx, edx                             ; state = 0 (NewValue)
@@ -12171,6 +12203,12 @@ handle_delete_property:
     test rax, rax
     jz .dp_done
     mov dword [rax], 0                       ; mark empty
+    cmp ebx, [opq_atom]
+    jne .dp_notify
+    mov edi, r12d
+    xor esi, esi
+    call opq_set
+.dp_notify:
     mov edi, r12d
     mov esi, ebx
     mov edx, 1                               ; state = 1 (Deleted)
@@ -12178,6 +12216,22 @@ handle_delete_property:
 .dp_done:
     pop r12
     pop rbx
+    ret
+
+; opq_set — edi = window xid, esi = w | h << 16 of a whole-window opaque
+; region (0 = none). Kept per slot, so the paint path never reads the
+; property.
+opq_set:
+    push rsi
+    call window_lookup
+    pop rsi
+    test rax, rax
+    jz .os_done
+    lea rdx, [windows]
+    sub rax, rdx
+    shr eax, 6                               ; slot (WINDOW_REC_SIZE = 64)
+    mov [win_opq + rax*4], esi
+.os_done:
     ret
 
 ; ----------------------------------------------------------------------------
@@ -18724,8 +18778,12 @@ rect_covered_opaque:
     jne .rco_next
     cmp byte [rax + 28], 1                    ; mapped
     jne .rco_next
-    cmp byte [rax + 18], 24                   ; opaque visual
+    cmp byte [rax + 18], 24                   ; opaque visual, or an ARGB
+    je .rco_opaque                            ; one whose opaque region
+    mov edx, [win_opq + rcx*4]                ; covers the whole w x h
+    cmp edx, [rax + 12]
     jne .rco_next
+.rco_opaque:
     cmp byte [rax + 19], 1                    ; InputOutput
     jne .rco_next
     cmp byte [rax + 31], 1                    ; has backing
@@ -21712,7 +21770,15 @@ blit_window:
     mov r15d, [screen_w]
     xor eax, eax                           ; depth-32 (ARGB visual) windows
     cmp byte [r13 + 18], 32                ; blend instead of copy — real
-    sete al                                ; transparency (glass opacity)
+    jne .bw_mode                           ; transparency (glass opacity) —
+    mov rax, r13                           ; unless the client's opaque
+    lea rdx, [windows]                     ; region covers the whole window
+    sub rax, rdx                           ; (GTK4 sets it; gaze's pages
+    shr eax, 6                             ; then skip the per-pixel blend)
+    mov edx, [win_opq + rax*4]
+    cmp edx, [r13 + 12]
+    setne al
+.bw_mode:
     mov [rsp + 56], al
 
     ; X clip. win x in r14d.
