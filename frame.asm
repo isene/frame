@@ -911,8 +911,9 @@ clickpad_btn:       resd 1               ; button a clickpad BTN_LEFT press was
                                          ; mapped to (1 or 3) — release must
                                          ; emit the SAME button
 scroll_accum:       resd 2               ; two-finger Y, X since the last notch
-scroll_total:       resd 2               ; two-finger Y, X running sums (units)
-scroll_sum:         resd 2               ; |Y|, |X| moved this stroke, until the
+scroll_total:       resd MAX_CLIENTS * 2 ; per client: Y, X running sums of the
+                                         ; scroll steps it was sent (units)
+scroll_sum:        resd 2               ; |Y|, |X| moved this stroke, until the
                                          ; stroke's direction is decided
 scroll_lock:        resd 1               ; this stroke: 0 undecided, 1 vertical,
                                          ; 2 horizontal, 3 both
@@ -920,7 +921,7 @@ xi_scroll_on:       resb 1               ; valuator mask (4 = valuator 2, 8 = 3)
                                          ; of the XI_Motion being sent, 0 = none
 xi_emulated:        resb 1               ; the button being sent is a wheel click
                                          ; made from a touchpad scroll
-xi_scroll_val:      resq 1               ; scroll valuator, FP3232 as sent
+xi_scroll_delta:    resd 1               ; that XI_Motion's scroll step (units)
 scroll_atom:        resd 1               ; "Rel Vert Scroll"
 hscroll_atom:       resd 1               ; "Rel Horiz Scroll"
 tap_sec:            resq 1               ; BTN_TOUCH-down time (for tap timing)
@@ -1148,6 +1149,8 @@ pr_subs:            resb PR_SUB_MAX * 16
 pr_pend:            resb PR_PEND_MAX * 32
 pr_pend_n:          resd 1               ; live entries (cold-path gate)
 pr_msc:             resq 1               ; frame counter handed to GL clients
+pr_tick_due:        resq 1               ; monotonic ms when waiting GL frames
+                                         ; get a clock vblank; 0 = not set
 pr_last_tick:       resq 1               ; mono ms of the last tick
 pr_evbuf:           resb 40              ; Present GenericEvent scratch
 dma_sync:           resq 1               ; struct dma_buf_sync { u64 flags }
@@ -1985,7 +1988,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.32", 10
+version_str:        db "frame 0.1.33", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -5047,7 +5050,8 @@ serve_loop:
 .sl_chk_blank:                               ; flip_pending forever = black screen.
     cmp dword [pr_pend_n], 0                 ; a GL frame waits for its vblank
     je .sl_chk_blank_idle                    ; and nothing else will flip: tick
-    mov edx, 16                              ; it from the timeout instead
+    call pr_tick_left                        ; it from the clock instead
+    mov edx, eax
     jmp .sl_poll_go
 .sl_chk_blank_idle:
     ; Fully idle. Screen auto-off: wake exactly once, at the blank deadline.
@@ -5088,13 +5092,10 @@ serve_loop:
     test rax, rax
     jz .sl_poll_timeout
     js .sl_iter                              ; -EINTR or similar — re-poll
-    jmp .sl_poll_done
+    call pr_tick_check                       ; input woke us, but waiting GL
+    jmp .sl_poll_done                        ; frames still get their vblank
 .sl_poll_timeout:
-    cmp dword [pr_pend_n], 0                 ; pending presents, no flip in
-    je .sl_pt_no_present                     ; flight: this is their vblank
-    cmp byte [flip_pending], 0
-    jne .sl_pt_no_present
-    call present_tick
+    call pr_tick_check
 .sl_pt_no_present:
     cmp byte [flip_pending], 0               ; flip was pending → lost-flip path:
     je .sl_poll_done                         ; unstick + re-poll. Else this was the
@@ -14084,7 +14085,8 @@ process_input:
 ; scroll_axis — eax = two-finger delta (touchpad units), edi = 0 vertical /
 ; 1 horizontal. XI2 clients get every report as that axis' scroll valuator
 ; (2 or 3), a running total where 1.0 = one notch = 60 units, so a page
-; follows the fingers. Every client still gets a wheel notch per 60 units
+; follows the fingers. Each client has its own total, see
+; send_xi2_device_event. Every client still gets a wheel notch per 60 units
 ; (5 down / 4 up, 7 right / 6 left); XI2 ones see it flagged emulated.
 ; A stroke that is clearly vertical or sideways after 30 units scrolls on
 ; that axis only, so a vertical scroll does not drift sideways.
@@ -14129,15 +14131,8 @@ scroll_axis:
     jne .sa_ret                              ; the other axis: ignored
 .sa_go:
     add [scroll_accum + rbx*4], eax
-    add [scroll_total + rbx*4], eax
-    movsxd rax, dword [scroll_total + rbx*4]
-    shl rax, 32
-    cqo
-    mov ecx, 60
-    idiv rcx                                 ; total / 60 as 32.32 fixed point
-    rol rax, 32                              ; FP3232 puts the integral first
-    mov [xi_scroll_val], rax
-    mov eax, 4                               ; valuator 2 (bit 2) or 3 (bit 3)
+    mov [xi_scroll_delta], eax
+    mov eax, 4                              ; valuator 2 (bit 2) or 3 (bit 3)
     mov ecx, ebx
     shl eax, cl
     mov [xi_scroll_on], al
@@ -16776,8 +16771,20 @@ send_xi2_device_event:
     mov word [rdi + 50], 1                   ; valuators_len
     movzx eax, byte [xi_scroll_on]
     mov [rdi + 84], eax                      ; valuator mask: bit 2 or bit 3
-    mov rax, [xi_scroll_val]
-    mov [rdi + 88], rax                      ; FP3232
+    ; The value is this client's own total. A toolkit scrolls by the change
+    ; since the last value it saw (GTK3 never starts over), so one total for
+    ; all would dump every scroll done in other windows on it as a jump.
+    shr eax, 3                               ; 0 vertical, 1 sideways
+    lea rax, [rbx*2 + rax]
+    mov ecx, [xi_scroll_delta]
+    add [scroll_total + rax*4], ecx
+    movsxd rax, dword [scroll_total + rax*4]
+    shl rax, 32
+    cqo
+    mov ecx, 60
+    idiv rcx                                 ; total / 60 as 32.32 fixed point
+    rol rax, 32                              ; FP3232 puts the integral first
+    mov [rdi + 88], rax
     mov edx, 96
     jmp .sxd_send
 .sxd_button:
@@ -28336,6 +28343,7 @@ handle_present:
 ; completion (and from the poll timeout when nothing flips).
 ; ----------------------------------------------------------------------------
 present_tick:
+    mov qword [pr_tick_due], 0               ; the next wait gets a new deadline
     inc qword [pr_msc]
     cmp dword [pr_pend_n], 0
     je .pt_ret
@@ -28370,6 +28378,42 @@ present_tick:
     pop r12
     pop rbx
 .pt_ret:
+    ret
+
+; ----------------------------------------------------------------------------
+; pr_tick_left — eax = ms until GL frames waiting for a vblank get one from
+; the clock (nothing flips). The deadline is set once, when the wait starts.
+; A 16 ms timeout restarted on every wakeup never ran out while a touchpad
+; reported every 7 ms, so gaze got no frame for as long as a scroll lasted.
+; pr_tick_check — after any wakeup: tick them once that deadline has passed.
+; ----------------------------------------------------------------------------
+pr_tick_left:
+    call now_mono_ms
+    mov rdx, [pr_tick_due]
+    test rdx, rdx
+    jnz .ptl_have
+    lea rdx, [rax + 16]
+    mov [pr_tick_due], rdx
+.ptl_have:
+    sub rdx, rax
+    jg .ptl_ret
+    xor edx, edx                             ; already due: poll returns at once
+.ptl_ret:
+    mov eax, edx
+    ret
+
+pr_tick_check:
+    cmp dword [pr_pend_n], 0
+    je .ptc_ret
+    cmp byte [flip_pending], 0               ; a flip in flight ticks them
+    jne .ptc_ret
+    cmp qword [pr_tick_due], 0
+    je pr_tick_left                          ; no deadline yet: start one
+    call now_mono_ms
+    cmp rax, [pr_tick_due]
+    jb .ptc_ret
+    call present_tick
+.ptc_ret:
     ret
 
 ; ----------------------------------------------------------------------------
