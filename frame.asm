@@ -910,14 +910,19 @@ tap_moved:          resd 1               ; summed |ABS delta| during the touch
 clickpad_btn:       resd 1               ; button a clickpad BTN_LEFT press was
                                          ; mapped to (1 or 3) — release must
                                          ; emit the SAME button
-scroll_accum:       resd 1               ; two-finger Y accumulator → notches
-scroll_total:       resd 1               ; two-finger Y, running sum (units)
-xi_scroll_on:       resb 1               ; the XI_Motion being sent carries the
-                                         ; scroll valuator (XI 2.1 smooth scroll)
+scroll_accum:       resd 2               ; two-finger Y, X since the last notch
+scroll_total:       resd 2               ; two-finger Y, X running sums (units)
+scroll_sum:         resd 2               ; |Y|, |X| moved this stroke, until the
+                                         ; stroke's direction is decided
+scroll_lock:        resd 1               ; this stroke: 0 undecided, 1 vertical,
+                                         ; 2 horizontal, 3 both
+xi_scroll_on:       resb 1               ; valuator mask (4 = valuator 2, 8 = 3)
+                                         ; of the XI_Motion being sent, 0 = none
 xi_emulated:        resb 1               ; the button being sent is a wheel click
                                          ; made from a touchpad scroll
 xi_scroll_val:      resq 1               ; scroll valuator, FP3232 as sent
 scroll_atom:        resd 1               ; "Rel Vert Scroll"
+hscroll_atom:       resd 1               ; "Rel Horiz Scroll"
 tap_sec:            resq 1               ; BTN_TOUCH-down time (for tap timing)
 tap_usec:           resq 1
 ; Multitouch slot tracking (MT-B). Drives the cursor only in 2-finger-drag
@@ -1435,6 +1440,7 @@ str_xi_keyboard:    db "Virtual core keyboard"     ; 21 bytes
 str_rel_x:          db "Rel X"
 str_rel_y:          db "Rel Y"
 str_rel_vscroll:    db "Rel Vert Scroll"
+str_rel_hscroll:    db "Rel Horiz Scroll"
 str_monitor_default: db "default"
 str_monitor_ext:     db "ext"
 log_xkb_minor:      db "xkb minor=", 0
@@ -1979,7 +1985,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.31", 10
+version_str:        db "frame 0.1.32", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -2327,6 +2333,10 @@ _start:
     mov esi, 15
     call atom_create
     mov [scroll_atom], eax
+    lea rdi, [str_rel_hscroll]
+    mov esi, 16
+    call atom_create
+    mov [hscroll_atom], eax
     call init_clients
     call init_windows
     call init_gcs
@@ -9167,10 +9177,11 @@ handle_xinput:
     ret
 
 ; XIQueryDevice — enumerate two master devices so GTK4/Qt see input. Master
-; pointer (id 2): button class (7 buttons), valuators x, y and vertical scroll,
-; and a scroll class (XI 2.1) so toolkits scroll by the touchpad's pixels
-; instead of whole wheel clicks. Master keyboard (id 3): key class listing
-; keycodes 8..255. Layout offsets are fixed; total 1296 bytes. r12 = base.
+; pointer (id 2): button class (7 buttons), valuators x, y, vertical and
+; horizontal scroll, and a scroll class for each (XI 2.1) so toolkits scroll
+; by the touchpad's pixels instead of whole wheel clicks. Master keyboard
+; (id 3): key class listing keycodes 8..255. Offsets are fixed; total 1364
+; bytes. r12 = base.
 .xi_query_device:
     push rbx
     push r12
@@ -9187,8 +9198,8 @@ handle_xinput:
     call atom_lookup
     mov r14d, eax                             ; "Rel Y" atom
     mov edi, ebx
-    mov esi, 1296
-    call xkb_reply_zero                       ; zeroes, header (type/seq/length=316)
+    mov esi, 1364
+    call xkb_reply_zero                       ; zeroes, header (type/seq/length=333)
     mov r12, rdi                              ; reply base
     mov byte [r12 + 1], 0                     ; RepType
     mov word [r12 + 8], 2                     ; num_devices
@@ -9197,7 +9208,7 @@ handle_xinput:
     mov word [r12 + 32], 2                    ; deviceid
     mov word [r12 + 34], 1                    ; use = MasterPointer
     mov word [r12 + 36], 3                    ; attachment = keyboard
-    mov word [r12 + 38], 5                    ; num_classes
+    mov word [r12 + 38], 7                    ; num_classes
     mov word [r12 + 40], 20                   ; name_len
     mov byte [r12 + 42], 1                    ; enabled
     lea rdi, [r12 + 44]                        ; name
@@ -9236,24 +9247,38 @@ handle_xinput:
     mov word [r12 + 242], 2                   ; number = valuator 2
     mov word [r12 + 244], 1                   ; scroll_type = vertical
     mov dword [r12 + 252], 1                  ; increment 1.0 (FP3232)
+    ; ValuatorClass 3 at +260 — the horizontal scroll axis, relative
+    mov word [r12 + 260], 2                   ; type
+    mov word [r12 + 262], 11                  ; length
+    mov word [r12 + 264], 2                   ; sourceid
+    mov word [r12 + 266], 3                   ; number = 3
+    mov eax, [hscroll_atom]
+    mov [r12 + 268], eax                      ; label = "Rel Horiz Scroll"
+    ; ScrollClass at +304 — valuator 3 scrolls horizontally, 1.0 a notch
+    mov word [r12 + 304], 3                   ; type = ScrollClass
+    mov word [r12 + 306], 6                   ; length
+    mov word [r12 + 308], 2                   ; sourceid
+    mov word [r12 + 310], 3                   ; number = valuator 3
+    mov word [r12 + 312], 2                   ; scroll_type = horizontal
+    mov dword [r12 + 320], 1                  ; increment 1.0 (FP3232)
 
-    ; --- Device 2: master keyboard (id 3) at +260 ---
-    mov word [r12 + 260], 3                   ; deviceid
-    mov word [r12 + 262], 2                   ; use = MasterKeyboard
-    mov word [r12 + 264], 2                   ; attachment = pointer
-    mov word [r12 + 266], 1                   ; num_classes
-    mov word [r12 + 268], 21                  ; name_len
-    mov byte [r12 + 270], 1                   ; enabled
-    lea rdi, [r12 + 272]                       ; name
+    ; --- Device 2: master keyboard (id 3) at +328 ---
+    mov word [r12 + 328], 3                   ; deviceid
+    mov word [r12 + 330], 2                   ; use = MasterKeyboard
+    mov word [r12 + 332], 2                   ; attachment = pointer
+    mov word [r12 + 334], 1                   ; num_classes
+    mov word [r12 + 336], 21                  ; name_len
+    mov byte [r12 + 338], 1                   ; enabled
+    lea rdi, [r12 + 340]                       ; name
     lea rsi, [str_xi_keyboard]
     mov ecx, 21
     rep movsb
-    ; KeyClass at +296 (8 hdr + 248*4 keycodes = 1000, length 250)
-    mov word [r12 + 296], 0                   ; type = KeyClass
-    mov word [r12 + 298], 250                 ; length
-    mov word [r12 + 300], 3                   ; sourceid
-    mov word [r12 + 302], KEYCODE_RANGE       ; num_keycodes = 248
-    lea rdi, [r12 + 304]
+    ; KeyClass at +364 (8 hdr + 248*4 keycodes = 1000, length 250)
+    mov word [r12 + 364], 0                   ; type = KeyClass
+    mov word [r12 + 366], 250                 ; length
+    mov word [r12 + 368], 3                   ; sourceid
+    mov word [r12 + 370], KEYCODE_RANGE       ; num_keycodes = 248
+    lea rdi, [r12 + 372]
     mov eax, X_MIN_KEYCODE
 .xiqd_kc:
     mov [rdi], eax                            ; keycode
@@ -14055,6 +14080,99 @@ process_input:
 ; care about EV_KEY events: update modifier state if it's a modifier
 ; key, then check key_grabs[] for a matching grab.
 ; ----------------------------------------------------------------------------
+; ----------------------------------------------------------------------------
+; scroll_axis — eax = two-finger delta (touchpad units), edi = 0 vertical /
+; 1 horizontal. XI2 clients get every report as that axis' scroll valuator
+; (2 or 3), a running total where 1.0 = one notch = 60 units, so a page
+; follows the fingers. Every client still gets a wheel notch per 60 units
+; (5 down / 4 up, 7 right / 6 left); XI2 ones see it flagged emulated.
+; A stroke that is clearly vertical or sideways after 30 units scrolls on
+; that axis only, so a vertical scroll does not drift sideways.
+; ----------------------------------------------------------------------------
+scroll_axis:
+    test eax, eax                            ; no movement on this axis
+    jz .sa_none
+    push rbx
+    mov ebx, edi
+    mov ecx, [scroll_lock]
+    test ecx, ecx
+    jnz .sa_locked
+    mov edx, eax                             ; undecided: count |delta|
+    sar edx, 31
+    mov r8d, eax
+    xor r8d, edx
+    sub r8d, edx
+    add [scroll_sum + rbx*4], r8d
+    mov ecx, [scroll_sum]                    ; |Y|
+    mov edx, [scroll_sum + 4]                ; |X|
+    lea r8d, [rcx + rdx]
+    cmp r8d, 30
+    jb .sa_go                                ; too early to tell: both axes
+    mov dword [scroll_lock], 3               ; both, unless one axis wins 2:1
+    lea r8d, [rdx*2]
+    cmp ecx, r8d
+    jbe .sa_not_v
+    mov dword [scroll_lock], 1               ; vertical
+    jmp .sa_decided
+.sa_not_v:
+    lea r8d, [rcx*2]
+    cmp edx, r8d
+    jbe .sa_decided
+    mov dword [scroll_lock], 2               ; sideways
+.sa_decided:
+    mov ecx, [scroll_lock]
+.sa_locked:
+    cmp ecx, 3
+    je .sa_go
+    lea edx, [rbx + 1]                       ; 1 = vertical, 2 = sideways
+    cmp ecx, edx
+    jne .sa_ret                              ; the other axis: ignored
+.sa_go:
+    add [scroll_accum + rbx*4], eax
+    add [scroll_total + rbx*4], eax
+    movsxd rax, dword [scroll_total + rbx*4]
+    shl rax, 32
+    cqo
+    mov ecx, 60
+    idiv rcx                                 ; total / 60 as 32.32 fixed point
+    rol rax, 32                              ; FP3232 puts the integral first
+    mov [xi_scroll_val], rax
+    mov eax, 4                               ; valuator 2 (bit 2) or 3 (bit 3)
+    mov ecx, ebx
+    shl eax, cl
+    mov [xi_scroll_on], al
+    call deliver_pointer_motion
+    mov byte [xi_scroll_on], 0
+    mov byte [xi_emulated], 1
+.sa_fwd:
+    cmp dword [scroll_accum + rbx*4], 60
+    jl .sa_back
+    sub dword [scroll_accum + rbx*4], 60
+    lea esi, [rbx*2 + 5]                     ; 5 down / 7 right
+    call .sa_click
+    jmp .sa_fwd
+.sa_back:
+    cmp dword [scroll_accum + rbx*4], -60
+    jg .sa_end
+    add dword [scroll_accum + rbx*4], 60
+    lea esi, [rbx*2 + 4]                     ; 4 up / 6 left
+    call .sa_click
+    jmp .sa_back
+.sa_end:
+    mov byte [xi_emulated], 0
+.sa_ret:
+    pop rbx
+    ret
+.sa_none:
+    ret
+.sa_click:                                   ; esi = button: press + release
+    push rsi
+    mov edi, 4
+    call deliver_pointer_button
+    pop rsi
+    mov edi, 5
+    jmp deliver_pointer_button
+
 dispatch_input_event:
     push rbx
     push r12
@@ -14421,8 +14539,13 @@ dispatch_input_event:
     xor r8d, r9d
     sub r8d, r9d
     add [tap_moved], r8d
-    cmp dword [finger_count], 2               ; 2+ fingers: skip ABS X — a drag
-    jge .die_done                              ; uses MT (right finger), scroll is Y
+    cmp dword [finger_count], 2               ; <2 fingers: move from ABS
+    jl .die_abs_x_apply
+    cmp dword [button_state], 0                ; 2+ fingers + button → drag: MT
+    jne .die_done                              ; (right finger) handles it
+    mov edi, 1                                 ; 2+ fingers, no button → scroll
+    call scroll_axis                           ; sideways
+    jmp .die_done
 .die_abs_x_apply:
     SCALE_SENS
     add eax, [cursor_x]
@@ -14478,48 +14601,9 @@ dispatch_input_event:
     cmovg eax, ecx
     mov [cursor_y], eax
     jmp .die_motion
-    ; Two-finger vertical scroll. XI2 clients get every report as the
-    ; scroll valuator's running total (1.0 = one notch = 60 units), so a
-    ; page follows the fingers. Every client still gets a wheel notch
-    ; (button 5 down / 4 up) per 60 units; XI2 ones see it flagged emulated.
 .die_scroll_y:
-    add [scroll_accum], eax
-    add [scroll_total], eax
-    movsxd rax, dword [scroll_total]
-    shl rax, 32
-    cqo
-    mov ecx, 60
-    idiv rcx                                 ; total / 60 as 32.32 fixed point
-    rol rax, 32                              ; FP3232 puts the integral first
-    mov [xi_scroll_val], rax
-    mov byte [xi_scroll_on], 1
-    call deliver_pointer_motion
-    mov byte [xi_scroll_on], 0
-    mov byte [xi_emulated], 1
-.die_scroll_dn:
-    cmp dword [scroll_accum], 60
-    jl .die_scroll_up
-    sub dword [scroll_accum], 60
-    mov edi, 4
-    mov esi, 5
-    call deliver_pointer_button
-    mov edi, 5
-    mov esi, 5
-    call deliver_pointer_button
-    jmp .die_scroll_dn
-.die_scroll_up:
-    cmp dword [scroll_accum], -60
-    jg .die_scroll_end
-    add dword [scroll_accum], 60
-    mov edi, 4
-    mov esi, 4
-    call deliver_pointer_button
-    mov edi, 5
-    mov esi, 4
-    call deliver_pointer_button
-    jmp .die_scroll_up
-.die_scroll_end:
-    mov byte [xi_emulated], 0
+    xor edi, edi                             ; two-finger scroll, vertical
+    call scroll_axis
     jmp .die_done
 
     ; --- Multitouch (MT-B) per-finger tracking ----------------------------
@@ -14630,7 +14714,9 @@ dispatch_input_event:
     mov dword [tap_fingers], 2                ; for two-finger tap = right-click
     mov dword [abs_have_x], 0
     mov dword [abs_have_y], 0
-    mov dword [scroll_accum], 0
+    mov qword [scroll_accum], 0               ; a new stroke: both axes from
+    mov qword [scroll_sum], 0                 ; zero, direction not decided
+    mov dword [scroll_lock], 0
     jmp .die_done
 
 .die_btn_touch:
@@ -16683,12 +16769,13 @@ send_xi2_device_event:
     mov [rdi + 80], eax                      ; buttons mask
     mov edx, 84
     cmp r12d, 6                              ; a touchpad scroll step: Motion
-    jne .sxd_button                          ; with valuator 2's running total
+    jne .sxd_button                          ; with that valuator's running total
     cmp byte [xi_scroll_on], 0
     je .sxd_send
     mov dword [rdi + 4], 16                  ; (96-32)/4
     mov word [rdi + 50], 1                   ; valuators_len
-    mov dword [rdi + 84], 4                  ; valuator mask: bit 2
+    movzx eax, byte [xi_scroll_on]
+    mov [rdi + 84], eax                      ; valuator mask: bit 2 or bit 3
     mov rax, [xi_scroll_val]
     mov [rdi + 88], rax                      ; FP3232
     mov edx, 96
