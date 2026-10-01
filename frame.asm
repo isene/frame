@@ -1791,6 +1791,22 @@ dbg_cs_en:          db " enter=", 0
 dbg_cs_ec:          db " entercur=", 0
 dbg_evdrop:         db " evdrop=", 0
 dbg_direct:         db " direct=", 0
+; SIGUSR1 INPUT line: where pointer events would go right now. Written for
+; "the pointer is dead in one window" reports (gaze, 2026-10-01): a grab
+; or a wrong window under the pointer shows here; if neither, the client
+; got the events and dropped them.
+dbg_in_grab:        db "INPUT grab=", 0
+dbg_in_slot:        db " slot=", 0
+dbg_in_impl:        db " implicit=", 0
+dbg_in_xi2:         db " xi2=", 0
+dbg_in_btn:         db " buttons=", 0
+dbg_in_fing:        db " fingers=", 0
+dbg_in_under:       db " under=", 0
+dbg_in_xmask:       db " xi2mask=", 0
+dbg_in_mask:        db " mask=", 0
+dbg_in_x:           db " x=", 0
+dbg_in_y:           db " y=", 0
+dbg_in_focus:       db " focus=", 0
 log_ds_first:       db "frame: direct scanout, first flip rc=", 0
 log_ds_refused:     db "frame: direct scanout refused, off until restart, rc=", 0
 dbg_pxblit:         db " blit=", 0
@@ -2000,7 +2016,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.34", 10
+version_str:        db "frame 0.1.35", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -19426,9 +19442,13 @@ recomposite_screen:
     js .rs_fb_swap                           ; ext flip refused: don't gate on it
     inc byte [flip_pending]
 .rs_fb_swap:
-    mov eax, [comp_back]                     ; swap: submitted buffer is the
-    xor eax, 1                               ; new front; render the other next
-    mov [comp_back], eax
+    cmp byte [flip_pending], 0               ; no completion event will come
+    jne .rs_fb_swap_wait                     ; (--fbtest, dead DRM poll): the
+    call ds_landed                           ; flip counts as landed now, so a
+.rs_fb_swap_wait:                            ; client buffer it replaced goes
+    mov eax, [comp_back]                     ; back to its client
+    xor eax, 1                               ; swap: submitted buffer is the
+    mov [comp_back], eax                     ; new front; render the other next
     jmp .rs_done_pop
 .rs_no_swap:
     ; Flip rejected (VT switch / master contention): the buffer is painted
@@ -27242,6 +27262,76 @@ dump_handler:
     lea rsi, [dbg_direct]
     call write_str_stderr
     mov rax, [ds_flips]
+    call write_u64_stderr
+    lea rsi, [probe_conn_nl]
+    mov edx, 1
+    call write_stderr
+    lea rsi, [dbg_in_grab]                    ; INPUT line (xids in decimal)
+    call write_str_stderr
+    mov eax, [ptr_grab_win]
+    call write_u64_stderr
+    lea rsi, [dbg_in_slot]
+    call write_str_stderr
+    mov eax, [ptr_grab_slot]
+    call write_u64_stderr
+    lea rsi, [dbg_in_impl]
+    call write_str_stderr
+    movzx eax, byte [ptr_grab_implicit]
+    call write_u64_stderr
+    lea rsi, [dbg_in_xi2]
+    call write_str_stderr
+    movzx eax, byte [ptr_grab_xi2]
+    call write_u64_stderr
+    lea rsi, [dbg_in_btn]
+    call write_str_stderr
+    mov eax, [button_state]
+    call write_u64_stderr
+    lea rsi, [dbg_in_fing]
+    call write_str_stderr
+    mov eax, [finger_count]
+    call write_u64_stderr
+    mov edi, [last_enter_win]                 ; the window the pointer was last
+    xor eax, eax                              ; sent into (no hit-test here: this
+    test edi, edi                             ; is a signal handler, its scratch
+    jz .dh_in_have                            ; state belongs to the main loop)
+    call window_lookup
+.dh_in_have:
+    mov r12, rax
+    lea rsi, [dbg_in_under]
+    call write_str_stderr
+    xor eax, eax
+    test r12, r12
+    jz .dh_in_under
+    mov eax, [r12]
+.dh_in_under:
+    call write_u64_stderr
+    lea rsi, [dbg_in_xmask]
+    call write_str_stderr
+    xor eax, eax
+    test r12, r12
+    jz .dh_in_xmask
+    mov eax, [r12 + 52]
+.dh_in_xmask:
+    call write_u64_stderr
+    lea rsi, [dbg_in_mask]
+    call write_str_stderr
+    xor eax, eax
+    test r12, r12
+    jz .dh_in_mask
+    mov eax, [r12 + 24]
+.dh_in_mask:
+    call write_u64_stderr
+    lea rsi, [dbg_in_x]
+    call write_str_stderr
+    mov eax, [cursor_x]
+    call write_u64_stderr
+    lea rsi, [dbg_in_y]
+    call write_str_stderr
+    mov eax, [cursor_y]
+    call write_u64_stderr
+    lea rsi, [dbg_in_focus]
+    call write_str_stderr
+    mov eax, [focus_window]
     call write_u64_stderr
     lea rsi, [probe_conn_nl]
     mov edx, 1
