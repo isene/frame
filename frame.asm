@@ -934,6 +934,18 @@ mt_last_x:          resd 2
 mt_last_y:          resd 2
 mt_have_x:          resd 2
 mt_have_y:          resd 2
+; Two-finger scroll source. Per touch slot: the last position and how far
+; it moved in this report (x, y pairs). At the report's end the slot that
+; moved most drives the scroll. ABS_X/Y follow the FIRST contact, so a
+; thumb resting on the pad used to stop all scrolling. sc_abs is the same
+; movement from ABS_X/Y, for pads that report no slots.
+%define SC_SLOTS 5
+sc_slot:            resd 1               ; current slot; SC_SLOTS = out of range
+sc_have:            resd SC_SLOTS * 2    ; position seen since touch-down
+sc_last:            resd SC_SLOTS * 2
+sc_d:               resd SC_SLOTS * 2    ; moved this report
+sc_abs:             resd 2               ; ABS_X, ABS_Y moved this report
+sc_dirty:           resb 1               ; something moved: scroll_report has work
 
 ; ---- ConfigureWindow / ChangeWindowAttributes value-mask bits -------------
 ; (numeric defines used by the handlers; not in BSS)
@@ -1988,7 +2000,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.33", 10
+version_str:        db "frame 0.1.34", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -14168,6 +14180,102 @@ scroll_axis:
     mov edi, 5
     jmp deliver_pointer_button
 
+; ----------------------------------------------------------------------------
+; sc_track — a slot's ABS_MT_POSITION: edx = value, ecx = 0 x / 1 y. Adds
+; the movement since the slot's last position to this report's total.
+; Keeps edx and ecx.
+; ----------------------------------------------------------------------------
+sc_track:
+    mov eax, [sc_slot]
+    cmp eax, SC_SLOTS
+    jae .sct_ret
+    lea eax, [rax*2 + rcx]
+    cmp dword [sc_have + rax*4], 0
+    jne .sct_move
+    mov dword [sc_have + rax*4], 1           ; first sample: anchor only
+    mov [sc_last + rax*4], edx
+    ret
+.sct_move:
+    mov r8d, edx
+    sub r8d, [sc_last + rax*4]
+    mov [sc_last + rax*4], edx
+    add [sc_d + rax*4], r8d
+    mov byte [sc_dirty], 1
+.sct_ret:
+    ret
+
+; ----------------------------------------------------------------------------
+; scroll_report — the end of one touchpad report (SYN_REPORT). With two or
+; more fingers down and no button held, the slot that moved most scrolls,
+; whichever finger landed first. A pad without slots falls back to the
+; ABS_X/Y movement. Same typing mute as the pointer.
+; ----------------------------------------------------------------------------
+scroll_report:
+    cmp byte [sc_dirty], 0
+    je .sr_ret
+    mov byte [sc_dirty], 0
+    push rbx
+    push r12
+    push r13
+    xor ebx, ebx                             ; best |dx| + |dy| so far
+    xor r12d, r12d                           ; its dx
+    xor r13d, r13d                           ; its dy
+    xor ecx, ecx
+.sr_slot:
+    mov eax, [sc_d + rcx*8]
+    mov edx, [sc_d + rcx*8 + 4]
+    mov qword [sc_d + rcx*8], 0
+    mov r8d, eax
+    neg r8d
+    cmovs r8d, eax                           ; |dx|
+    mov r9d, edx
+    neg r9d
+    cmovs r9d, edx                           ; |dy|
+    add r8d, r9d
+    cmp r8d, ebx
+    jbe .sr_next
+    mov ebx, r8d
+    mov r12d, eax
+    mov r13d, edx
+.sr_next:
+    inc ecx
+    cmp ecx, SC_SLOTS
+    jb .sr_slot
+    mov eax, [sc_abs]
+    mov edx, [sc_abs + 4]
+    mov qword [sc_abs], 0
+    test ebx, ebx
+    jnz .sr_have
+    mov r12d, eax                            ; no slot moved: ABS_X/Y
+    mov r13d, edx
+.sr_have:
+    cmp dword [finger_count], 2
+    jl .sr_done
+    cmp dword [button_state], 0              ; button held: a drag
+    jne .sr_done
+    cmp dword [dwt_touch_dead], 0            ; disable-while-typing
+    jne .sr_done
+    mov ecx, [cfg_dwt_ms]
+    test ecx, ecx
+    jz .sr_live
+    mov eax, [server_time_ms]
+    sub eax, [dwt_last_key_ms]
+    cmp eax, ecx
+    jb .sr_done
+.sr_live:
+    mov eax, r13d
+    xor edi, edi
+    call scroll_axis                         ; vertical
+    mov eax, r12d
+    mov edi, 1
+    call scroll_axis                         ; sideways
+.sr_done:
+    pop r13
+    pop r12
+    pop rbx
+.sr_ret:
+    ret
+
 dispatch_input_event:
     push rbx
     push r12
@@ -14194,6 +14302,13 @@ dispatch_input_event:
     je .die_rel                              ; mouse motion / wheel
     cmp eax, EV_ABS
     je .die_abs                              ; touchpad absolute motion
+    test eax, eax                            ; EV_SYN: SYN_REPORT (code 0) ends
+    jnz .die_not_syn                         ; a report, the scroll is decided
+    cmp word [rbx + 18], 0
+    jne .die_done
+    call scroll_report
+    jmp .die_done
+.die_not_syn:
     cmp eax, EV_KEY
     jne .die_done
 
@@ -14538,8 +14653,8 @@ dispatch_input_event:
     jl .die_abs_x_apply
     cmp dword [button_state], 0                ; 2+ fingers + button → drag: MT
     jne .die_done                              ; (right finger) handles it
-    mov edi, 1                                 ; 2+ fingers, no button → scroll
-    call scroll_axis                           ; sideways
+    add [sc_abs], eax                          ; 2+ fingers, no button → scroll,
+    mov byte [sc_dirty], 1                     ; decided at the report's end
     jmp .die_done
 .die_abs_x_apply:
     SCALE_SENS
@@ -14597,8 +14712,8 @@ dispatch_input_event:
     mov [cursor_y], eax
     jmp .die_motion
 .die_scroll_y:
-    xor edi, edi                             ; two-finger scroll, vertical
-    call scroll_axis
+    add [sc_abs + 4], eax                    ; two-finger scroll, vertical:
+    mov byte [sc_dirty], 1                   ; decided at the report's end
     jmp .die_done
 
     ; --- Multitouch (MT-B) per-finger tracking ----------------------------
@@ -14607,6 +14722,10 @@ dispatch_input_event:
     ; here. Each moving finger contributes its delta to the cursor; the still
     ; click finger contributes ~0, so the cursor tracks the dragging finger.
 .die_mt_slot:
+    mov eax, SC_SLOTS                        ; the scroll source follows every
+    cmp edx, eax                             ; slot, the drag only two
+    cmovb eax, edx
+    mov [sc_slot], eax
     cmp edx, 2
     jb .die_mts_ok
     mov edx, 2                               ; clamp out-of-range to dead slot
@@ -14614,6 +14733,12 @@ dispatch_input_event:
     mov [mt_cur_slot], edx
     jmp .die_done
 .die_mt_trk:
+    mov ecx, [sc_slot]                       ; touch or lift: the slot starts
+    cmp ecx, SC_SLOTS                        ; over, and a lift's last jump
+    jae .die_mt_trk_drag                     ; must not scroll
+    mov qword [sc_have + rcx*8], 0
+    mov qword [sc_d + rcx*8], 0
+.die_mt_trk_drag:
     mov ecx, [mt_cur_slot]
     cmp ecx, 2
     jae .die_done
@@ -14621,6 +14746,8 @@ dispatch_input_event:
     mov dword [mt_have_y + rcx*4], 0
     jmp .die_done
 .die_mt_x:
+    xor ecx, ecx
+    call sc_track
     mov ecx, [mt_cur_slot]
     cmp ecx, 2
     jae .die_done
@@ -14649,6 +14776,8 @@ dispatch_input_event:
     mov [cursor_x], eax
     jmp .die_motion
 .die_mt_y:
+    mov ecx, 1
+    call sc_track
     mov ecx, [mt_cur_slot]
     cmp ecx, 2
     jae .die_done
@@ -14685,6 +14814,12 @@ dispatch_input_event:
     je .die_tool_one
     cmp r12d, 0x14d                          ; BTN_TOOL_DOUBLETAP (2 fingers)
     je .die_tool_two
+    cmp r12d, 0x14e                          ; BTN_TOOL_TRIPLETAP, QUADTAP and
+    je .die_tool_more                        ; QUINTTAP: a thumb or palm resting
+    cmp r12d, 0x14f                          ; beside two scrolling fingers
+    je .die_tool_more
+    cmp r12d, 0x148
+    je .die_tool_more
     ; Real buttons: BTN_LEFT(0x110)->1, MIDDLE(0x112)->2, RIGHT(0x111)->3.
     ; Other BTN_* (TRIPLETAP, etc.) ignored.
     cmp r12d, 0x110
@@ -14702,11 +14837,17 @@ dispatch_input_event:
     mov dword [abs_have_x], 0                 ; re-anchor on finger-config change
     mov dword [abs_have_y], 0
     jmp .die_done
+.die_tool_more:
+    test r13d, r13d
+    jz .die_done
+    mov dword [finger_count], 3               ; scrolls like two; the tap
+    jmp .die_tool_stroke                      ; (tap_fingers) stays as it was
 .die_tool_two:
     test r13d, r13d
     jz .die_done
     mov dword [finger_count], 2
     mov dword [tap_fingers], 2                ; for two-finger tap = right-click
+.die_tool_stroke:
     mov dword [abs_have_x], 0
     mov dword [abs_have_y], 0
     mov qword [scroll_accum], 0               ; a new stroke: both axes from
