@@ -1191,6 +1191,7 @@ raw_delta:          resd 1               ; unscaled evdev delta of this event
 ; ============================================================================
 SECTION .rodata
 x11_sock_dir:       db "/tmp/.X11-unix/X", 0
+x11_dir:            db "/tmp/.X11-unix", 0
 str_framerc:        db "/.framerc", 0
 str_dev_tty0:       db "/dev/tty0", 0
 str_netwm_cm:       db "_NET_WM_CM_S0"      ; compositor-manager selection
@@ -2016,7 +2017,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.35", 10
+version_str:        db "frame 0.1.36", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -2505,6 +2506,22 @@ socket_setup:
     lea rcx, [sockaddr_path]
     sub rax, rcx
     mov [sockaddr_pathlen], rax
+
+    ; /tmp/.X11-unix is there once any X server has run since boot. On a
+    ; machine that never had one, bind failed and frame exited: make it,
+    ; sticky and open to all as Xorg does. chmod because mkdir obeys the
+    ; umask; only for a directory this call created.
+    mov eax, 83                          ; SYS_MKDIR
+    lea rdi, [x11_dir]
+    mov esi, 0o1777
+    syscall
+    test rax, rax
+    jnz .ss_dir_ok
+    mov eax, 90                          ; SYS_CHMOD
+    lea rdi, [x11_dir]
+    mov esi, 0o1777
+    syscall
+.ss_dir_ok:
 
     ; Pre-unlink any stale socket file from a previous run. Ignore errors.
     mov rax, SYS_UNLINK

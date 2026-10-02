@@ -1,6 +1,7 @@
 frame
 frame.o
 *.swp
-/test/
+/test/*
+!/test/xcursors/
 *.deb
 pkgroot/
