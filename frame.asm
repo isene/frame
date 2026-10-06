@@ -486,6 +486,7 @@ mono_ts:            resq 2                 ; clock_gettime scratch
 blank_crtc_cmd:     resb 104               ; zeroed SETCRTC = CRTC off
 cfg_blankkey_sym:   resd 1                 ; blank_key keysym (0 = none)
 cfg_blankkey_mods:  resb 1                 ; blank_key required mod_state
+blank_why:          resb 1                 ; 0 = idle, 1 = blank_key, 2 = a faked blank_key
 blank_kc:           resd 1                 ; blank_key resolved X keycode
 ; ---- gamma / color temperature (Mod4+n night, Mod4+b sunlight) ----
 ; SETGAMMA on the CRTC(s): night-light warms (blue/green down), sunlight
@@ -1362,6 +1363,10 @@ log_input_suf:      db " input device(s)", 10
 log_input_suf_len   equ $ - log_input_suf
 log_blank:          db "frame: panel off (idle blank_timeout)", 10
 log_blank_len       equ $ - log_blank
+log_blank_key:      db "frame: panel off (blank_key, pressed on the keyboard)", 10
+log_blank_key_len   equ $ - log_blank_key
+log_blank_fake:     db "frame: panel off (blank_key, faked by a client)", 10
+log_blank_fake_len  equ $ - log_blank_fake
 log_unblank:        db "frame: panel on (input)", 10
 log_unblank_len     equ $ - log_unblank
 log_hotplug:        db "frame: display hotplug — outputs reconfigured", 10
@@ -2017,7 +2022,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.36", 10
+version_str:        db "frame 0.1.37", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -14475,7 +14480,16 @@ dispatch_input_event:
     jne .die_no_blankkey
     cmp r13d, 1
     jne .die_done                            ; swallow repeat/release too
+    ; Name the cause in the log. Every blank used to read "idle", so a
+    ; blank_key that fired by accident looked like a broken timer.
+    mov byte [blank_why], 1
+    lea rax, [xtest_fake_ev]                 ; XTEST builds its events here
+    cmp rbx, rax
+    jne .die_blank_go
+    mov byte [blank_why], 2
+.die_blank_go:
     call comp_blank
+    mov byte [blank_why], 0
     jmp .die_done
 .die_no_blankkey:
 
@@ -20420,7 +20434,15 @@ comp_blank:
     mov byte [blank_state], 1
     call log_stamp
     lea rsi, [log_blank]
-    mov rdx, log_blank_len
+    mov edx, log_blank_len
+    cmp byte [blank_why], 1                  ; lea and mov leave the flags alone
+    jb .cb_log
+    lea rsi, [log_blank_key]
+    mov edx, log_blank_key_len
+    je .cb_log
+    lea rsi, [log_blank_fake]
+    mov edx, log_blank_fake_len
+.cb_log:
     call write_stderr
 .cb_out:
     ret
