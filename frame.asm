@@ -487,6 +487,7 @@ blank_crtc_cmd:     resb 104               ; zeroed SETCRTC = CRTC off
 cfg_blankkey_sym:   resd 1                 ; blank_key keysym (0 = none)
 cfg_blankkey_mods:  resb 1                 ; blank_key required mod_state
 blank_why:          resb 1                 ; 0 = idle, 1 = blank_key, 2 = a faked blank_key
+unblank_why:        resb 1                 ; 0 = input, 1 = a monitor change
 blank_kc:           resd 1                 ; blank_key resolved X keycode
 ; ---- gamma / color temperature (Mod4+n night, Mod4+b sunlight) ----
 ; SETGAMMA on the CRTC(s): night-light warms (blue/green down), sunlight
@@ -1369,6 +1370,8 @@ log_blank_fake:     db "frame: panel off (blank_key, faked by a client)", 10
 log_blank_fake_len  equ $ - log_blank_fake
 log_unblank:        db "frame: panel on (input)", 10
 log_unblank_len     equ $ - log_unblank
+log_unblank_mon:    db "frame: panel on (monitor change reported by the kernel)", 10
+log_unblank_mon_len equ $ - log_unblank_mon
 log_hotplug:        db "frame: display hotplug — outputs reconfigured", 10
 log_hotplug_len     equ $ - log_hotplug
 stamp_open:         db "["
@@ -2022,7 +2025,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.37", 10
+version_str:        db "frame 0.1.38", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -18074,7 +18077,12 @@ compositor_reconfigure:
     jne .crc_done
     cmp byte [blank_state], 1                ; wake first: reprogramming dark
     jne .crc_awake                           ; CRTCs would fight the blank
+    ; No key woke the panel here, and the log must say so. The idle clock
+    ; is left alone on purpose: with nobody at the keys the panel goes
+    ; off again at once, so a loose cable cannot keep the screen lit.
+    mov byte [unblank_why], 1
     call comp_unblank
+    mov byte [unblank_why], 0
 .crc_awake:
     call ds_drop                             ; sizes may change: every client
     call ds_forget_fbs                       ; fb is rebuilt on demand
@@ -20474,7 +20482,12 @@ comp_unblank:
     mov byte [comp_dirty], 1
     call log_stamp
     lea rsi, [log_unblank]
-    mov rdx, log_unblank_len
+    mov edx, log_unblank_len
+    cmp byte [unblank_why], 0
+    je .cu_log
+    lea rsi, [log_unblank_mon]
+    mov edx, log_unblank_mon_len
+.cu_log:
     call write_stderr
 .cu_out:
     ret
