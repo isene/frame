@@ -2025,7 +2025,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.38", 10
+version_str:        db "frame 0.1.39", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -14958,12 +14958,25 @@ dispatch_input_event:
     jne .die_tap_emit
     mov esi, 3                                ; 2-finger tap → right button
 .die_tap_emit:
+    ; A tap is a press and a release in one go. The release must still say
+    ; that its own button was held, as every X release does. GTK4 lets go of
+    ; the clicked widget only when it reads exactly one held button there.
+    ; With none it kept the click pinned to the tapped page, and after a tab
+    ; switch in gaze the new page got no mouse at all (fixed v0.1.39).
     mov edi, 4                                ; ButtonPress
     push rsi
     call deliver_pointer_button
     pop rsi
+    mov edx, [button_state]
+    push rdx                                  ; the mask from before the tap
+    lea ecx, [rsi - 1]
+    mov eax, 0x100
+    shl eax, cl
+    or [button_state], eax
     mov edi, 5                                ; ButtonRelease
     call deliver_pointer_button
+    pop rdx
+    mov [button_state], edx
     jmp .die_done
 .die_btn_left:
     ; Clickpad "clickfinger": a physical press with 2 fingers resting is a
@@ -14994,6 +15007,9 @@ dispatch_input_event:
     ; Send first (so 'state' reflects pre-event mask), then update the mask.
     test r13d, r13d
     jz .die_btn_release
+    ; A touch that pressed a button is no tap. Without this a quick press
+    ; of the pad was two clicks: its own, and a tap when the finger lifted.
+    mov dword [tap_moved], 0x40000000
     mov edi, 4                               ; ButtonPress
     push rsi
     call deliver_pointer_button

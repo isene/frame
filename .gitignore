@@ -5,3 +5,5 @@ frame.o
 !/test/xcursors/
 *.deb
 pkgroot/
+!/test/run.sh
+!/test/tap.c
