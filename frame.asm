@@ -2025,7 +2025,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.39", 10
+version_str:        db "frame 0.1.40", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -11611,6 +11611,14 @@ handle_unmap_window:
     mov eax, [r12]                            ; focus follows the window off
     cmp eax, [focus_window]                   ; screen: an unviewable focus
     jne .uw_focus_ok                          ; swallows every key
+    ; The window is told, as X requires. tile hides the old workspace
+    ; before it moves the focus, so SetInputFocus found PointerRoot as
+    ; the old focus and told nobody. glass lets go of held keys on
+    ; FocusOut: with none, a held arrow key stayed down in a game after
+    ; a workspace switch (fixed v0.1.40).
+    mov edi, eax
+    mov esi, 10                               ; FocusOut
+    call send_focus_change
     mov dword [focus_window], 1               ; PointerRoot
 .uw_focus_ok:
     mov byte [comp_dirty], 1

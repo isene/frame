@@ -7,3 +7,4 @@ frame.o
 pkgroot/
 !/test/run.sh
 !/test/tap.c
+!/test/focus-unmap.c

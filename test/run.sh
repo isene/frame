@@ -21,6 +21,7 @@ done
 export HOME=$T/home PATH=$T/stub:$PATH XDG_RUNTIME_DIR=$T/run
 export DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent
 gcc -O1 -o "$T/tap" "$here/tap.c" -lX11 || exit 1
+gcc -O1 -o "$T/focus-unmap" "$here/focus-unmap.c" -lX11 || exit 1
 mkfifo "$T/pad"
 
 D=41; while [ -e /tmp/.X11-unix/X$D ]; do D=$((D + 1)); done
@@ -46,6 +47,13 @@ is "a two-finger tap lets go with the right button held" \
    "$("$T/tap" "$T/pad" tap2)" "press 3 0x000, release 3 0x400"
 is "a quick press of the pad's button is one click, with no tap after it" \
    "$("$T/tap" "$T/pad" quick)" "press 1 0x000, release 1 0x100"
+
+# tile hides the old workspace before it moves the keyboard. The hidden
+# window was never told, so glass kept a held arrow key down and a game
+# went on turning after the switch back.
+echo "== v0.1.40: a hidden window is told it lost the keyboard"
+is "a window that has the keyboard gets FocusOut when it is hidden" \
+   "$("$T/focus-unmap")" "FocusIn 1, UnmapNotify 1, FocusOut 1"
 
 echo
 if [ $fails -eq 0 ]; then echo "frame tests: all good"; else echo "frame tests: $fails failed"; fi
