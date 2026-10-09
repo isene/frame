@@ -1169,6 +1169,13 @@ pr_last_tick:       resq 1               ; mono ms of the last tick
 pr_evbuf:           resb 40              ; Present GenericEvent scratch
 dma_sync:           resq 1               ; struct dma_buf_sync { u64 flags }
 root_prop_sel:      resb MAX_CLIENTS     ; 1 = client selected PropertyChange on root
+; A client that selected PropertyChange on ANOTHER client's window. A
+; copy too big for one request is sent in pieces, and its owner waits for
+; PropertyNotify on the taker's window before it sends the next one.
+%define MAX_PROP_WATCH   256
+prop_watch_win:     resd MAX_PROP_WATCH  ; window xid, 0 = free
+prop_watch_slot:    resb MAX_PROP_WATCH  ; the client that asked
+prop_watch_n:       resd 1               ; live entries; 0 keeps the path cold
 fstat_buf:          resb 144             ; struct stat (st_size at +48)
 dp_args:            resd 8               ; dma_pixmap_create arguments: +0 pid,
                                          ; +4 w, +8 h, +12 stride, +16 offset,
@@ -2025,7 +2032,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.40", 10
+version_str:        db "frame 0.1.41", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -4312,6 +4319,11 @@ client_alloc:
     mov dword [clients_meta + rax + 20], 0   ; flags (CL_FLAG_DRI3)
     mov byte [cl_fd_n + rbx], 0              ; no passed fds queued
     mov byte [root_prop_sel + rbx], 0        ; a new client has selected nothing
+    cmp dword [prop_watch_n], 0
+    je .ca_no_watch
+    mov edi, ebx
+    call prop_watch_drop_slot                ; nor on anyone's window
+.ca_no_watch:
     call slots_watch                         ; DIAG: 3/4-full early warning
     mov eax, ebx
     pop r12
@@ -10992,6 +11004,11 @@ window_destroy:
                                              ; on the next client/window using
                                              ; this xid (and the 1024-slot
                                              ; table would exhaust under churn)
+    cmp dword [prop_watch_n], 0
+    je .wd_no_watch
+    mov edi, [r13]
+    call prop_watch_drop_win                 ; and whoever watched its properties
+.wd_no_watch:
     mov dword [r13], 0                       ; mark empty
     mov byte [r13 + 31], 0                   ; has_backing = 0
     mov qword [r13 + 32], 0
@@ -11271,6 +11288,22 @@ handle_change_window_attributes:
     setnz al
     mov [root_prop_sel + rbx], al
 .cwa_not_root_prop:
+    ; Another client's window: the window's one mask belongs to its owner,
+    ; so who else asked for PropertyNotify is kept in the watch table.
+    mov eax, [r13]
+    cmp eax, X_RID_BASE
+    jb .cwa_prop_done
+    sub eax, X_RID_BASE
+    shr eax, 21                              ; owner slot
+    cmp eax, ebx
+    je .cwa_prop_done                        ; the owner is told by the mask
+    mov edi, [r13]
+    mov esi, ebx
+    xor edx, edx
+    test r8d, EM_PROPERTY_CHANGE
+    setnz dl
+    call prop_watch_set                      ; keeps r8
+.cwa_prop_done:
     test r8d, EM_SUBSTRUCTURE_REDIRECT
     jz .cwa_clear_redirect
     movsx eax, byte [r13 + 30]
@@ -12386,21 +12419,28 @@ opq_set:
 ; window's (combined) event mask. Root properties go to every client
 ; that selected PropertyChange on root (root_prop_sel; frame keeps one
 ; mask per window, and root has many listeners, e.g. strip watching
-; tile's EWMH properties).
+; tile's EWMH properties). Any other client that selected it on this
+; window is in the watch table and is sent the event too.
 ; ----------------------------------------------------------------------------
 send_property_notify:
     push rbx
     push r12
     push r13
     push r14
+    push r15
     mov r12d, edi                            ; window
     mov r13d, esi                            ; atom
     mov r14d, edx                            ; state
     call window_lookup
     test rax, rax
     jz .spn_done
+    xor r15d, r15d
     test dword [rax + 24], EM_PROPERTY_CHANGE
-    jz .spn_done
+    setnz r15b                               ; 1 = the window's own mask asks
+    jnz .spn_build
+    cmp dword [prop_watch_n], 0
+    je .spn_done
+.spn_build:
     ; Fresh timestamp, not the last-input one: Qt and GTK learn "server
     ; time" from THIS event's time field (their zero-length-property
     ; dance), then Qt refuses to serve selections it acquired at time 0 —
@@ -12422,18 +12462,44 @@ send_property_notify:
     je .spn_root
     cmp r12d, X_RID_BASE
     jb .spn_done
+    test r15d, r15d
+    jz .spn_watchers
     mov eax, r12d
     sub eax, X_RID_BASE
     shr eax, 21                              ; owner slot
     cmp eax, MAX_CLIENTS
-    jae .spn_done
+    jae .spn_watchers
     mov ebx, eax
     call client_meta_addr                    ; eax = slot
     cmp dword [rax], -1                      ; fd live?
-    je .spn_done
+    je .spn_watchers
     mov edi, ebx
     lea rsi, [pn_buf]
     call send_event_to_slot
+.spn_watchers:
+    ; The other clients that asked on this window. Without them a copy
+    ; sent in pieces stopped after the first: the owner of a 5 MB picture
+    ; never learnt that the taker had read it.
+    cmp dword [prop_watch_n], 0
+    je .spn_done
+    xor ebx, ebx
+.spn_watch_loop:
+    cmp [prop_watch_win + rbx*4], r12d
+    jne .spn_watch_next
+    movzx r15d, byte [prop_watch_slot + rbx]
+    mov eax, r15d
+    call client_meta_addr
+    cmp dword [rax], -1
+    je .spn_watch_next
+    cmp byte [rax + 4], CSTATE_RUNNING
+    jne .spn_watch_next
+    mov edi, r15d
+    lea rsi, [pn_buf]
+    call send_event_to_slot
+.spn_watch_next:
+    inc ebx
+    cmp ebx, MAX_PROP_WATCH
+    jb .spn_watch_loop
     jmp .spn_done
 .spn_root:
     xor ebx, ebx
@@ -12458,10 +12524,86 @@ send_property_notify:
     inc ebx
     jmp .spn_root_loop
 .spn_done:
+    pop r15
     pop r14
     pop r13
     pop r12
     pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; The watch table: clients that selected PropertyChange on a window they
+; do not own. All three helpers change only rax, rcx and r9.
+;
+; prop_watch_set — edi = window xid, esi = client slot, edx = 1 to watch,
+; 0 to stop. A full table leaves a new watcher out.
+; ----------------------------------------------------------------------------
+prop_watch_set:
+    xor ecx, ecx
+    mov r9d, -1                              ; first free entry
+.pws_loop:
+    mov eax, [prop_watch_win + rcx*4]
+    test eax, eax
+    jnz .pws_used
+    cmp r9d, -1
+    jne .pws_next
+    mov r9d, ecx
+    jmp .pws_next
+.pws_used:
+    cmp eax, edi
+    jne .pws_next
+    movzx eax, byte [prop_watch_slot + rcx]
+    cmp eax, esi
+    je .pws_found
+.pws_next:
+    inc ecx
+    cmp ecx, MAX_PROP_WATCH
+    jb .pws_loop
+    test edx, edx
+    jz .pws_ret
+    cmp r9d, -1
+    je .pws_ret
+    mov [prop_watch_win + r9*4], edi
+    mov [prop_watch_slot + r9], sil
+    inc dword [prop_watch_n]
+    ret
+.pws_found:
+    test edx, edx
+    jnz .pws_ret                             ; watching already
+    mov dword [prop_watch_win + rcx*4], 0
+    dec dword [prop_watch_n]
+.pws_ret:
+    ret
+
+; prop_watch_drop_win — edi = window xid (never 0): the window is gone.
+prop_watch_drop_win:
+    xor ecx, ecx
+.pwdw_loop:
+    cmp [prop_watch_win + rcx*4], edi
+    jne .pwdw_next
+    mov dword [prop_watch_win + rcx*4], 0
+    dec dword [prop_watch_n]
+.pwdw_next:
+    inc ecx
+    cmp ecx, MAX_PROP_WATCH
+    jb .pwdw_loop
+    ret
+
+; prop_watch_drop_slot — edi = client slot: a new client has it now.
+prop_watch_drop_slot:
+    xor ecx, ecx
+.pwds_loop:
+    cmp dword [prop_watch_win + rcx*4], 0
+    je .pwds_next
+    movzx eax, byte [prop_watch_slot + rcx]
+    cmp eax, edi
+    jne .pwds_next
+    mov dword [prop_watch_win + rcx*4], 0
+    dec dword [prop_watch_n]
+.pwds_next:
+    inc ecx
+    cmp ecx, MAX_PROP_WATCH
+    jb .pwds_loop
     ret
 
 ; ============================================================================

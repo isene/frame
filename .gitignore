@@ -8,3 +8,4 @@ pkgroot/
 !/test/run.sh
 !/test/tap.c
 !/test/focus-unmap.c
+!/test/prop-watch.c

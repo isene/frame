@@ -22,6 +22,7 @@ export HOME=$T/home PATH=$T/stub:$PATH XDG_RUNTIME_DIR=$T/run
 export DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent
 gcc -O1 -o "$T/tap" "$here/tap.c" -lX11 || exit 1
 gcc -O1 -o "$T/focus-unmap" "$here/focus-unmap.c" -lX11 || exit 1
+gcc -O1 -o "$T/prop-watch" "$here/prop-watch.c" -lX11 || exit 1
 mkfifo "$T/pad"
 
 D=41; while [ -e /tmp/.X11-unix/X$D ]; do D=$((D + 1)); done
@@ -54,6 +55,14 @@ is "a quick press of the pad's button is one click, with no tap after it" \
 echo "== v0.1.40: a hidden window is told it lost the keyboard"
 is "a window that has the keyboard gets FocusOut when it is hidden" \
    "$("$T/focus-unmap")" "FocusIn 1, UnmapNotify 1, FocusOut 1"
+
+# A copy bigger than one request (256 kB) is sent in pieces. Its owner
+# waits for a property event on the taker's window before the next piece.
+# frame told only the window's own client, so a pasted screenshot stopped
+# after the first piece and the paste hung.
+echo "== v0.1.41: a client is told of property changes on another's window"
+is "the owner and the watcher both hear a change and a delete" \
+   "$("$T/prop-watch")" "owner 2, watcher 2, after it stopped 0, a new client in its place 0"
 
 echo
 if [ $fails -eq 0 ]; then echo "frame tests: all good"; else echo "frame tests: $fails failed"; fi
