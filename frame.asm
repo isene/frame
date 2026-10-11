@@ -793,6 +793,12 @@ co_prev_src:        resq 1               ; fast path: source row the row above
 co_prev_dst:        resq 1               ; fast path: where that row went
 flush_kind:         resb 1               ; 0 clflush, 1 clflushopt, 2 clwb (cpuid at start)
 rs_rect_opaque:     resb 1               ; this damage rect lies under an opaque window
+rs_rect_blend:      resb 1               ; this damage rect is being painted in comp_scratch
+comp_scratch:       resq 1               ; plain memory shaped like the screen buffer (0 = none yet)
+comp_scratch_size:  resq 1               ; its size in bytes
+rs_real_addr:       resq 1               ; the screen buffer, while drm_dumb_addr points at the scratch
+rs_full_rect:       resd 4               ; the whole screen as a rect (x1, y1, x2, y2)
+comp_px_readback:   resq 1               ; pixels mixed by reading the screen buffer (stays 0)
 tz_dst_ptr:         resq 1               ; render_trapezoids: dst backing
 tz_dst_stride:      resd 1
 tz_dst_h:           resd 1
@@ -1807,6 +1813,7 @@ dbg_cs_en:          db " enter=", 0
 dbg_cs_ec:          db " entercur=", 0
 dbg_evdrop:         db " evdrop=", 0
 dbg_direct:         db " direct=", 0
+dbg_readback:       db " readback=", 0
 ; SIGUSR1 INPUT line: where pointer events would go right now. Written for
 ; "the pointer is dead in one window" reports (gaze, 2026-10-01): a grab
 ; or a wrong window under the pointer shows here; if neither, the client
@@ -2032,7 +2039,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.41", 10
+version_str:        db "frame 0.1.42", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -19373,6 +19380,152 @@ rect_covered_opaque:
     xor eax, eax
     ret
 
+; ----------------------------------------------------------------------------
+; A see-through window is mixed with what lies under it, so the pixels
+; under it must be read. The screen buffer is write-combining memory:
+; quick to write, and about 350 times slower to read than plain memory.
+; One full read of a 1920x1200 panel took 0.8 s (measured 2026-10-11), so
+; a focus change beside a see-through glass took over a second.
+;
+; A rect that a see-through window touches is therefore painted in
+; comp_scratch, plain memory shaped like the screen buffer, and copied to
+; the screen buffer in one write. Other rects never come here, and the
+; scratch is not mapped until the first see-through rect arrives.
+;
+; rect_blend_setup: rbx = rect (x1, y1, x2, y2). Points drm_dumb_addr at
+; the scratch when a see-through window touches the rect.
+; rect_blend_finish: rbx = the same rect. Copies it to the screen buffer
+; and points drm_dumb_addr back. Both keep rbx and r12-r15.
+; ----------------------------------------------------------------------------
+rect_blend_setup:
+    mov byte [rs_rect_blend], 0
+    call rect_blend_window
+    test eax, eax
+    jz .rbs_ret
+    call scratch_ready
+    test rax, rax
+    jz .rbs_ret                               ; no memory: mix in place, slow but right
+    mov rcx, [drm_dumb_addr]
+    mov [rs_real_addr], rcx
+    mov [drm_dumb_addr], rax
+    mov byte [rs_rect_blend], 1
+.rbs_ret:
+    ret
+
+rect_blend_finish:
+    cmp byte [rs_rect_blend], 0
+    je .rbf_ret
+    mov byte [rs_rect_blend], 0
+    mov r8, [drm_dumb_addr]                   ; the scratch
+    mov r9, [rs_real_addr]
+    mov [drm_dumb_addr], r9
+    mov r10d, [rbx + 8]
+    sub r10d, [rbx + 0]                       ; w
+    jle .rbf_ret
+    mov r11d, [rbx + 0]
+    shl r11, 2                                ; x * 4
+    mov edx, [rbx + 4]                        ; y
+.rbf_row:
+    cmp edx, [rbx + 12]
+    jge .rbf_ret
+    mov eax, edx
+    imul eax, [drm_dumb_pitch]
+    add rax, r11
+    lea rsi, [r8 + rax]
+    lea rdi, [r9 + rax]
+    mov ecx, r10d
+    rep movsd
+    inc edx
+    jmp .rbf_row
+.rbf_ret:
+    ret
+
+; rbx = rect. eax = 1 when a mapped window that blit_window mixes (depth 32
+; and no opaque region over all of it) overlaps the rect. Keeps rbx.
+rect_blend_window:
+    push r12
+    push r13
+    xor r12d, r12d                            ; slot
+    lea r13, [windows]
+.rbw_loop:
+    cmp byte [r13 + 18], 32                   ; nearly every window stops here
+    jne .rbw_next
+    cmp dword [r13], 0
+    je .rbw_next
+    cmp byte [r13 + 28], 0                    ; mapped
+    je .rbw_next
+    cmp byte [r13 + 31], 0                    ; has backing
+    je .rbw_next
+    mov eax, [win_opq + r12*4]
+    cmp eax, [r13 + 12]                       ; solid all over: copied, never mixed
+    je .rbw_next
+    movsx r10d, word [r13 + 8]
+    movsx r11d, word [r13 + 10]
+    cmp dword [r13 + 4], X_ROOT_WINDOW
+    je .rbw_have_xy
+    mov edi, [r13]
+    call window_abs_xy                        ; r10d = x, r11d = y on the screen
+.rbw_have_xy:
+    cmp r10d, [rbx + 8]
+    jge .rbw_next
+    cmp r11d, [rbx + 12]
+    jge .rbw_next
+    movzx eax, word [r13 + 40]                ; backing_w: what blit_window paints
+    add eax, r10d
+    cmp eax, [rbx + 0]
+    jle .rbw_next
+    movzx eax, word [r13 + 42]
+    add eax, r11d
+    cmp eax, [rbx + 4]
+    jle .rbw_next
+    mov eax, 1
+    jmp .rbw_ret
+.rbw_next:
+    add r13, WINDOW_REC_SIZE
+    inc r12d
+    cmp r12d, MAX_WINDOWS
+    jl .rbw_loop
+    xor eax, eax
+.rbw_ret:
+    pop r13
+    pop r12
+    ret
+
+; rax = the scratch, 0 when there is no memory for it. Mapped on first use,
+; and again when the screen buffers change size (a monitor came or went).
+scratch_ready:
+    mov rax, [comp_scratch]
+    mov rsi, [drm_dumb_size]
+    cmp rsi, [comp_scratch_size]
+    je .scr_ret
+    test rax, rax
+    jz .scr_map
+    mov rdi, rax
+    mov rsi, [comp_scratch_size]
+    mov rax, SYS_MUNMAP
+    syscall
+.scr_map:
+    mov qword [comp_scratch], 0
+    mov qword [comp_scratch_size], 0
+    mov rax, SYS_MMAP
+    xor edi, edi
+    mov rsi, [drm_dumb_size]
+    mov edx, 3                                ; PROT_READ|PROT_WRITE
+    mov r10d, 0x22                            ; MAP_PRIVATE|MAP_ANONYMOUS
+    mov r8, -1
+    xor r9d, r9d
+    syscall
+    cmp rax, -4096
+    ja .scr_fail
+    mov [comp_scratch], rax
+    mov rsi, [drm_dumb_size]
+    mov [comp_scratch_size], rsi
+    ret
+.scr_fail:
+    xor eax, eax
+.scr_ret:
+    ret
+
 ; cpuid leaf 7: pick the cheapest way to push framebuffer lines to RAM.
 detect_flush_kind:
     push rbx
@@ -19470,6 +19623,7 @@ recomposite_screen:
     call rect_unpainted_hold
     test eax, eax
     jnz .rs_rect_hold
+    call rect_blend_setup                     ; a see-through window here: paint in plain memory
     call rect_covered_opaque
     mov [rs_rect_opaque], al
     mov eax, [rbx + 0]
@@ -19496,6 +19650,7 @@ recomposite_screen:
     call .rs_window_walk
     call xor_band_apply                       ; rubber band rides on top
     call warn_band_apply                      ; and the out-of-slots warning
+    call rect_blend_finish
     jmp .rs_rect_next
 .rs_rect_hold:
     ; The window owning this rect is mapped but has never drawn, and it
@@ -19563,6 +19718,13 @@ recomposite_screen:
     mov [bw_clip_x2], eax
     mov eax, [screen_h]
     mov [bw_clip_y2], eax
+    lea rbx, [rs_full_rect]                   ; the whole screen as one rect
+    mov qword [rbx], 0
+    mov eax, [screen_w]
+    mov [rbx + 8], eax
+    mov eax, [screen_h]
+    mov [rbx + 12], eax
+    call rect_blend_setup                     ; a see-through window: paint in plain memory
     xor eax, eax                              ; whole-screen bg (wallpaper/solid)
     xor esi, esi
     mov edi, [screen_w]
@@ -19574,6 +19736,7 @@ recomposite_screen:
     call .rs_window_walk
     call xor_band_apply                       ; rubber band rides on top
     call warn_band_apply                      ; and the out-of-slots warning
+    call rect_blend_finish
     call lens_draw                            ; magnifier overlay
     mov rdi, [drm_dumb_addr]
     mov rcx, [drm_dumb_size]
@@ -22440,7 +22603,7 @@ blit_window:
     mov ecx, [rsp + 40]                     ; copy_w
     add [comp_px_blit], rcx                 ; PERF counter
     cmp byte [rsp + 56], 0
-    jne .bw_blend
+    jne .bw_blend_row
     rep movsd
 .bw_row_next:
     inc r12d
@@ -22450,6 +22613,11 @@ blit_window:
     ; unscaled RGB; its text cells are opaque, so the a=255 fast path
     ; covers glyphs and only the translucent background pays the blend;
     ; for premultiplied toolkit pixels a=255 regions are identical).
+.bw_blend_row:
+    mov rax, [drm_dumb_addr]                ; mixing in the screen buffer itself
+    cmp rax, [comp_scratch]                 ; is the slow read rect_blend_setup
+    je .bw_blend                            ; exists to avoid: count it
+    add [comp_px_readback], rcx
 .bw_blend:
     mov eax, [rsi]
     mov edx, eax
@@ -27480,6 +27648,10 @@ dump_handler:
     lea rsi, [dbg_direct]
     call write_str_stderr
     mov rax, [ds_flips]
+    call write_u64_stderr
+    lea rsi, [dbg_readback]
+    call write_str_stderr
+    mov rax, [comp_px_readback]
     call write_u64_stderr
     lea rsi, [probe_conn_nl]
     mov edx, 1
