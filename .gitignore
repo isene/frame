@@ -10,3 +10,4 @@ pkgroot/
 !/test/focus-unmap.c
 !/test/prop-watch.c
 !/test/see-through.c
+!/test/caps-lock.c

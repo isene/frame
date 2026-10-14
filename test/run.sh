@@ -24,7 +24,9 @@ gcc -O1 -o "$T/tap" "$here/tap.c" -lX11 || exit 1
 gcc -O1 -o "$T/focus-unmap" "$here/focus-unmap.c" -lX11 || exit 1
 gcc -O1 -o "$T/prop-watch" "$here/prop-watch.c" -lX11 || exit 1
 gcc -O1 -o "$T/see-through" "$here/see-through.c" -lX11 || exit 1
+gcc -O1 -o "$T/caps-lock" "$here/caps-lock.c" -lX11 || exit 1
 mkfifo "$T/pad"
+printf 'keymap = no\n' > "$T/home/.framerc"   # caps-lock types AltGr+e = euro sign
 
 D=41; while [ -e /tmp/.X11-unix/X$D ]; do D=$((D + 1)); done
 "$FRAME" $D --fbtest --noinput --testinput "$T/pad" 2> "$T/frame.log" &
@@ -77,6 +79,15 @@ kill -USR1 $FPID; sleep 0.3
 is "no pixel was mixed in the screen buffer" \
    "$(grep -a FBSTATE "$T/frame.log" | tail -1 | sed -n 's/.* readback=\([0-9]*\).*/\1/p')" 0
 rm -f /tmp/frame${D}_*.raw
+
+# ~/bin/toggle-capslock asks for the caps lock light, then locks Lock.
+# frame answered neither request: the script hung, and caps lock never
+# came on. Letter keys did not read Lock either.
+echo "== v0.1.43: caps lock goes on and off"
+out=$("$T/caps-lock" "$T/pad")
+is "the light is answered, and follows caps lock" "${out%%,*}" "light 0 1 0"
+is "with caps lock on, letters are capitals, AltGr and digits are not" \
+   "${out#*, }" "on: A a E EuroSign 1, off: a"
 
 echo
 if [ $fails -eq 0 ]; then echo "frame tests: all good"; else echo "frame tests: $fails failed"; fi

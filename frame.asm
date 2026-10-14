@@ -871,6 +871,7 @@ input_fd_count:     resd 1
 grab_bits:          resb 96                ; EVIOCGBIT capability scratch
 mod_state:          resd 1
 focus_window:       resd 1               ; SetInputFocus target (0/1 = none/PointerRoot)
+led_ev:             resb 48              ; caps_led: EV_LED + SYN_REPORT records
 keys_down:          resb 32              ; QueryKeymap bitmap: bit = X keycode,
                                          ; set on press, cleared on release
 screen_w:           resd 1               ; advertised screen size; defaults to
@@ -1520,6 +1521,24 @@ xkb_types_blob:
     dw 0x0000, 0x0000
     db 1, 0x81, 3, 0x81        ;     Shift|Mod5 → level 3
     dw 0x0000, 0x0000
+    ; type 4 FOUR_LEVEL_SEMIALPHABETIC: a letter with AltGr symbols (e and
+    ; € on the Norwegian map). Lock counts as Shift for the letter only;
+    ; Shift with Lock gives the small letter again, like ALPHABETIC.
+    db 0x83, 0x83              ;   mask=Shift|Lock|Mod5
+    dw 0x0000
+    db 4, 6, 0, 0              ;   numLevels=4, nMapEntries=6
+    db 1, 0x01, 1, 0x01        ;     Shift → level 1
+    dw 0x0000, 0x0000
+    db 1, 0x02, 1, 0x02        ;     Lock → level 1
+    dw 0x0000, 0x0000
+    db 1, 0x80, 2, 0x80        ;     Mod5 → level 2
+    dw 0x0000, 0x0000
+    db 1, 0x81, 3, 0x81        ;     Shift|Mod5 → level 3
+    dw 0x0000, 0x0000
+    db 1, 0x82, 2, 0x82        ;     Lock|Mod5 → level 2
+    dw 0x0000, 0x0000
+    db 1, 0x83, 3, 0x83        ;     Shift|Lock|Mod5 → level 3
+    dw 0x0000, 0x0000
 xkb_types_blob_end:
 XKB_TYPES_BYTES equ xkb_types_blob_end - xkb_types_blob
 
@@ -2039,7 +2058,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.42", 10
+version_str:        db "frame 0.1.43", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -7632,6 +7651,10 @@ handle_xkb:
     je .xkb_per_client_flags
     cmp eax, 4                               ; 4  = XkbGetState (GIMP uses it)
     je .xkb_get_state
+    cmp eax, 5                               ; 5  = XkbLatchLockState (void)
+    je .xkb_latch_lock_state
+    cmp eax, 12                              ; 12 = XkbGetIndicatorState
+    je .xkb_get_indicator_state
     ; --- DIAG (temporary): log unhandled XKB minor opcode ---
     push rax
     mov rsi, log_xkb_minor
@@ -7647,16 +7670,57 @@ handle_xkb:
 .xkb_select_events:
     ret                                       ; XkbSelectEvents is void — no reply
 
-.xkb_get_state:                               ; idle state: no mods, group 0, no buttons
+.xkb_get_state:                               ; the mods held now, group 0, no buttons
     mov esi, 32
     call xkb_reply_zero
     mov byte [rdi + 1], 3                      ; deviceID = core keyboard
+    movzx eax, byte [mod_state]
+    mov [rdi + 8], al                          ; mods
+    mov [rdi + 18], al                         ; compatState
+    mov [rdi + 21], al                         ; lookupMods
+    mov [rdi + 22], al                         ; compatLookupMods
+    mov ecx, eax
+    and ecx, 2                                 ; Lock: the one locked mod
+    mov [rdi + 11], cl                         ; lockedMods
+    xor eax, ecx
+    mov [rdi + 9], al                          ; baseMods
     lea rsi, [reply_buf]
     mov edi, r15d
     mov edx, r8d
     mov eax, SYS_WRITE
     syscall
     ret
+
+.xkb_latch_lock_state:
+    ; XkbLockModifiers (~/bin/toggle-capslock) turns caps lock on and off
+    ; here. Only Lock (bit 2) is kept; other locks and latches are dropped.
+    ; Lock then rides in mod_state, so every event's state carries it.
+    movzx eax, byte [rsi + 6]                 ; affectModLocks
+    and eax, 2                                ; Lock
+    jz .xkb_ll_done
+    movzx ecx, byte [rsi + 7]                 ; modLocks
+    and ecx, eax
+    mov edx, [mod_state]
+    mov r8d, edx
+    not eax
+    and edx, eax
+    or edx, ecx
+    mov [mod_state], edx
+    cmp edx, r8d
+    jne caps_led                              ; changed: the key's light follows
+.xkb_ll_done:
+    ret
+
+.xkb_get_indicator_state:
+    ; Bit 0 is the Caps Lock light. toggle-capslock waits for this answer.
+    mov esi, 32
+    call xkb_reply_zero
+    mov byte [rdi + 1], 3                      ; deviceID = core keyboard
+    movzx eax, byte [mod_state]
+    shr eax, 1
+    and eax, 1
+    mov [rdi + 8], eax                         ; state
+    jmp .xkb_reply_write
 
 .xkb_per_client_flags:
     ; GTK calls XkbSetDetectableAutoRepeat → PerClientFlags and BLOCKS on the
@@ -7732,7 +7796,7 @@ handle_xkb:
                                              ; _XkbReadGetMapReply reads modmap at the
                                              ; wrong offset and SIGSEGVs (GIMP crash).
 
-    ; --- key types (copy the 56-byte static blob) ---
+    ; --- key types (copy the static blob) ---
     lea rdi, [reply_buf + 40]                ; data follows the 40-byte header
     lea rsi, [xkb_types_blob]
     mov ecx, XKB_TYPES_BYTES
@@ -7772,6 +7836,10 @@ handle_xkb:
     jmp .gm_sym_next
 .gm_sym_two:
     mov dword [rdi + 0], 1                    ; ktIndex = TWO_LEVEL
+    call ksym_lower
+    jnc .gm_two_kt
+    mov dword [rdi + 0], 2                    ; a letter: ALPHABETIC, reads Lock
+.gm_two_kt:
     mov byte  [rdi + 4], 1
     mov byte  [rdi + 5], 2                    ; width
     mov word  [rdi + 6], 2                    ; nSyms
@@ -7782,6 +7850,10 @@ handle_xkb:
     jmp .gm_sym_next
 .gm_sym_four:
     mov dword [rdi + 0], 3                    ; ktIndex = {3,0,0,0} (FOUR_LEVEL)
+    call ksym_lower
+    jnc .gm_four_kt
+    mov dword [rdi + 0], 4                    ; a letter: SEMIALPHABETIC, reads Lock
+.gm_four_kt:
     mov byte  [rdi + 4], 1                    ; groupInfo: 1 group
     mov byte  [rdi + 5], 4                    ; width
     mov word  [rdi + 6], 4                    ; nSyms
@@ -7845,8 +7917,8 @@ handle_xkb:
     mov byte [rdi + 11], X_MAX_KEYCODE        ; maxKeyCode
     mov eax, [xkb_getmap_present]            ; present (req full | types|syms|modmap)
     mov [rdi + 12], ax
-    mov byte [rdi + 15], 4                    ; nTypes
-    mov byte [rdi + 16], 4                    ; totalTypes
+    mov byte [rdi + 15], 5                    ; nTypes
+    mov byte [rdi + 16], 5                    ; totalTypes
     mov byte [rdi + 17], X_MIN_KEYCODE        ; firstKeySym
     mov word [rdi + 18], r10w                 ; totalSyms
     mov byte [rdi + 20], KEYCODE_RANGE        ; nKeySyms
@@ -7893,7 +7965,7 @@ handle_xkb:
     ; are None(0) — xkbcommon skips GetAtomName for None, so components/types/
     ; levels are unnamed but valid. Key names are REAL + unique ("K008".."K255")
     ; since xkbcommon uses them as key identifiers. Body order (per XKB spec):
-    ; keycodes, symbols, types, compat, typeNames(4), KTLevelNames(counts+9),
+    ; keycodes, symbols, types, compat, typeNames(5), KTLevelNames(counts+13),
     ; [indicators/vmods/groups empty], keyNames(248), [aliases empty].
     push rbx
     push r12
@@ -7902,17 +7974,18 @@ handle_xkb:
     push r15
     mov ebx, edi                             ; slot
     lea rdi, [reply_buf + 32]                ; body after 32-byte header
-    ; keycodes+symbols+types+compat (4) + typeNames (4) = 8 None atoms
+    ; keycodes+symbols+types+compat (4) + typeNames (5) = 9 None atoms
     xor eax, eax
-    mov ecx, 8
+    mov ecx, 9
     rep stosd
     ; KTLevelNames: per-type level-name counts MUST equal the GetMap types'
     ; numLevels — modern xkbcommon checks equality (kitty/GLFW died on
     ; "type->num_levels == wire_num_levels"). Names themselves stay None(0).
-    mov dword [rdi + 0], 0x04020201           ; n_levels_per_type = {1,2,2,4}
-    add rdi, 4
+    mov dword [rdi + 0], 0x04020201           ; n_levels_per_type = {1,2,2,4,
+    mov dword [rdi + 4], 4                    ;   4}, padded to 8 bytes
+    add rdi, 8
     xor eax, eax
-    mov ecx, 9                                ; 1+2+2+4 level-name atoms, all None
+    mov ecx, 13                               ; 1+2+2+4+4 level-name atoms, all None
     rep stosd
     ; (indicatorNames / virtualModNames / groupNames all empty → 0 bytes)
     ; keyNames: one XkbKeyNameRec per keycode 8..255. Copy the standard XKB
@@ -7949,10 +8022,10 @@ handle_xkb:
     mov dword [rdi + 8], 0x1FF5               ; which
     mov byte [rdi + 12], X_MIN_KEYCODE        ; minKeyCode
     mov byte [rdi + 13], X_MAX_KEYCODE        ; maxKeyCode
-    mov byte [rdi + 14], 4                    ; nTypes
+    mov byte [rdi + 14], 5                    ; nTypes
     mov byte [rdi + 18], X_MIN_KEYCODE        ; firstKey
     mov byte [rdi + 19], KEYCODE_RANGE        ; nKeys
-    mov word [rdi + 26], 9                    ; nKTLevels = 9 (matches the counts)
+    mov word [rdi + 26], 13                   ; nKTLevels = 13 (matches the counts)
     mov edi, r15d                             ; fd
     mov rax, SYS_WRITE
     lea rsi, [reply_buf]
@@ -8004,6 +8077,66 @@ handle_xkb:
 ; common reply header (type=1, deviceID=3, seq, length=(total-32)/4). Returns
 ; rdi=reply_buf, r15d=fd, r8d=total for the caller to patch fields + write.
 ; (Non-local label: kept outside handle_xkb's local-label scope on purpose.)
+; caps_led — the caps lock light on each keyboard follows the Lock bit of
+; mod_state: one EV_LED and a SYN_REPORT to every input device. A device
+; without that light ignores it, one opened read-only refuses it.
+caps_led:
+    push rbx
+    movzx eax, byte [mod_state]
+    shr eax, 1
+    and eax, 1
+    mov word [led_ev + 16], 0x11              ; EV_LED
+    mov word [led_ev + 18], 1                 ; LED_CAPSL
+    mov [led_ev + 20], eax                    ; on / off; led_ev+24 stays SYN
+    ; Stamp both with the server's time. The kernel restamps what it hands
+    ; back to readers; the --testinput pipe hands these bytes back as they
+    ; are, and a zero stamp would turn the server clock back to 0.
+    mov eax, [server_time_ms]
+    xor edx, edx
+    mov ecx, 1000
+    div ecx
+    mov [led_ev + 0], rax                     ; tv_sec
+    mov [led_ev + 24], rax
+    imul edx, edx, 1000
+    mov [led_ev + 8], rdx                     ; tv_usec
+    mov [led_ev + 32], rdx
+    xor ebx, ebx
+.cl_loop:
+    cmp ebx, [input_fd_count]
+    jge .cl_done
+    mov edi, [input_fds + rbx*4]
+    test edi, edi
+    js .cl_next
+    mov eax, SYS_WRITE
+    lea rsi, [led_ev]
+    mov edx, 48
+    syscall
+.cl_next:
+    inc ebx
+    jmp .cl_loop
+.cl_done:
+    pop rbx
+    ret
+
+; ksym_lower — CF=1 iff keysym eax is a small letter that caps lock makes a
+; capital: a..z and the Latin-1 letters 0xE0..0xFE but the sign 0xF7.
+; Clobbers r11d.
+ksym_lower:
+    lea r11d, [rax - 'a']
+    cmp r11d, 26
+    jb .kl_ret                                ; CF=1
+    lea r11d, [rax - 0xE0]
+    cmp r11d, 0x1F
+    jae .kl_no
+    cmp eax, 0xF7
+    je .kl_no
+    stc
+.kl_ret:
+    ret
+.kl_no:
+    clc
+    ret
+
 xkb_reply_zero:
     push rbx
     mov ebx, edi
@@ -14007,12 +14140,21 @@ init_input:
     mov eax, ebx
     call u64_to_ascii
     mov byte [rdi], 0
-    ; open O_RDONLY | O_NONBLOCK = 0 | 0x800
+    ; O_RDWR | O_NONBLOCK: caps_led writes the keyboard's caps lock light.
+    ; Read-only when writing is not allowed; then the light stays dark.
     mov rax, SYS_OPEN
     lea rdi, [input_dev_path]
-    mov esi, 0x800                            ; O_NONBLOCK
+    mov esi, 0x802                            ; O_RDWR | O_NONBLOCK
     xor edx, edx
     syscall
+    cmp rax, -13                              ; EACCES
+    jne .ii_opened
+    mov rax, SYS_OPEN
+    lea rdi, [input_dev_path]
+    mov esi, 0x800                            ; O_RDONLY | O_NONBLOCK
+    xor edx, edx
+    syscall
+.ii_opened:
     test rax, rax
     js .ii_next
     ; Store the fd.
@@ -14636,6 +14778,7 @@ dispatch_input_event:
     cmp eax, r12d
     jne .die_no_blankkey
     movzx eax, byte [mod_state]
+    and al, ~MOD_LOCK                        ; caps lock on or off
     cmp al, [cfg_blankkey_mods]
     jne .die_no_blankkey
     cmp r13d, 1
@@ -14658,6 +14801,7 @@ dispatch_input_event:
     ; blank_key — swallowed, never reach clients. r12d is the X keycode
     ; (evdev+8): 'b'=56, 'n'=57, 'z'=52.
     movzx eax, byte [mod_state]
+    and al, ~MOD_LOCK                        ; caps lock on or off
     cmp al, MOD_MOD4
     jne .die_no_gammakey
     cmp r12d, 57                             ; 'n'
@@ -21023,7 +21167,8 @@ vt_release_display:
     inc ebx
     jmp .vrd_ungrab
 .vrd_input_done:
-    mov dword [mod_state], 0                 ; keys held across the switch
+    and dword [mod_state], 2                 ; keys held across the switch
+                                             ; must not stick; caps lock stays
     mov dword [button_state], 0              ; must not stick
     lea rdi, [keys_down]
     xor eax, eax
