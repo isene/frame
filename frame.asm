@@ -732,7 +732,7 @@ pixmaps:            resb MAX_PIXMAPS * PIXMAP_REC_SIZE
 ;   +0  pid (u32)          0 = empty
 ;   +4  drawable (u32)
 ;   +8  format (u32)
-;   +12 pad
+;   +12 repeat (u32): 0 none, 1 normal, 2 pad, 3 reflect
 %define MAX_PICTURES     1024   ; 256 exhausted on a full FF+GTK desktop —
                                 ; a dropped CreatePicture renders popups/menus
                                 ; empty or lost (5627 PICFULL in one session).
@@ -804,6 +804,16 @@ tz_dst_stride:      resd 1
 tz_dst_h:           resd 1
 tz_dst_drawable:    resd 1
 tz_color:           resd 1               ; resolved opaque ARGB source colour
+; An image source bigger than 1x1 is sampled per pixel (tz_span_image).
+tz_img:             resd 1               ; 1 = sample tz_src per pixel
+tz_src_ptr:         resq 1
+tz_src_xform:       resq 1               ; transform entry, 0 if identity
+tz_src_w:           resd 1               ; width == stride
+tz_src_h:           resd 1
+tz_src_repeat:      resd 1               ; picture +12
+tz_src_opaque:      resd 1               ; 0xFF000000 for a format with no alpha
+tz_src_dx:          resd 1               ; source x = dst x + dx (before the transform)
+tz_src_dy:          resd 1
 ag_log_count:       resd 1               ; debug: limit AddGlyphs dumps
 
 ; ---- Phase 4c property table ----------------------------------------------
@@ -2058,7 +2068,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.43", 10
+version_str:        db "frame 0.1.44", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -25435,6 +25445,12 @@ render_create_picture:
     mov [rax + 4], ecx                        ; drawable
     mov ecx, [r12 + 12]
     mov [rax + 8], ecx                        ; format
+    xor ecx, ecx
+    test byte [r12 + 16], 1                   ; CPRepeat is the first value
+    jz .rcp_repeat
+    mov ecx, [r12 + 20]
+.rcp_repeat:
+    mov [rax + 12], ecx                       ; repeat
     push rax
     call pic_clip_entry                       ; fresh picture → no clip
     mov dword [rax], 0
@@ -25559,8 +25575,9 @@ render_set_pic_clip:
 ; ----------------------------------------------------------------------------
 ; render_change_picture — rdi = req ptr (RENDER minor 5).
 ;   +4 picture  +8 value-mask  +12 value list (CARD32 per set bit).
-; Only CPClipMask (bit 6) matters here: None clears the picture's clip
-; (pixmap masks unsupported → also clear). Other attributes stay ignored,
+; CPRepeat (bit 0) is kept in the picture record. CPClipMask (bit 6): None
+; clears the picture's clip (pixmap masks unsupported → also clear). Other
+; attributes stay ignored,
 ; but the value cursor is advanced per set bit so parsing stays aligned.
 ; ----------------------------------------------------------------------------
 render_change_picture:
@@ -25582,6 +25599,12 @@ render_change_picture:
     jz .rcp2_done
     bt r12d, 0
     jnc .rcp2_skip
+    test ecx, ecx                             ; CPRepeat
+    jnz .rcp2_not_repeat
+    mov eax, [r14]
+    mov [r13 + 12], eax
+    jmp .rcp2_adv
+.rcp2_not_repeat:
     cmp ecx, 6                                ; CPClipMask
     jne .rcp2_adv
     push rcx
@@ -25715,6 +25738,9 @@ render_fill_rectangles:
 ; Simplification: opaque pixel-centre scanline fill, no edge anti-aliasing;
 ; op and maskFormat ignored. Menus use a solid opaque source, where this is
 ; exact except at 1-px rounded corners. No reply.
+; An image source bigger than 1x1 is sampled for every pixel: LibreOffice
+; fills a shape with a scaled photo, and frame painted it all in the
+; photo's first pixel (v0.1.44).
 ;
 ;   rbx = req ptr   rbp = trapezoid cursor   r12d = remaining traps
 ;   r13d = y (row)  r14d = y_end (excl)      r15d = x_start (pixel)
@@ -25742,8 +25768,9 @@ render_trapezoids:
     mov [tz_dst_stride], edx
     mov [tz_dst_h], ecx
 
-    ; --- resolve src colour: solid fill, or sample the src image top-left
-    ;     (cairo's non-solid src here is a 1×1 repeat pattern) ---
+    ; --- resolve src colour: solid fill, a 1x1 image (cairo's repeat
+    ;     pattern for one colour), or an image sampled per pixel ---
+    mov dword [tz_img], 0
     mov edi, [rbx + 8]
     call picture_lookup
     test rax, rax
@@ -25753,11 +25780,53 @@ render_trapezoids:
     mov ecx, [rax + 8]                        ; stored 8-bit ARGB
     jmp .tz_have_color
 .tz_src_image:
+    mov r12, rax                              ; src picture record
     mov edi, [rax + 4]
     call drawable_get_backing
     test rax, rax
     jz .tz_done
+    mov r8d, edx
+    imul r8d, ecx
+    cmp r8d, 1
+    jne .tz_src_sampled
     mov ecx, [rax]
+    jmp .tz_have_color
+.tz_src_sampled:
+    mov [tz_src_ptr], rax
+    mov [tz_src_w], edx
+    mov [tz_src_h], ecx
+    mov eax, [r12 + 12]
+    mov [tz_src_repeat], eax
+    xor eax, eax
+    cmp dword [r12 + 8], 0x31                 ; RGB24: the top byte is not alpha
+    jne .tz_src_alpha
+    mov eax, 0xFF000000
+.tz_src_alpha:
+    mov [tz_src_opaque], eax
+    mov rax, r12
+    call pic_xform_entry
+    cmp dword [rax], 0
+    jne .tz_src_xform
+    xor eax, eax
+.tz_src_xform:
+    mov [tz_src_xform], rax
+    ; The source lines up with the first point of the first trapezoid:
+    ; source = dst - (that point, whole pixels) + (xSrc, ySrc).
+    movzx eax, word [rbx + 2]
+    cmp eax, 16                               ; 24-byte header + one trapezoid
+    jb .tz_done
+    mov eax, [rbx + 24 + 8]                   ; left p1.x
+    sar eax, 16
+    movsx ecx, word [rbx + 20]                ; xSrc
+    sub ecx, eax
+    mov [tz_src_dx], ecx
+    mov eax, [rbx + 24 + 12]                  ; left p1.y
+    sar eax, 16
+    movsx ecx, word [rbx + 22]                ; ySrc
+    sub ecx, eax
+    mov [tz_src_dy], ecx
+    mov dword [tz_img], 1
+    jmp .tz_count
 .tz_have_color:
     ; op Src (1) replaces → force opaque (mirrors render_composite). Any other
     ; op blends Over by the source alpha: keep it; fully transparent = no-op.
@@ -25771,6 +25840,7 @@ render_trapezoids:
 .tz_color_ready:
     mov [tz_color], ecx
 
+.tz_count:
     ; --- trapezoid count = (length*4 - 24) / 40 ---
     movzx eax, word [rbx + 2]
     shl eax, 2
@@ -25835,6 +25905,14 @@ render_trapezoids:
     add eax, r15d
     mov rdi, [tz_dst_ptr]
     lea rdi, [rdi + rax*4]
+    cmp dword [tz_img], 0
+    je .tz_span_color
+    mov esi, r15d                             ; x
+    mov edx, r13d                             ; y
+    movzx r8d, byte [rbx + 4]                 ; op
+    call tz_span_image
+    jmp .tz_row_next
+.tz_span_color:
     mov eax, [tz_color]
     cmp eax, 0xFF000000                       ; alpha 255? (unsigned: opaque ≥)
     jb .tz_span_blend
@@ -26043,6 +26121,132 @@ render_trapezoids:
     ret
 .tz_lx_flat:
     mov rax, rcx
+    ret
+
+; ----------------------------------------------------------------------------
+; tz_span_image — one row of a trapezoid, painted from an image source.
+;   rdi = first dst pixel, ecx = pixel count, esi = dst x, edx = dst y,
+;   r8d = op. Reads the tz_src_* state that render_trapezoids sets up.
+; Each pixel takes the source pixel under its centre, through the
+; picture's transform (nearest pixel, whatever filter was asked for).
+; Preserves the callee-saved registers.
+; ----------------------------------------------------------------------------
+tz_span_image:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rdi                              ; dst pixel
+    mov r12d, ecx                             ; pixels left
+    mov r13d, esi
+    add r13d, [tz_src_dx]                     ; u: source x before the transform
+    mov r14d, edx
+    add r14d, [tz_src_dy]                     ; v
+    mov r15d, r8d                             ; op
+.tsi_px:
+    movsxd rax, r13d                          ; sx = u
+    movsxd rdx, r14d                          ; sy = v
+    mov rsi, [tz_src_xform]
+    test rsi, rsi
+    jz .tsi_have_xy
+    shl rax, 16
+    add rax, 0x8000                           ; U = pixel centre, 16.16
+    shl rdx, 16
+    add rdx, 0x8000                           ; V
+    movsxd rcx, dword [rsi + 4]               ; m11
+    imul rcx, rax
+    movsxd r8, dword [rsi + 8]                ; m12
+    imul r8, rdx
+    add rcx, r8
+    sar rcx, 16
+    movsxd r8, dword [rsi + 12]               ; m13
+    add rcx, r8                               ; sx, 16.16
+    movsxd r8, dword [rsi + 16]               ; m21
+    imul r8, rax
+    movsxd r9, dword [rsi + 20]               ; m22
+    imul r9, rdx
+    add r8, r9
+    sar r8, 16
+    movsxd r9, dword [rsi + 24]               ; m23
+    add r8, r9                                ; sy, 16.16
+    sar rcx, 16
+    sar r8, 16
+    mov rax, rcx
+    mov rdx, r8
+.tsi_have_xy:
+    mov ecx, [tz_src_w]
+    call tsi_fit                              ; sx into [0, w)
+    jc .tsi_next
+    mov r10, rax
+    mov rax, rdx
+    mov ecx, [tz_src_h]
+    call tsi_fit                              ; sy into [0, h)
+    jc .tsi_next
+    imul eax, [tz_src_w]
+    add eax, r10d
+    mov rsi, [tz_src_ptr]
+    mov esi, [rsi + rax*4]
+    or esi, [tz_src_opaque]
+    mov rdi, rbx
+    cmp r15d, 1                               ; Src: copy
+    je .tsi_store
+    mov eax, esi
+    shr eax, 24                               ; alpha
+    cmp eax, 255
+    je .tsi_store
+    test eax, eax
+    jz .tsi_next
+    call rc_blend_pixel
+    jmp .tsi_next
+.tsi_store:
+    or esi, 0xFF000000
+    mov [rdi], esi
+.tsi_next:
+    add rbx, 4
+    inc r13d
+    dec r12d
+    jnz .tsi_px
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; tsi_fit — rax = source coordinate, ecx = source size (1 or more).
+; Brings rax into [0, size) by the picture's repeat: normal wraps, pad
+; and reflect take the edge pixel. CF=1 when the pixel is outside a
+; picture with repeat none. Keeps rdx; clobbers r8, r9.
+tsi_fit:
+    cmp rax, rcx                              ; unsigned: a negative is huge
+    jb .tf_in
+    mov r8d, [tz_src_repeat]
+    test r8d, r8d
+    jz .tf_out
+    cmp r8d, 1
+    je .tf_wrap
+    test rax, rax                             ; pad, reflect: the edge
+    js .tf_zero
+    lea rax, [rcx - 1]
+    jmp .tf_in
+.tf_zero:
+    xor eax, eax
+    jmp .tf_in
+.tf_wrap:
+    mov r9, rdx
+    cqo
+    idiv rcx
+    mov rax, rdx                              ; remainder, sign of the coordinate
+    mov rdx, r9
+    test rax, rax
+    jns .tf_in
+    add rax, rcx
+.tf_in:
+    clc
+    ret
+.tf_out:
+    stc
     ret
 
 ; ============================================================================

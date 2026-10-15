@@ -25,6 +25,7 @@ gcc -O1 -o "$T/focus-unmap" "$here/focus-unmap.c" -lX11 || exit 1
 gcc -O1 -o "$T/prop-watch" "$here/prop-watch.c" -lX11 || exit 1
 gcc -O1 -o "$T/see-through" "$here/see-through.c" -lX11 || exit 1
 gcc -O1 -o "$T/caps-lock" "$here/caps-lock.c" -lX11 || exit 1
+gcc -O1 -o "$T/image-shape" "$here/image-shape.c" -lXrender -lX11 || exit 1
 mkfifo "$T/pad"
 printf 'keymap = no\n' > "$T/home/.framerc"   # caps-lock types AltGr+e = euro sign
 
@@ -88,6 +89,11 @@ out=$("$T/caps-lock" "$T/pad")
 is "the light is answered, and follows caps lock" "${out%%,*}" "light 0 1 0"
 is "with caps lock on, letters are capitals, AltGr and digits are not" \
    "${out#*, }" "on: A a E EuroSign 1, off: a"
+
+# LibreOffice fills a shape with a scaled photo. frame filled the whole
+# shape with the photo's first pixel, so every photo was a flat box.
+echo "== v0.1.44: a shape filled with a picture shows the picture"
+is "each quarter of the square has its own colour" "$("$T/image-shape")" "ff0000 00ff00 0000ff ffffff"
 
 echo
 if [ $fails -eq 0 ]; then echo "frame tests: all good"; else echo "frame tests: $fails failed"; fi
