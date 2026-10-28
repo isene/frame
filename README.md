@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.44-blue)
+![Version](https://img.shields.io/badge/version-0.1.45-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -47,6 +47,7 @@ keyboard-driven. No libc, no Xlib, no Mesa anywhere in the path.*
 | 4f | Software compositor — solid-colour rects on the panel via `--display` | ✓ shipped |
 | 4g | GCs + window backing store + PolyFillRectangle / PutImage | ✓ shipped |
 | 4h | Pixmaps + CopyArea / ClearArea / PolyRectangle | ✓ shipped |
+| 4i | Core text: PolyText and ImageText, every font drawn as the built-in 6x13 fixed | ✓ shipped (v0.1.45, for xterm-era apps like ssh-askpass) |
 | 5 | Atoms + GetProperty / ChangeProperty / selections | ✓ shipped |
 | 6 | SHAPE extension | ✓ shipped (bounding + input regions — spot runs) |
 | 7 | GCs + drawing primitives | |

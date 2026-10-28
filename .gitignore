@@ -12,3 +12,4 @@ pkgroot/
 !/test/see-through.c
 !/test/caps-lock.c
 !/test/image-shape.c
+!/test/core-text.c

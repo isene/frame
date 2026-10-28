@@ -26,6 +26,7 @@ gcc -O1 -o "$T/prop-watch" "$here/prop-watch.c" -lX11 || exit 1
 gcc -O1 -o "$T/see-through" "$here/see-through.c" -lX11 || exit 1
 gcc -O1 -o "$T/caps-lock" "$here/caps-lock.c" -lX11 || exit 1
 gcc -O1 -o "$T/image-shape" "$here/image-shape.c" -lXrender -lX11 || exit 1
+gcc -O1 -o "$T/core-text" "$here/core-text.c" -lX11 || exit 1
 mkfifo "$T/pad"
 printf 'keymap = no\n' > "$T/home/.framerc"   # caps-lock types AltGr+e = euro sign
 
@@ -94,6 +95,12 @@ is "with caps lock on, letters are capitals, AltGr and digits are not" \
 # shape with the photo's first pixel, so every photo was a flat box.
 echo "== v0.1.44: a shape filled with a picture shows the picture"
 is "each quarter of the square has its own colour" "$("$T/image-shape")" "ff0000 00ff00 0000ff ffffff"
+
+# Red text on blue: ImageText fills its cells blue, PolyText leaves the
+# black window, and a char the font lacks draws the font's dotted box.
+echo "== v0.1.45: the old text calls draw in the built-in fixed font"
+is "each text call draws its A, and the missing char its box" "$("$T/core-text")" \
+   "width 6: ff0000 0000ff ff0000 000000 ff0000 ff0000 0000ff"
 
 echo
 if [ $fails -eq 0 ]; then echo "frame tests: all good"; else echo "frame tests: $fails failed"; fi
