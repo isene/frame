@@ -1406,6 +1406,10 @@ log_unblank_mon:    db "frame: panel on (monitor change reported by the kernel)"
 log_unblank_mon_len equ $ - log_unblank_mon
 log_hotplug:        db "frame: display hotplug — outputs reconfigured", 10
 log_hotplug_len     equ $ - log_hotplug
+log_crtc_off:       db "frame: turned off an output frame no longer uses", 10
+log_crtc_off_len    equ $ - log_crtc_off
+log_relight:        db "frame: an output was dark after a display change; lit again", 10
+log_relight_len     equ $ - log_relight
 stamp_open:         db "["
 stamp_close:        db "] "
 log_uev_pre:        db "frame: drm uevent: ", 0
@@ -2076,7 +2080,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.46", 10
+version_str:        db "frame 0.1.47", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -18723,6 +18727,7 @@ compositor_reconfigure:
     call modeset_pick_outputs
     test eax, eax
     jz .crc_unchanged                        ; no connector at all: keep as-is
+    call crtcs_off_unused
     pop r9                                   ; ext_h
     pop r8                                   ; ext_w
     pop rdx                                  ; ext_conn
@@ -18740,14 +18745,16 @@ compositor_reconfigure:
     cmp ecx, eax
     jne .crc_changed
     test eax, eax                            ; both single-output → done
-    jz .crc_done
+    jz .crc_same
     cmp edx, [ext_conn]
     jne .crc_changed
     cmp r8d, [ext_w]
     jne .crc_changed
     cmp r9d, [ext_h]
     jne .crc_changed
-    jmp .crc_done                            ; identical config: no-op
+.crc_same:                                   ; identical config: only make
+    call crtcs_relight                       ; sure it is still lit
+    jmp .crc_done
 .crc_unchanged:
     add rsp, 56                              ; drop the snapshot
     jmp .crc_done
@@ -18788,6 +18795,119 @@ compositor_reconfigure:
     mov rdx, log_hotplug_len
     call write_stderr
 .crc_done:
+    ret
+
+; ----------------------------------------------------------------------------
+; crtc_cmd — edi = crtc id, esi = DRM_IOCTL_MODE_GETCRTC or _SETCRTC, run on
+; blank_crtc_cmd zeroed first. GETCRTC reads the CRTC's state into it (fb
+; +16, mode_valid +32); SETCRTC with no fb, mode or connector turns the
+; CRTC off. rax = the ioctl's result.
+; ----------------------------------------------------------------------------
+crtc_cmd:
+    push rsi
+    push rdi
+    lea rdi, [blank_crtc_cmd]
+    xor eax, eax
+    mov ecx, 13
+    rep stosq
+    pop rax
+    mov [blank_crtc_cmd + 12], eax
+    pop rsi
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    lea rdx, [blank_crtc_cmd]
+    syscall
+    ret
+
+; ----------------------------------------------------------------------------
+; crtcs_off_unused — after a display change, turn off every CRTC frame
+; does not drive. One left on for a dock's screen that had gone made the
+; kernel's restore after suspend fail (ENOSPC), and that left the panel
+; dark too (2026-10-28). Only a CRTC still lit gets a SETCRTC, so a quiet
+; hotplug costs one GETCRTC per CRTC.
+; ----------------------------------------------------------------------------
+crtcs_off_unused:
+    push rbx
+    push r12
+    mov r12d, [drm_res_buf + 36]             ; count_crtcs, capped by the probe
+    xor ebx, ebx
+.cou_loop:
+    cmp ebx, r12d
+    jae .cou_ret
+    mov edi, [drm_crtc_ids + rbx*4]
+    cmp edi, [drm_chosen_crtc]
+    je .cou_next
+    cmp byte [ext_active], 0
+    je .cou_get
+    cmp edi, [ext_crtc]
+    je .cou_next
+.cou_get:
+    mov esi, DRM_IOCTL_MODE_GETCRTC
+    call crtc_cmd
+    test rax, rax
+    js .cou_next
+    mov eax, [blank_crtc_cmd + 16]           ; fb
+    or eax, [blank_crtc_cmd + 32]            ; mode_valid
+    jz .cou_next                             ; already dark
+    mov edi, [blank_crtc_cmd + 12]
+    mov esi, DRM_IOCTL_MODE_SETCRTC
+    call crtc_cmd
+    call log_stamp
+    lea rsi, [log_crtc_off]
+    mov edx, log_crtc_off_len
+    call write_stderr
+.cou_next:
+    inc ebx
+    jmp .cou_loop
+.cou_ret:
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; crtcs_relight — after a display change that left the outputs as they
+; were, check that frame's CRTCs still show something. A failed restore
+; after suspend leaves them off with the connectors unchanged, and nothing
+; else would light the panel again (2026-10-28). Dark: comp_unblank
+; replays the compositor's SETCRTCs and repaints; the cursor is re-seated.
+; ----------------------------------------------------------------------------
+crtcs_relight:
+    mov edi, [drm_chosen_crtc]
+    mov esi, DRM_IOCTL_MODE_GETCRTC
+    call crtc_cmd
+    test rax, rax
+    js .crl_ret
+    cmp dword [blank_crtc_cmd + 32], 0       ; mode_valid
+    je .crl_dark
+    cmp dword [blank_crtc_cmd + 16], 0       ; fb
+    je .crl_dark
+    cmp byte [ext_active], 0
+    je .crl_ret
+    mov edi, [ext_crtc]
+    mov esi, DRM_IOCTL_MODE_GETCRTC
+    call crtc_cmd
+    test rax, rax
+    js .crl_ret
+    cmp dword [blank_crtc_cmd + 32], 0
+    je .crl_dark
+    cmp dword [blank_crtc_cmd + 16], 0
+    jne .crl_ret
+.crl_dark:
+    call log_stamp
+    lea rsi, [log_relight]
+    mov edx, log_relight_len
+    call write_stderr
+    mov byte [blank_state], 1                ; so comp_unblank runs
+    mov byte [unblank_why], 1
+    call comp_unblank
+    mov byte [unblank_why], 0
+    cmp dword [cursor_ready], 0
+    je .crl_ret
+    mov edi, [drm_chosen_crtc]
+    mov esi, [cursor_handle]
+    call cursor_set_bo
+    call cursor_move_hw
+.crl_ret:
     ret
 
 ; ----------------------------------------------------------------------------
