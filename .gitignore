@@ -13,3 +13,4 @@ pkgroot/
 !/test/caps-lock.c
 !/test/image-shape.c
 !/test/core-text.c
+!/test/fill-poly.c

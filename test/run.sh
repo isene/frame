@@ -27,6 +27,7 @@ gcc -O1 -o "$T/see-through" "$here/see-through.c" -lX11 || exit 1
 gcc -O1 -o "$T/caps-lock" "$here/caps-lock.c" -lX11 || exit 1
 gcc -O1 -o "$T/image-shape" "$here/image-shape.c" -lXrender -lX11 || exit 1
 gcc -O1 -o "$T/core-text" "$here/core-text.c" -lX11 || exit 1
+gcc -O1 -o "$T/fill-poly" "$here/fill-poly.c" -lX11 || exit 1
 mkfifo "$T/pad"
 printf 'keymap = no\n' > "$T/home/.framerc"   # caps-lock types AltGr+e = euro sign
 
@@ -101,6 +102,10 @@ is "each quarter of the square has its own colour" "$("$T/image-shape")" "ff0000
 echo "== v0.1.45: the old text calls draw in the built-in fixed font"
 is "each text call draws its A, and the missing char its box" "$("$T/core-text")" \
    "width 6: ff0000 0000ff ff0000 000000 ff0000 ff0000 0000ff"
+
+echo "== v0.1.46: a filled polygon is filled, and nothing left of the window"
+is "inside, outside and edge pixels, and none from shapes off the left" "$("$T/fill-poly")" \
+   "00ff00 000000 00ff00 000000 00ff00 00ff00 000000 000000"
 
 echo
 if [ $fails -eq 0 ]; then echo "frame tests: all good"; else echo "frame tests: $fails failed"; fi

@@ -695,6 +695,8 @@ txt_h:              resd 1               ; colours, and 1 for 16-bit chars
 txt_fg:             resd 1
 txt_bg:             resd 1
 txt_wide:           resd 1
+%define MAX_POLY_X       1024            ; FillPoly: edge crossings per row
+poly_x:             resd MAX_POLY_X      ; (16.16 x), the rest are dropped
 last_enter_win:     resd 1               ; window the pointer was last inside —
                                          ; drives EnterNotify/LeaveNotify. GTK
                                          ; menu items prelight + activate on
@@ -2074,7 +2076,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.45", 10
+version_str:        db "frame 0.1.46", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -6001,6 +6003,8 @@ dispatch_request:
     je .dr_put_image
     cmp eax, 73
     je .dr_get_image
+    cmp eax, 69
+    je .dr_fill_poly
     lea ecx, [rax - 74]                      ; PolyText8/16, ImageText8/16
     cmp ecx, 3
     jbe .dr_text
@@ -6326,6 +6330,12 @@ dispatch_request:
     mov rsi, r12
     mov edx, r13d
     call handle_text
+    jmp .dr_done
+
+.dr_fill_poly:
+    mov rsi, r12
+    mov edx, r13d
+    call handle_fill_poly
     jmp .dr_done
 
 .dr_put_image:
@@ -22533,6 +22543,242 @@ text_glyph:
     ret
 
 ; ----------------------------------------------------------------------------
+; handle_fill_poly — rsi = req, edx = req bytes. FillPoly (69): fills the
+; polygon through the points in the GC foreground, the pixels Xorg fills:
+; pixel (x, y) is the point (x, y), filled when inside by the even-odd rule
+; (the X default; the GC's fill-rule is not tracked). On an edge it is
+; filled only when the inside is to its right or below it.
+;   +4 drawable  +8 gc  +12 shape (unused)  +13 coordinate mode (1 = each
+;   point relative to the one before)  +16 points, x y s16
+;   rbx = req  r12 = points  r13d = n  r14d = row  r15d = span index
+;   ebp = crossings  poly_x = crossing x in 16.16
+; stack: +0 min x  +4 max x  +8 min y  +12 max y  +16 damage rect
+;        +24 buf  +32 stride  +36 buf height  +40 colour  +44 rows end
+; ----------------------------------------------------------------------------
+handle_fill_poly:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 56
+    cmp edx, 16 + 3*4
+    jb .fp_ret                               ; fewer than 3 points: no area
+    mov rbx, rsi
+    lea r12, [rsi + 16]
+    lea r13d, [rdx - 16]
+    shr r13d, 2                              ; n points
+    mov qword [cur_clip], 0
+    mov edi, [rbx + 8]
+    call gc_lookup
+    test rax, rax
+    jz .fp_ret
+    mov ecx, [rax + 4]
+    mov [rsp + 40], ecx
+    lea rcx, [gcs]
+    sub rax, rcx                             ; GC slot offset
+    shr rax, 4                               ; slot index (GC_REC_SIZE 16)
+    imul rax, CLIP_ENTRY_SIZE
+    lea rcx, [gc_clips]
+    add rax, rcx
+    mov [cur_clip], rax                      ; clipped_fb_fill honours it
+    mov edi, [rbx + 4]
+    call drawable_get_backing
+    test rax, rax
+    jz .fp_done
+    mov [rsp + 24], rax
+    mov [rsp + 32], edx
+    mov [rsp + 36], ecx
+
+    cmp byte [rbx + 13], 1                   ; relative points: add them up
+    jne .fp_abs
+    lea rax, [r12 + 4]
+    lea ecx, [r13 - 1]
+.fp_rel:
+    mov dx, [rax - 4]
+    add [rax], dx
+    mov dx, [rax - 2]
+    add [rax + 2], dx
+    add rax, 4
+    dec ecx
+    jnz .fp_rel
+.fp_abs:
+
+    movsx eax, word [r12]                    ; bounding box
+    mov [rsp + 0], eax
+    mov [rsp + 4], eax
+    movsx eax, word [r12 + 2]
+    mov [rsp + 8], eax
+    mov [rsp + 12], eax
+    mov ecx, 1
+.fp_bb:
+    movsx eax, word [r12 + rcx*4]
+    cmp eax, [rsp + 0]
+    jge .fp_bb1
+    mov [rsp + 0], eax
+.fp_bb1:
+    cmp eax, [rsp + 4]
+    jle .fp_bb2
+    mov [rsp + 4], eax
+.fp_bb2:
+    movsx eax, word [r12 + rcx*4 + 2]
+    cmp eax, [rsp + 8]
+    jge .fp_bb3
+    mov [rsp + 8], eax
+.fp_bb3:
+    cmp eax, [rsp + 12]
+    jle .fp_bb4
+    mov [rsp + 12], eax
+.fp_bb4:
+    inc ecx
+    cmp ecx, r13d
+    jb .fp_bb
+
+    mov r14d, [rsp + 8]                      ; rows min y .. max y - 1,
+    test r14d, r14d                          ; inside the buffer
+    jns .fp_top
+    xor r14d, r14d
+.fp_top:
+    mov eax, [rsp + 12]
+    cmp eax, [rsp + 36]
+    jle .fp_bottom
+    mov eax, [rsp + 36]
+.fp_bottom:
+    mov [rsp + 44], eax
+
+.fp_row:
+    cmp r14d, [rsp + 44]
+    jge .fp_damage
+    xor ebp, ebp
+    xor ecx, ecx                             ; edge from point i to i+1
+.fp_edge:
+    lea eax, [rcx + 1]
+    cmp eax, r13d
+    jb .fp_e1
+    xor eax, eax                             ; the last edge closes the shape
+.fp_e1:
+    movsx r8d, word [r12 + rcx*4 + 2]        ; y0
+    movsx r9d, word [r12 + rax*4 + 2]        ; y1
+    cmp r8d, r9d
+    je .fp_enext                             ; flat edges cross no centre
+    mov r10d, r8d
+    mov r11d, r9d
+    cmp r10d, r11d
+    jle .fp_ord
+    xchg r10d, r11d
+.fp_ord:
+    cmp r14d, r10d                           ; is the row in [top, bottom)?
+    jl .fp_enext
+    cmp r14d, r11d
+    jge .fp_enext
+    ; x = (x0 << 16) + ((row - y0) * (x1 - x0) << 16) / (y1 - y0)
+    movsx r10, word [r12 + rcx*4]            ; x0
+    movsx r11, word [r12 + rax*4]            ; x1
+    sub r11, r10
+    sub r9d, r8d
+    movsxd r9, r9d                           ; y1 - y0
+    mov edi, r14d
+    sub edi, r8d
+    movsxd rdi, edi
+    imul rdi, r11
+    shl rdi, 16
+    mov rax, rdi
+    cqo
+    idiv r9
+    shl r10, 16
+    add rax, r10
+    cmp ebp, MAX_POLY_X
+    jae .fp_enext
+    mov [poly_x + rbp*4], eax
+    inc ebp
+.fp_enext:
+    inc ecx
+    cmp ecx, r13d
+    jb .fp_edge
+
+    mov ecx, 1                               ; sort the crossings
+.fp_sort:
+    cmp ecx, ebp
+    jae .fp_spans
+    mov eax, [poly_x + rcx*4]
+    mov edx, ecx
+.fp_shift:
+    test edx, edx
+    jz .fp_put
+    mov r8d, [poly_x + rdx*4 - 4]
+    cmp r8d, eax
+    jle .fp_put
+    mov [poly_x + rdx*4], r8d
+    dec edx
+    jmp .fp_shift
+.fp_put:
+    mov [poly_x + rdx*4], eax
+    inc ecx
+    jmp .fp_sort
+
+.fp_spans:                                   ; fill between crossing pairs
+    xor r15d, r15d
+.fp_span:
+    lea eax, [r15 + 1]
+    cmp eax, ebp
+    jae .fp_next_row
+    movsxd rax, dword [poly_x + r15*4]
+    movsxd r9, dword [poly_x + r15*4 + 4]
+    add r15d, 2
+    add rax, 0xFFFF                          ; first pixel at or right
+    sar rax, 16                              ; of the edge
+    add r9, 0xFFFF
+    sar r9, 16
+    sub r9, rax                              ; width
+    jle .fp_span
+    mov rdi, [rsp + 24]
+    mov esi, [rsp + 32]
+    mov edx, [rsp + 36]
+    mov r8d, r14d
+    mov r10d, 1
+    mov r11d, [rsp + 40]
+    call clipped_fb_fill
+    jmp .fp_span
+.fp_next_row:
+    inc r14d
+    jmp .fp_row
+
+.fp_damage:
+    mov edi, [rbx + 4]
+    call window_lookup
+    test rax, rax
+    jz .fp_done
+    mov ecx, [rsp + 4]
+    sub ecx, [rsp + 0]
+    jle .fp_done
+    mov edx, [rsp + 12]
+    sub edx, [rsp + 8]
+    jle .fp_done
+    mov byte [comp_dirty], 1
+    mov r8d, [rsp + 0]
+    mov [rsp + 16], r8w                      ; x
+    mov r8d, [rsp + 8]
+    mov [rsp + 18], r8w                      ; y
+    mov [rsp + 20], cx                       ; w
+    mov [rsp + 22], dx                       ; h
+    mov rdx, rax
+    lea rdi, [rsp + 16]
+    mov esi, 1
+    call damage_rect_list
+.fp_done:
+    mov qword [cur_clip], 0
+.fp_ret:
+    add rsp, 56
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
 ; fb_fill — fill a rectangle in an arbitrary 32-bpp buffer, clipped to
 ; the buffer bounds.
 ;   rdi = buffer base
@@ -22560,6 +22806,7 @@ fb_fill:
     test eax, eax
     jns .fbf_x_ok
     add r9d, eax                             ; w += x
+    jle .fbf_ret                             ; all left of the buffer
     xor eax, eax
 .fbf_x_ok:
     cmp eax, r12d
@@ -22578,6 +22825,7 @@ fb_fill:
     test r8d, r8d
     jns .fbf_y_ok
     add r10d, r8d
+    jle .fbf_ret                             ; all above the buffer
     xor r8d, r8d
 .fbf_y_ok:
     cmp r8d, r13d
