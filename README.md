@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.48-blue)
+![Version](https://img.shields.io/badge/version-0.1.49-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -280,7 +280,8 @@ phase 2b runs anyway) this is automatic if you use `sudo`.
 ### Config (`~/.framerc`)
 
 frame reads an optional `~/.framerc` (line-based `key = value`, the CHasm
-rc convention):
+rc convention). `kill -USR2` makes frame read it again, with the
+wallpaper; only the keymap stays as it was at start:
 
 ```
 keymap = no                # keyboard layout: us (default), no (Norwegian), be (Belgian)

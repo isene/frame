@@ -2092,7 +2092,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.48", 10
+version_str:        db "frame 0.1.49", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -5338,12 +5338,15 @@ serve_loop:
     mov rdx, log_serve_ready_len
     call write_stderr
 .sl_iter:
-    ; --- SIGUSR2 (wp-cycle / chasm-bg): re-read ~/.framebg and repaint.
+    ; --- SIGUSR2 (wp-cycle / chasm-bg / fx): re-read ~/.framerc and
+    ; ~/.framebg, and repaint. Keys used live (beam, cursor, sensitivity)
+    ; change at once; the keymap is built at start and stays.
     ; The handler only sets the flag; the blocked poll returns EINTR and
     ; lands here, so the reload runs in normal context, not in the handler.
     cmp byte [wall_reload], 0
     je  .sl_no_wallre
     mov byte [wall_reload], 0
+    call read_framerc
     call load_wallpaper
     mov dword [dmg_count0], -1               ; whole-screen repaint, both buffers
     mov dword [dmg_count1], -1
@@ -13339,6 +13342,7 @@ read_framerc:
     mov dword [cur_scale], 1                  ; cursor normal size
     mov dword [cfg_shake_find], 1             ; shake-to-find on by default
     mov dword [cfg_magnify], 2                ; magnifier zoom factor
+    mov dword [cfg_beam], 0                   ; beam-in off
     ; --- locate HOME in envp ---
     mov rsi, [envp]
     test rsi, rsi

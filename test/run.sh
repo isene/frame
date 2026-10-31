@@ -122,6 +122,12 @@ for _ in {1..25}; do [ -S /tmp/.X11-unix/X$D2 ] && break; sleep 0.2; done
 is "with beam = 600, part shows at 0.3 s and all of it at 1.2 s" \
    "$(DISPLAY=:$D2 "$T/beam-in")" "at 0.3 s part, at 1.2 s all"
 
+echo "== v0.1.49: SIGUSR2 re-reads ~/.framerc"
+printf 'keymap = no\nbeam = 0\n' > "$T/home2/.framerc"
+kill -USR2 $F2PID; sleep 0.3
+is "after beam = 0 and SIGUSR2, a window shows whole at once" \
+   "$(DISPLAY=:$D2 "$T/beam-in")" "at 0.3 s all, at 1.2 s all"
+
 echo
 if [ $fails -eq 0 ]; then echo "frame tests: all good"; else echo "frame tests: $fails failed"; fi
 exit $((fails > 0))
