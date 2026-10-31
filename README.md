@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.47-blue)
+![Version](https://img.shields.io/badge/version-0.1.48-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -289,6 +289,7 @@ dwt = 400                  # ms the touchpad ignores motion+taps after a keystro
 nightlight = 60            # Mod4+n warmth strength 0..100 (default 60)
 sunlight = 40              # Mod4+b contrast strength 0..100 (default 40)
 shake_find = 1             # wiggle the pointer to briefly enlarge it (0 = off)
+beam = 600                 # ms a new window takes to beam in, in sparkles (0 = off, the default)
 magnify = 2               # Mod4+z magnifier lens zoom factor 2..8 (default 2)
 cursor_color = ffffff      # cursor fill colour, RRGGBB hex (default ffffff)
 cursor_transparency = 50   # cursor % transparent: 0 solid .. 100 invisible (default 50)
@@ -330,6 +331,14 @@ same combo again to return to normal. Both strengths are `0..100`.
 grows (3x), so a lost cursor is easy to spot, then shrinks back on its own.
 Pure gesture, no key. Detection is a few compares per motion event and
 nothing at all when idle. `0` disables.
+
+`beam`: a new window arrives like a transporter beam-in. Its first picture
+shows cell by cell over this many ms, with sparkles at the edge of what has
+arrived. A window beams in once, and menus and windows under 64x64 never do.
+
+While it runs, frame redraws that window about 60 times a second; a
+full-screen window costs about 0.3 s of one core. Off (the default) costs
+one compare at a window's first draw.
 
 `magnify` / **`Mod4+z`**: a magnifier lens that follows the cursor,
 showing the area under it enlarged by the `magnify` factor (2..8). Toggle

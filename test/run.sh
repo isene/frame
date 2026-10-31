@@ -28,6 +28,7 @@ gcc -O1 -o "$T/caps-lock" "$here/caps-lock.c" -lX11 || exit 1
 gcc -O1 -o "$T/image-shape" "$here/image-shape.c" -lXrender -lX11 || exit 1
 gcc -O1 -o "$T/core-text" "$here/core-text.c" -lX11 || exit 1
 gcc -O1 -o "$T/fill-poly" "$here/fill-poly.c" -lX11 || exit 1
+gcc -O1 -o "$T/beam-in" "$here/beam-in.c" -lX11 || exit 1
 mkfifo "$T/pad"
 printf 'keymap = no\n' > "$T/home/.framerc"   # caps-lock types AltGr+e = euro sign
 
@@ -106,6 +107,20 @@ is "each text call draws its A, and the missing char its box" "$("$T/core-text")
 echo "== v0.1.46: a filled polygon is filled, and nothing left of the window"
 is "inside, outside and edge pixels, and none from shapes off the left" "$("$T/fill-poly")" \
    "00ff00 000000 00ff00 000000 00ff00 00ff00 000000 000000"
+
+# beam = N fades a new window in over N ms. It is off unless asked for,
+# and then a window shows whole on its first draw.
+echo "== v0.1.48: beam = 600 fades a new window in"
+is "with no beam line, a window shows whole at once" "$("$T/beam-in")" "at 0.3 s all, at 1.2 s all"
+mkdir "$T/home2"
+printf 'keymap = no\nbeam = 600\n' > "$T/home2/.framerc"
+D2=$((D + 1)); while [ -e /tmp/.X11-unix/X$D2 ]; do D2=$((D2 + 1)); done
+HOME=$T/home2 "$FRAME" $D2 --fbtest --noinput 2> "$T/frame2.log" &
+F2PID=$!
+trap 'kill $FPID $F2PID 2>/dev/null; rm -rf "$T" /tmp/.X11-unix/X$D /tmp/.X11-unix/X$D2' EXIT
+for _ in {1..25}; do [ -S /tmp/.X11-unix/X$D2 ] && break; sleep 0.2; done
+is "with beam = 600, part shows at 0.3 s and all of it at 1.2 s" \
+   "$(DISPLAY=:$D2 "$T/beam-in")" "at 0.3 s part, at 1.2 s all"
 
 echo
 if [ $fails -eq 0 ]; then echo "frame tests: all good"; else echo "frame tests: $fails failed"; fi

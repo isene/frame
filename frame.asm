@@ -401,6 +401,17 @@ cur_hot_y:          resd 1
 ; (no timer). framerc `shake_find = 0` disables. All state event-driven.
 cur_scale:          resd 1                 ; arrow draw scale (1 = normal)
 cfg_shake_find:     resd 1                 ; 0 = off
+; ---- beam-in: a new window arrives in sparkles, like a transporter ----
+; framerc `beam = N`: its first picture takes N ms to appear (0 = off).
+; Off, the only cost is one test at a window's first paint.
+cfg_beam:           resd 1                 ; ms, 0 = off
+beam_win:           resd 1                 ; the window beaming in (0 = none)
+beam_start:         resq 1                 ; now_mono_ms when it began
+beam_s:             resd 1                 ; this frame's threshold (beam_row)
+beam_fr:            resd 1                 ; this frame's sparkle number
+beam_ox:            resd 1                 ; the window's place on screen
+beam_oy:            resd 1
+beam_in:            resb 1                 ; the walk is drawing it or a child
 ; ---- magnifier lens (Mod4+z): a zoom window that follows the cursor ----
 ; Drawn as a post-window-walk overlay into the composited buffer. Moving it
 ; damages the old + new rects; the compositor's own damage repaint restores
@@ -614,6 +625,7 @@ xkb_getmap_present: resd 1               ; GetMap reply present mask (echoes req
 %define WINDOW_REC_SIZE  64          ; was 56; +56 border_pixel, +60 cursor
 windows:            resb MAX_WINDOWS * WINDOW_REC_SIZE
 win_bgpix:          resd MAX_WINDOWS      ; CW_BACK_PIXMAP xid per window slot
+win_beamed:         resb MAX_WINDOWS      ; 1 once a window has beamed in
 win_painted:        resb MAX_WINDOWS      ; 1 once the CLIENT has drawn into
                                           ; this window (not the back_pixel
                                           ; fill frame does on map)
@@ -2080,7 +2092,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.47", 10
+version_str:        db "frame 0.1.48", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -5696,6 +5708,10 @@ serve_loop:
     mov byte [defer_bg_composite], 0         ; consume the one-cycle grace: leave
     jmp .sl_iter                             ; comp_dirty set, composite next time
 .sl_do_composite:                            ; (poll now uses a 16ms fallback)
+    cmp dword [beam_win], 0                  ; a window beaming in: its next
+    je .sl_comp_now                          ; frame
+    call beam_tick
+.sl_comp_now:
     mov byte [comp_dirty], 0
     call recomposite_screen
     jmp .sl_iter
@@ -11439,6 +11455,7 @@ window_destroy:
 .wd_kill_clear:
     mov dword [win_bgpix + rbx*4], 0         ; drop bg-pixmap ref (slot reuse)
     mov byte [win_painted + rbx], 0          ; ditto the has-drawn flag
+    mov byte [win_beamed + rbx], 0           ; and the beamed-in flag
     mov dword [win_opq + rbx*4], 0           ; and the opaque region
     mov edi, [r13]                           ; free its property records too:
     call window_props_clear                  ; Xlib XID reuse is deterministic,
@@ -13597,7 +13614,7 @@ parse_framerc:
     ; sunlight = N (contrast strength 0..100 for Mod4+b)
     mov eax, [rsi]
     cmp eax, 'sunl'
-    jne .pf_chk_shake
+    jne .pf_chk_beam
     call pf_to_value
     call pf_parse_dec
     cmp eax, 100
@@ -13605,6 +13622,19 @@ parse_framerc:
     mov eax, 100
 .pf_sun_ok:
     mov [cfg_sunlight], eax
+    jmp .pf_next_line
+.pf_chk_beam:
+    ; beam = N (ms a new window takes to beam in; 0 = off)
+    mov eax, [rsi]
+    cmp eax, 'beam'
+    jne .pf_chk_shake
+    call pf_to_value
+    call pf_parse_dec
+    cmp eax, 5000
+    jbe .pf_beam_ok
+    mov eax, 5000
+.pf_beam_ok:
+    mov [cfg_beam], eax
     jmp .pf_next_line
 .pf_chk_shake:
     ; shake_find = N (0 = off; the pointer-wiggle magnifier)
@@ -19746,6 +19776,12 @@ damage_add_local:
     shr rax, 6                                ; / WINDOW_REC_SIZE (64), no div
     cmp rax, MAX_WINDOWS                       ; in a per-draw hot path
     jae .dal_no_slot
+    cmp byte [win_painted + rax], 0
+    jne .dal_painted
+    cmp dword [cfg_beam], 0                    ; a first paint: beam it in?
+    je .dal_painted
+    call beam_first_paint
+.dal_painted:
     mov byte [win_painted + rax], 1
 .dal_no_slot:
     pop rcx
@@ -19896,6 +19932,8 @@ damage_add_window:
 ; the wallpaper fill under it would be painted over at once (v0.1.7).
 ; A game frame filling a glass window skips a full-window fill a frame.
 rect_covered_opaque:
+    cmp dword [beam_win], 0                  ; a window beaming in shows what
+    jne .rco_no                              ; is under it
     xor ecx, ecx
 .rco_loop:
     cmp ecx, MAX_WINDOWS
@@ -20394,6 +20432,10 @@ recomposite_screen:
     pop r12
     pop rbx
 .rs_done:
+    cmp dword [beam_win], 0                  ; a window beaming in: its next
+    je .rs_ret                               ; frame too, whoever drew this one
+    mov byte [comp_dirty], 1                 ; (a grab of the screen does too)
+.rs_ret:
     ret
 
 ; local: stk-ordered walk blitting every mapped backed window, clipped to
@@ -20456,6 +20498,11 @@ rs_composite_children:
     test r14, r14
     jz .rcc_done
     mov r13d, r15d                            ; advance last-drawn stk
+    mov eax, [r14]                            ; the window beaming in: it and
+    cmp eax, [beam_win]                       ; its children draw through
+    jne .rcc_draw                             ; beam_row
+    mov byte [beam_in], 1
+.rcc_draw:
     mov rdi, r14                              ; border ring first (it lives
     call border_draw                          ; outside w×h; early-out bw=0)
     cmp byte [r14 + 31], 0                    ; has backing? blit it (a backless
@@ -20465,6 +20512,10 @@ rs_composite_children:
 .rcc_recurse:
     mov edi, [r14]                            ; recurse into this child's subtree
     call rs_composite_children
+    mov eax, [r14]
+    cmp eax, [beam_win]
+    jne .rcc_pass
+    mov byte [beam_in], 0
     jmp .rcc_pass
 .rcc_done:
     pop r15
@@ -23419,6 +23470,241 @@ handle_shm_put_image:
 ; the punched-out areas show through). Unshaped windows take the plain path
 ; with zero overhead beyond one table probe.
 ; ----------------------------------------------------------------------------
+; ----------------------------------------------------------------------------
+; Beam-in (framerc beam = N). A window's first paint starts it, and for N
+; ms each composite redraws that window cell by cell: a 2x2 cell shows once
+; its number (a hash of where it is) is under beam_s - 48, sparkles while it
+; is in the 48 above that, and leaves what is under it until then. beam_s
+; runs from -48 to 304, so every cell has shown by the end. One window at a
+; time; the main loop keeps comp_dirty set while it runs.
+; ----------------------------------------------------------------------------
+%define BEAM_SPARK 0xFFE8F0FF                ; blue-white
+
+; beam_first_paint — rdi = the window record a client first drew into.
+; Starts the beam for its top-level window: mapped, not override-redirect
+; (menus, tooltips and notices appear at once), 64x64 or more, and only
+; once in its life. Preserves all registers.
+beam_first_paint:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r11
+    mov rsi, rdi
+.bfp_up:
+    mov edi, [rsi + 4]                       ; up to the top-level
+    cmp edi, X_ROOT_WINDOW
+    je .bfp_top
+    call window_lookup
+    test rax, rax
+    jz .bfp_ret
+    mov rsi, rax
+    jmp .bfp_up
+.bfp_top:
+    cmp byte [rsi + 28], 1                   ; mapped
+    jne .bfp_ret
+    cmp byte [rsi + 29], 0                   ; override-redirect
+    jne .bfp_ret
+    cmp word [rsi + 12], 64
+    jb .bfp_ret
+    cmp word [rsi + 14], 64
+    jb .bfp_ret
+    mov rax, rsi
+    lea rcx, [windows]
+    sub rax, rcx
+    shr eax, 6                               ; slot (WINDOW_REC_SIZE = 64)
+    cmp byte [win_beamed + rax], 0
+    jne .bfp_ret
+    mov byte [win_beamed + rax], 1
+    cmp dword [beam_win], 0                  ; another still beaming: it shows
+    je .bfp_start                            ; whole on the next frame
+    push rsi
+    call beam_damage
+    pop rsi
+.bfp_start:
+    mov eax, [rsi]
+    mov [beam_win], eax
+    call now_mono_ms
+    mov [beam_start], rax
+    mov dword [beam_s], -48                  ; nothing shows before the first tick
+    mov byte [comp_dirty], 1
+.bfp_ret:
+    pop r11
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; beam_damage — the beaming window's rect repaints on the next composite.
+; rax = its record, or 0 when it is gone or hidden.
+beam_damage:
+    mov edi, [beam_win]
+    call window_lookup
+    test rax, rax
+    jz .bd_ret
+    cmp byte [rax + 28], 1
+    jne .bd_gone
+    push rax
+    movsx edx, word [rax + 10]
+    movzx ecx, word [rax + 12]
+    movzx r8d, word [rax + 14]
+    movsx eax, word [rax + 8]
+    call damage_add
+    mov byte [comp_dirty], 1
+    pop rax
+    ret
+.bd_gone:
+    xor eax, eax
+.bd_ret:
+    ret
+
+; beam_tick — before a composite while a window beams in: this frame's
+; threshold and sparkle number, and its rect damaged. At the end, or when
+; the window went away, one last plain repaint and the beam stops.
+beam_tick:
+    call now_mono_ms
+    sub rax, [beam_start]
+    mov ecx, [cfg_beam]
+    cmp rax, rcx
+    jae .bt_end
+    mov r8d, eax
+    imul eax, eax, 352                       ; 0 .. 351 over the beam
+    xor edx, edx
+    div ecx
+    sub eax, 48
+    mov [beam_s], eax
+    mov eax, r8d
+    xor edx, edx
+    mov ecx, 33                              ; sparkles change at 30 Hz
+    div ecx
+    mov [beam_fr], eax
+    call beam_damage
+    test rax, rax
+    jz .bt_stop
+    movsx ecx, word [rax + 8]
+    mov [beam_ox], ecx
+    movsx ecx, word [rax + 10]
+    mov [beam_oy], ecx
+    ret
+.bt_end:
+    call beam_damage
+.bt_stop:
+    mov dword [beam_win], 0
+    ret
+
+; beam_row — one row of the window beaming in. rsi = its pixels, rdi = the
+; screen's, ecx = count, edx = screen x of the first, r8d = screen y,
+; r9d = 1 when see-through pixels blend.
+beam_row:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    mov r12d, edx
+    sub r12d, [beam_ox]                      ; x in the window
+    sub r8d, [beam_oy]
+    sar r8d, 1                               ; cell row
+    mov ebp, r8d
+    imul r13d, r8d, 0x85EBCA77
+    mov r14d, [beam_s]
+.brw_px:
+    mov eax, r12d
+    sar eax, 1                               ; cell column
+    mov ebx, eax
+    imul eax, eax, 0x9E3779B1
+    add eax, r13d
+    mov edx, eax
+    shr edx, 15
+    xor eax, edx
+    imul eax, eax, 0x2C1B3C6D
+    shr eax, 24                              ; the cell's number, 0..255
+    lea edx, [rax + 48]
+    cmp edx, r14d
+    jl .brw_show
+    cmp eax, r14d
+    jge .brw_next                            ; not here yet
+    imul ebx, ebx, 0x27D4EB2F                ; in the band: a quarter of the
+    imul edx, ebp, 0x165667B1                ; cells sparkle each frame, a
+    xor ebx, edx                             ; quarter show
+    mov edx, [beam_fr]
+    imul edx, edx, 0x9E3779B1
+    xor ebx, edx
+    imul ebx, ebx, 0x85EBCA77
+    shr ebx, 30
+    jz .brw_spark
+    cmp ebx, 1
+    je .brw_show
+    jmp .brw_next
+.brw_spark:
+    mov dword [rdi], BEAM_SPARK
+    jmp .brw_next
+.brw_show:
+    mov eax, [rsi]
+    test r9d, r9d
+    jz .brw_store
+    mov edx, eax
+    shr edx, 24
+    cmp edx, 255
+    je .brw_store
+    test edx, edx
+    jz .brw_next
+    push rcx
+    mov ecx, [rdi]
+    call px_over
+    pop rcx
+.brw_store:
+    mov [rdi], eax
+.brw_next:
+    add rsi, 4
+    add rdi, 4
+    inc r12d
+    dec ecx
+    jnz .brw_px
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+; px_over — eax = straight-alpha pixel, edx = its alpha (1..254), ecx =
+; the pixel under it. eax = the mix (divides by 256, near enough for a
+; beam). Changes ecx.
+px_over:
+    push r8
+    push r9
+    push r10
+    mov r9d, 256
+    sub r9d, edx
+    mov r8d, eax
+    and r8d, 0xFF00FF
+    imul r8d, edx
+    mov r10d, ecx
+    and r10d, 0xFF00FF
+    imul r10d, r9d
+    add r8d, r10d
+    shr r8d, 8
+    and r8d, 0xFF00FF
+    and eax, 0xFF00
+    imul eax, edx
+    and ecx, 0xFF00
+    imul ecx, r9d
+    add eax, ecx
+    shr eax, 8
+    and eax, 0xFF00
+    or eax, r8d
+    or eax, 0xFF000000
+    pop r10
+    pop r9
+    pop r8
+    ret
+
 blit_window_shaped:
     push rbx
     push r12
@@ -23552,6 +23838,10 @@ blit_window:
     cmp edx, [r13 + 12]
     setne al
 .bw_mode:
+    cmp byte [beam_in], 0                  ; beaming in: per pixel, beam_row
+    je .bw_mode_set
+    or al, 2
+.bw_mode_set:
     mov [rsp + 56], al
 
     ; X clip. win x in r14d.
@@ -23626,11 +23916,21 @@ blit_window:
     mov ecx, [rsp + 40]                     ; copy_w
     add [comp_px_blit], rcx                 ; PERF counter
     cmp byte [rsp + 56], 0
-    jne .bw_blend_row
+    jne .bw_special
     rep movsd
 .bw_row_next:
     inc r12d
     jmp .bw_row
+.bw_special:
+    test byte [rsp + 56], 2
+    jz .bw_blend_row
+    mov edx, [rsp + 24]                     ; screen x of the row's first pixel
+    mov r8d, [rsp + 16]
+    add r8d, r12d                           ; and its screen y
+    movzx r9d, byte [rsp + 56]
+    and r9d, 1                              ; see-through pixels blend
+    call beam_row
+    jmp .bw_row_next
 
     ; --- ARGB row: STRAIGHT-alpha src-over (glass writes A=opacity with
     ; unscaled RGB; its text cells are opaque, so the a=255 fast path
