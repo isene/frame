@@ -402,6 +402,9 @@ cur_hot_y:          resd 1
 cur_scale:          resd 1                 ; arrow draw scale (1 = normal)
 cfg_shake_find:     resd 1                 ; 0 = off
 ; ---- beam-in: a new window arrives in sparkles, like a transporter ----
+%define RAIN_COLS 512                      ; 12-pixel columns: 6144 pixels wide
+%define RAIN_LEN  160                      ; a strand: 10 letters of 16 rows
+%define RAIN_HEAD 0xFFC8FFD2               ; the leading letter, pale green
 ; framerc `beam = N`: its first picture takes N ms to appear (0 = off).
 ; Off, the only cost is one test at a window's first paint.
 cfg_beam:           resd 1                 ; ms, 0 = off
@@ -412,6 +415,11 @@ beam_fr:            resd 1                 ; this frame's sparkle number
 beam_ox:            resd 1                 ; the window's place on screen
 beam_oy:            resd 1
 beam_in:            resb 1                 ; the walk is drawing it or a child
+; framerc `beam_style = rain`: the window arrives as falling code instead,
+; each 12-pixel column written top down behind a strand of green letters.
+cfg_beam_rain:      resb 1                 ; 1 = falling code
+alignb 4
+rain_front:         resd RAIN_COLS         ; per column: window y the code has reached
 ; ---- magnifier lens (Mod4+z): a zoom window that follows the cursor ----
 ; Drawn as a post-window-walk overlay into the composited buffer. Moving it
 ; damages the old + new rects; the compositor's own damage repaint restores
@@ -2092,7 +2100,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.49", 10
+version_str:        db "frame 0.1.50", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -2510,6 +2518,43 @@ font_6x13:
 ; ============================================================================
 ; TEXT
 ; ============================================================================
+; The letters of the falling-code beam-in: 32 mirrored katakana and
+; digits, 16 rows of 12 pixels, bit 0 leftmost. Made by tools/rain_glyphs.py.
+align 2
+rain_glyphs:
+    dw 0x000, 0x000, 0x1A0, 0x1A0, 0x120, 0x120, 0x130, 0x130, 0x130, 0x330, 0x310, 0x318, 0x218, 0x618, 0x208, 0x000   ; ﾊ
+    dw 0x000, 0x080, 0x1F8, 0x018, 0x000, 0x000, 0x0E0, 0x0F8, 0x018, 0x000, 0x000, 0x180, 0x1F0, 0x038, 0x008, 0x000   ; ﾐ
+    dw 0x000, 0x200, 0x300, 0x310, 0x330, 0x3E0, 0x380, 0x300, 0x300, 0x300, 0x300, 0x300, 0x300, 0x3F8, 0x0F0, 0x000   ; ﾋ
+    dw 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x1FC, 0x1FC, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000   ; ｰ
+    dw 0x000, 0x0C0, 0x0C0, 0x3F0, 0x3F8, 0x318, 0x318, 0x310, 0x310, 0x030, 0x030, 0x030, 0x060, 0x1C0, 0x180, 0x000   ; ｳ
+    dw 0x000, 0x000, 0x180, 0x0C0, 0x040, 0x00C, 0x18C, 0x1C8, 0x018, 0x018, 0x030, 0x060, 0x0E0, 0x1C0, 0x100, 0x000   ; ｼ
+    dw 0x000, 0x0C0, 0x0C0, 0x0C0, 0x3F8, 0x7F8, 0x0C0, 0x040, 0x0C0, 0x0C0, 0x0C0, 0x0C0, 0x180, 0x380, 0x100, 0x000   ; ﾅ
+    dw 0x000, 0x000, 0x1F8, 0x0E0, 0x040, 0x040, 0x0E0, 0x1FC, 0x040, 0x040, 0x040, 0x040, 0x040, 0x07C, 0x038, 0x000   ; ﾓ
+    dw 0x000, 0x000, 0x000, 0x1F8, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x1F8, 0x1FC, 0x000, 0x000   ; ﾆ
+    dw 0x000, 0x130, 0x330, 0x330, 0x3F8, 0x7F8, 0x330, 0x330, 0x330, 0x330, 0x030, 0x060, 0x060, 0x1C0, 0x080, 0x000   ; ｻ
+    dw 0x000, 0x000, 0x1FC, 0x18C, 0x18C, 0x18C, 0x18C, 0x18C, 0x008, 0x018, 0x018, 0x030, 0x070, 0x0E0, 0x0C0, 0x000   ; ﾜ
+    dw 0x000, 0x080, 0x288, 0x6D8, 0x2D8, 0x358, 0x318, 0x018, 0x030, 0x030, 0x070, 0x060, 0x1C0, 0x180, 0x000, 0x000   ; ﾂ
+    dw 0x000, 0x030, 0x030, 0x1F8, 0x3F8, 0x070, 0x070, 0x0F0, 0x0F0, 0x1B0, 0x330, 0x330, 0x230, 0x060, 0x060, 0x000   ; ｵ
+    dw 0x000, 0x110, 0x310, 0x310, 0x310, 0x310, 0x310, 0x310, 0x330, 0x330, 0x030, 0x030, 0x060, 0x0E0, 0x080, 0x000   ; ﾘ
+    dw 0x000, 0x000, 0x7F8, 0x018, 0x018, 0x090, 0x0B0, 0x0F0, 0x080, 0x080, 0x180, 0x180, 0x300, 0x300, 0x200, 0x000   ; ｱ
+    dw 0x000, 0x040, 0x040, 0x3E0, 0x7F8, 0x040, 0x150, 0x350, 0x350, 0x358, 0x258, 0x258, 0x648, 0x1C0, 0x1C0, 0x000   ; ﾎ
+    dw 0x000, 0x1F8, 0x000, 0x000, 0x000, 0x3FC, 0x060, 0x060, 0x060, 0x060, 0x060, 0x0E0, 0x0C0, 0x080, 0x000, 0x000   ; ﾃ
+    dw 0x000, 0x3F8, 0x1FC, 0x008, 0x018, 0x018, 0x0B0, 0x1F0, 0x0E0, 0x060, 0x060, 0x030, 0x018, 0x010, 0x000, 0x000   ; ﾏ
+    dw 0x000, 0x180, 0x180, 0x180, 0x1F8, 0x370, 0x320, 0x660, 0x260, 0x060, 0x060, 0x0C0, 0x1C0, 0x380, 0x100, 0x000   ; ｹ
+    dw 0x000, 0x010, 0x030, 0x030, 0x020, 0x3A0, 0x1E0, 0x0E0, 0x060, 0x0F0, 0x0D8, 0x188, 0x180, 0x300, 0x200, 0x000   ; ﾒ
+    dw 0x000, 0x000, 0x000, 0x3F8, 0x0C0, 0x0C0, 0x0C0, 0x0C0, 0x0C0, 0x0C0, 0x0C0, 0x0C0, 0x7F8, 0x3F8, 0x000, 0x000   ; ｴ
+    dw 0x000, 0x060, 0x060, 0x060, 0x1FC, 0x06C, 0x06C, 0x06C, 0x04C, 0x04C, 0x0CC, 0x0CC, 0x18C, 0x1B8, 0x010, 0x000   ; ｶ
+    dw 0x000, 0x060, 0x060, 0x078, 0x1F8, 0x060, 0x060, 0x060, 0x1FC, 0x1E0, 0x020, 0x020, 0x020, 0x020, 0x020, 0x000   ; ｷ
+    dw 0x080, 0x0C0, 0x080, 0x180, 0x180, 0x1A0, 0x1A0, 0x130, 0x130, 0x310, 0x310, 0x3F8, 0x7F8, 0x008, 0x000, 0x000   ; ﾑ
+    dw 0x000, 0x000, 0x000, 0x3F0, 0x030, 0x030, 0x030, 0x030, 0x030, 0x030, 0x030, 0x030, 0x3F8, 0x3F8, 0x000, 0x000   ; ﾕ
+    dw 0x000, 0x1F8, 0x000, 0x000, 0x1F8, 0x1FC, 0x008, 0x018, 0x018, 0x030, 0x030, 0x060, 0x1C0, 0x180, 0x000, 0x000   ; ﾗ
+    dw 0x000, 0x100, 0x100, 0x100, 0x1F8, 0x7F8, 0x110, 0x130, 0x130, 0x160, 0x120, 0x100, 0x100, 0x1F8, 0x0F8, 0x000   ; ｾ
+    dw 0x000, 0x000, 0x000, 0x0F0, 0x1D8, 0x198, 0x19C, 0x1BC, 0x1BC, 0x19C, 0x198, 0x1D8, 0x0F0, 0x000, 0x000, 0x000   ; 0
+    dw 0x000, 0x000, 0x000, 0x1E0, 0x3E0, 0x0E0, 0x0E0, 0x0E0, 0x0E0, 0x0E0, 0x0E0, 0x0E0, 0x3F8, 0x000, 0x000, 0x000   ; 1
+    dw 0x000, 0x000, 0x000, 0x1F8, 0x180, 0x180, 0x1F0, 0x118, 0x018, 0x01C, 0x018, 0x118, 0x0F0, 0x000, 0x000, 0x000   ; 5
+    dw 0x000, 0x000, 0x000, 0x1F8, 0x018, 0x018, 0x038, 0x030, 0x070, 0x060, 0x060, 0x0E0, 0x0C0, 0x000, 0x000, 0x000   ; 7
+    dw 0x000, 0x000, 0x000, 0x0F0, 0x198, 0x198, 0x198, 0x19C, 0x19C, 0x0F8, 0x018, 0x118, 0x0F0, 0x000, 0x000, 0x000   ; 9
+
 SECTION .text
 global _start
 
@@ -13343,6 +13388,7 @@ read_framerc:
     mov dword [cfg_shake_find], 1             ; shake-to-find on by default
     mov dword [cfg_magnify], 2                ; magnifier zoom factor
     mov dword [cfg_beam], 0                   ; beam-in off
+    mov byte [cfg_beam_rain], 0               ; in sparkles
     ; --- locate HOME in envp ---
     mov rsi, [envp]
     test rsi, rsi
@@ -13632,6 +13678,8 @@ parse_framerc:
     mov eax, [rsi]
     cmp eax, 'beam'
     jne .pf_chk_shake
+    cmp byte [rsi + 4], '_'
+    je .pf_beam_style
     call pf_to_value
     call pf_parse_dec
     cmp eax, 5000
@@ -13639,6 +13687,13 @@ parse_framerc:
     mov eax, 5000
 .pf_beam_ok:
     mov [cfg_beam], eax
+    jmp .pf_next_line
+.pf_beam_style:
+    ; beam_style = rain (falling code) or sparkle (the default)
+    call pf_to_value
+    cmp byte [rsi], 'r'
+    sete al
+    mov [cfg_beam_rain], al
     jmp .pf_next_line
 .pf_chk_shake:
     ; shake_find = N (0 = off; the pointer-wiggle magnifier)
@@ -23528,6 +23583,13 @@ beam_first_paint:
     call beam_damage
     pop rsi
 .bfp_start:
+    cmp byte [cfg_beam_rain], 0              ; falling code: no column written
+    je .bfp_go                               ; yet, whatever the last beam left
+    lea rdi, [rain_front]
+    xor eax, eax
+    mov ecx, RAIN_COLS
+    rep stosd
+.bfp_go:
     mov eax, [rsi]
     mov [beam_win], eax
     call now_mono_ms
@@ -23594,6 +23656,8 @@ beam_tick:
     mov [beam_ox], ecx
     movsx ecx, word [rax + 10]
     mov [beam_oy], ecx
+    cmp byte [cfg_beam_rain], 0
+    jne rain_tick
     ret
 .bt_end:
     call beam_damage
@@ -23605,6 +23669,8 @@ beam_tick:
 ; screen's, ecx = count, edx = screen x of the first, r8d = screen y,
 ; r9d = 1 when see-through pixels blend.
 beam_row:
+    cmp byte [cfg_beam_rain], 0
+    jne rain_row
     push rbx
     push rbp
     push r12
@@ -23670,6 +23736,181 @@ beam_row:
     inc r12d
     dec ecx
     jnz .brw_px
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+; rain_tick — the end of beam_tick in falling code, rax = the window's
+; record. Each column starts at its own time (a hash of its number, up to
+; 37 % of the beam) and falls at one speed, so the last one to start has
+; its strand past the bottom as the beam ends.
+rain_tick:
+    push rbx
+    push r12
+    push r13
+    call now_mono_ms
+    sub rax, [beam_start]
+    shl eax, 10
+    xor edx, edx
+    div dword [cfg_beam]
+    mov r12d, eax                            ; progress, 0 .. 1023
+    mov edi, [beam_win]
+    call window_lookup
+    test rax, rax
+    jz .rt_ret
+    movzx r13d, word [rax + 14]
+    add r13d, RAIN_LEN                       ; distance a strand falls
+    movzx ecx, word [rax + 12]
+    add ecx, 11
+    mov eax, ecx
+    xor edx, edx
+    mov ecx, 12
+    div ecx                                  ; columns
+    cmp eax, RAIN_COLS
+    jbe .rt_cols
+    mov eax, RAIN_COLS
+.rt_cols:
+    mov ecx, eax
+    xor ebx, ebx
+.rt_col:
+    imul eax, ebx, 0x9E3779B1                ; when this column starts
+    mov edx, eax
+    shr edx, 15
+    xor eax, edx
+    imul eax, eax, 0x2C1B3C6D
+    shr eax, 24
+    imul eax, eax, 3
+    shr eax, 1                               ; 0 .. 382
+    mov edx, r12d
+    sub edx, eax
+    jg .rt_falling
+    xor eax, eax                             ; not started
+    jmp .rt_store
+.rt_falling:
+    mov eax, edx
+    imul eax, r13d
+    xor edx, edx
+    push rcx
+    mov ecx, 1023 - 382
+    div ecx
+    pop rcx
+.rt_store:
+    mov [rain_front + rbx*4], eax
+    inc ebx
+    cmp ebx, ecx
+    jb .rt_col
+.rt_ret:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; rain_row — beam_row in falling code. Above its column's strand a pixel
+; shows the window, in the strand a letter (pale at the head, darker up
+; the tail) on black, and below it what is under the window.
+rain_row:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov eax, edx
+    sub eax, [beam_ox]                       ; x in the window
+    sub r8d, [beam_oy]
+    mov r13d, r8d                            ; y in the window
+    mov r12d, ecx                            ; pixels left
+    xor edx, edx
+    mov ecx, 12
+    div ecx
+    mov r14d, eax                            ; column
+    mov r15d, edx                            ; x in its letter
+.rr_px:
+    cmp r14d, RAIN_COLS
+    jae .rr_show
+    mov eax, [rain_front + r14*4]
+    cmp r13d, eax
+    jge .rr_next                             ; not written yet
+    lea edx, [rax - RAIN_LEN]
+    cmp r13d, edx
+    jl .rr_show                              ; above the strand
+    dec eax
+    sar eax, 4                               ; the head's letter row
+    mov ebx, r13d
+    sar ebx, 4
+    sub eax, ebx
+    mov ebp, eax                             ; letters behind the head
+    imul edx, r14d, 0x9E3779B1               ; which letter: a hash of its
+    imul ebx, ebx, 0x85EBCA77                ; place, and of the frame too
+    xor edx, ebx                             ; at the head, which flickers
+    test ebp, ebp
+    jnz .rr_letter
+    mov ebx, [beam_fr]
+    imul ebx, ebx, 0x27D4EB2F
+    xor edx, ebx
+.rr_letter:
+    mov ebx, edx
+    shr ebx, 15
+    xor edx, ebx
+    imul edx, edx, 0x2C1B3C6D
+    shr edx, 27
+    shl edx, 5                               ; 32 bytes a letter
+    mov ebx, r13d
+    and ebx, 15
+    movzx eax, word [rain_glyphs + rdx + rbx*2]
+    bt eax, r15d
+    jnc .rr_black
+    test ebp, ebp
+    jz .rr_head
+    imul ebp, ebp, 24
+    mov eax, 255
+    sub eax, ebp                             ; 255 at the head, 39 at the end
+    imul edx, eax, 215
+    shr edx, 8
+    add edx, 40                              ; green
+    imul eax, eax, 55
+    shr eax, 8
+    add eax, 10                              ; a little blue
+    shl edx, 8
+    or eax, edx
+    or eax, 0xFF000000
+    mov [rdi], eax
+    jmp .rr_next
+.rr_head:
+    mov dword [rdi], RAIN_HEAD
+    jmp .rr_next
+.rr_black:
+    mov dword [rdi], 0xFF000000
+    jmp .rr_next
+.rr_show:
+    mov eax, [rsi]
+    test r9d, r9d
+    jz .rr_store
+    mov edx, eax
+    shr edx, 24
+    cmp edx, 255
+    je .rr_store
+    test edx, edx
+    jz .rr_next
+    mov ecx, [rdi]
+    call px_over
+.rr_store:
+    mov [rdi], eax
+.rr_next:
+    add rsi, 4
+    add rdi, 4
+    inc r15d
+    cmp r15d, 12
+    jb .rr_same
+    xor r15d, r15d
+    inc r14d
+.rr_same:
+    dec r12d
+    jnz .rr_px
+    pop r15
     pop r14
     pop r13
     pop r12
