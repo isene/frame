@@ -30,6 +30,7 @@ gcc -O1 -o "$T/core-text" "$here/core-text.c" -lX11 || exit 1
 gcc -O1 -o "$T/fill-poly" "$here/fill-poly.c" -lX11 || exit 1
 gcc -O1 -o "$T/beam-in" "$here/beam-in.c" -lX11 || exit 1
 gcc -O1 -o "$T/overview" "$here/overview.c" -lX11 || exit 1
+gcc -O1 -o "$T/held-key" "$here/held-key.c" -lX11 || exit 1
 mkfifo "$T/pad"
 printf 'keymap = no\n' > "$T/home/.framerc"   # caps-lock types AltGr+e = euro sign
 
@@ -143,6 +144,11 @@ is "the cells, their rings, a hidden workspace and the request to the WM" \
 echo "== v0.1.52: a key remapped to Escape closes the overview"
 is "after Mod4+space the backdrop shows, after Caps Lock the window again" \
    "$(DISPLAY=:$D2 "$T/overview" "$T/pad2" esc)" "open: 0b0b10, caps lock as escape: ff0000"
+
+# Computer listens while Mod4+g is held. frame sent the kernel's repeats
+# of a held WM hotkey to the focused window, so it read g, g, g.
+echo "== v0.1.53: a held WM hotkey repeats to nobody"
+is "the WM reads one press and the focused window none" "$("$T/held-key" "$T/pad")" "wm 1, window 0"
 
 echo
 if [ $fails -eq 0 ]; then echo "frame tests: all good"; else echo "frame tests: $fails failed"; fi

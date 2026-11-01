@@ -914,6 +914,7 @@ key_grabs:          resb MAX_KEY_GRABS * KEY_GRAB_SIZE
 ; Active keyboard grab — set by GrabKeyboard, cleared by
 ; UngrabKeyboard. -1 = no active grab.
 active_kbd_slot:    resd 1
+grab_held_key:      resd 1               ; X keycode of a held WM hotkey, 0 = none
 active_kbd_window:  resd 1
 
 ; ---- Phase 4d.2 evdev integration -----------------------------------------
@@ -15264,10 +15265,16 @@ dispatch_input_event:
     ; Release (value 0) → KeyRelease to the focused window.
     cmp r13d, 0
     je .die_release
-    ; Repeat (value 2) → KeyPress to the focused window (no grab re-fire).
+    ; Repeat (value 2): a held WM hotkey repeats to nobody. On X the grab
+    ; holder owns the key until it is released, and tile acts on the press
+    ; alone. Any other repeat → KeyPress to the focused window.
     cmp r13d, 1
-    jne .die_focus_press
+    je .die_fresh
+    cmp r12d, [grab_held_key]
+    je .die_done
+    jmp .die_focus_press
 
+.die_fresh:
     ; Fresh press: an ACTIVE keyboard grab overrides passive WM hotkey
     ; grabs (X semantics) — while rofi holds the keyboard, Mod4 combos go
     ; to rofi, not tile. deliver_to_focus routes to the grab holder.
@@ -15279,6 +15286,7 @@ dispatch_input_event:
     call find_key_grab
     test rax, rax
     jz .die_focus_press
+    mov [grab_held_key], r12d
     mov edi, [rax + 4]                       ; grab client slot
     mov esi, r12d                            ; keycode
     movzx ecx, byte [mod_state]
@@ -15293,6 +15301,10 @@ dispatch_input_event:
     call deliver_to_focus
     jmp .die_done
 .die_release:
+    cmp r12d, [grab_held_key]
+    jne .die_release_send
+    mov dword [grab_held_key], 0
+.die_release_send:
     mov esi, r12d
     mov r8d, 3                               ; KeyRelease
     call deliver_to_focus
