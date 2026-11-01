@@ -114,9 +114,10 @@ is "inside, outside and edge pixels, and none from shapes off the left" "$("$T/f
 echo "== v0.1.48: beam = 600 fades a new window in"
 is "with no beam line, a window shows whole at once" "$("$T/beam-in")" "at 0.3 s all, at 1.2 s all"
 mkdir "$T/home2"
-printf 'keymap = no\nbeam = 600\n' > "$T/home2/.framerc"
+printf 'keymap = no\nbeam = 600\nkeycode 66 = Escape\n' > "$T/home2/.framerc"
+mkfifo "$T/pad2"
 D2=$((D + 1)); while [ -e /tmp/.X11-unix/X$D2 ]; do D2=$((D2 + 1)); done
-HOME=$T/home2 "$FRAME" $D2 --fbtest --noinput 2> "$T/frame2.log" &
+HOME=$T/home2 "$FRAME" $D2 --fbtest --noinput --testinput "$T/pad2" 2> "$T/frame2.log" &
 F2PID=$!
 trap 'kill $FPID $F2PID 2>/dev/null; rm -rf "$T" /tmp/.X11-unix/X$D /tmp/.X11-unix/X$D2' EXIT
 for _ in {1..25}; do [ -S /tmp/.X11-unix/X$D2 ] && break; sleep 0.2; done
@@ -136,6 +137,12 @@ echo "== v0.1.51: Mod4+space shows the workspaces, and Enter picks one"
 is "the cells, their rings, a hidden workspace and the request to the WM" \
    "$("$T/overview" "$T/pad")" \
    "open: 0b0b10 ff0000 00ff00 1a1d24 0000ff ff9900 3a3f4a, right 2: 0b0b10 ff9900, enter: ff0000 00ff00, asked for 2"
+
+# Caps Lock remapped to Escape (home2's keycode 66 line) is the Escape key
+# to its owner. The overview matched the key's place, not its meaning.
+echo "== v0.1.52: a key remapped to Escape closes the overview"
+is "after Mod4+space the backdrop shows, after Caps Lock the window again" \
+   "$(DISPLAY=:$D2 "$T/overview" "$T/pad2" esc)" "open: 0b0b10, caps lock as escape: ff0000"
 
 echo
 if [ $fails -eq 0 ]; then echo "frame tests: all good"; else echo "frame tests: $fails failed"; fi

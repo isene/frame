@@ -2117,7 +2117,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.51", 10
+version_str:        db "frame 0.1.52", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -25470,8 +25470,13 @@ ov_key:
     je .ok_go
     cmp r12d, 104                            ; KP_Enter
     je .ok_go
-    cmp r12d, 9                              ; Esc
+    lea ecx, [r12d - X_MIN_KEYCODE]          ; Escape by what the key means,
+    cmp ecx, KEYCODE_RANGE                   ; so a remap counts (Caps Lock
+    jae .ok_no_esc                           ; as Escape, say)
+    imul ecx, ecx, 24
+    cmp dword [keysym_table + rcx], 0xff1b   ; XK_Escape
     je ov_close
+.ok_no_esc:
     cmp r12d, 65                             ; space (Mod4+space again)
     je ov_close
     cmp r12d, 10                             ; digits 1..9, 0 = keycodes 10..19

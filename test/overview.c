@@ -2,7 +2,9 @@
    workspace 1, blue on workspace 3 and hidden), then Mod4+space, two Right
    presses and Enter on the fake keyboard. Prints the screen's pixels at
    each step and the workspace the WM is asked for. FIFO is the pipe frame
-   reads through --testinput. The cells are for a 1920x1080 screen. */
+   reads through --testinput. The cells are for a 1920x1080 screen.
+   "overview FIFO esc" instead opens it and presses Caps Lock, which the
+   frame on FIFO must have remapped to Escape. */
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -69,6 +71,17 @@ int main(int argc, char **argv) {
     XSelectInput(wm, DefaultRootWindow(wm), SubstructureRedirectMask);
     XSync(wm, False);
     usleep(200000);
+
+    if (argc > 2) {                         /* "esc": the key that means Escape closes it */
+        printf("open:");
+        tap(KEY_LEFTMETA, KEY_SPACE);
+        px(10, 10);
+        printf(", caps lock as escape:");
+        tap(0, KEY_CAPSLOCK);
+        px(10, 10);
+        printf("\n");
+        return 0;
+    }
 
     /* Cell 1 at x 24..379, cell 2 at 403.., cell 3 at 782..; rows 329..528. */
     printf("open:");

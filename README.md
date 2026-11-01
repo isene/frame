@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.51-blue)
+![Version](https://img.shields.io/badge/version-0.1.52-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -353,7 +353,8 @@ backing store. Runs only while the lens is up; off costs one compare.
 **`Mod4+space`**: the workspace overview. Every workspace shows as a small
 live picture of its windows on the wallpaper, two rows of five, numbered 1
 to 10. The arrows move the orange ring, Enter or a click goes there, a digit
-goes straight to that workspace, and Esc or `Mod4+space` again closes it.
+goes straight to that workspace, and Escape (also a key remapped to it) or
+`Mod4+space` again closes it.
 frame asks the window manager for the switch the way a pager does
 (`_NET_CURRENT_DESKTOP`), so it works with tile or any EWMH window manager
 that sets `_NET_WM_DESKTOP` on its windows. A repaint costs about 8 ms at
