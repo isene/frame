@@ -427,6 +427,19 @@ rain_front:         resd RAIN_COLS         ; per column: window y the code has r
 ; zoom factor. LENS_W/LENS_H are the on-screen lens size.
 %define LENS_W 480
 %define LENS_H 320
+ov_on:              resb 1                 ; 1 = workspace overview up (Mod4+space)
+    alignb 4
+ov_sel:             resd 1                 ; overview: the picked cell, 0..9
+ov_serial:          resd 1                 ; counts unmaps (newest hidden tab on top)
+ov_n:               resd 1                 ; windows in ov_list
+ov_gap:             resd 1                 ; overview layout, set by ov_draw
+ov_cw:              resd 1
+ov_ch:              resd 1
+ov_top:             resd 1
+ov_px:              resd 1                 ; size of a dot in the numbers
+ov_cx:              resd 1                 ; the cell being painted
+ov_cy:              resd 1
+ov_ev:              resb 32                ; the ClientMessage to the WM
 lens_active:        resd 1                 ; 1 = lens visible
 cfg_magnify:        resd 1                 ; zoom factor (2..8)
 lens_prev_x:        resd 1                 ; last lens top-left (for restore)
@@ -632,6 +645,10 @@ xkb_getmap_present: resd 1               ; GetMap reply present mask (echoes req
 %define MAX_WINDOWS      512
 %define WINDOW_REC_SIZE  64          ; was 56; +56 border_pixel, +60 cursor
 windows:            resb MAX_WINDOWS * WINDOW_REC_SIZE
+win_unmap_serial:   resd MAX_WINDOWS       ; ov_serial at each slot's last unmap
+ov_list:            resd MAX_WINDOWS       ; overview paint order: record slots,
+ov_keys:            resd MAX_WINDOWS       ; their sort keys
+ov_ldesk:           resb MAX_WINDOWS       ; and their workspaces
 win_bgpix:          resd MAX_WINDOWS      ; CW_BACK_PIXMAP xid per window slot
 win_beamed:         resb MAX_WINDOWS      ; 1 once a window has beamed in
 win_painted:        resb MAX_WINDOWS      ; 1 once the CLIENT has drawn into
@@ -2100,7 +2117,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.50", 10
+version_str:        db "frame 0.1.51", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -12148,6 +12165,13 @@ handle_unmap_window:
     cmp byte [r12 + 28], 0
     je .uw_done
     mov byte [r12 + 28], 0
+    mov rax, r12                              ; when, for the overview's order
+    lea rcx, [windows]
+    sub rax, rcx
+    shr eax, 6
+    inc dword [ov_serial]
+    mov ecx, [ov_serial]
+    mov [win_unmap_serial + rax*4], ecx
     mov eax, [r12]                            ; focus follows the window off
     cmp eax, [focus_window]                   ; screen: an unviewable focus
     jne .uw_focus_ok                          ; swallows every key
@@ -15160,6 +15184,15 @@ dispatch_input_event:
     btr dword [keys_down], r12d
 .die_kd_done:
 
+    ; The workspace overview takes every key press while it is up.
+    cmp byte [ov_on], 0
+    je .die_no_ov
+    test r13d, r13d
+    jz .die_no_ov                            ; releases still reach clients
+    call ov_key
+    jmp .die_done
+.die_no_ov:
+
     ; framerc blank_key: exact modifier match on the resolved keycode →
     ; panel off NOW. Server-level like the zap/VT combos: the combo never
     ; reaches clients (press blanks; its repeats + release are swallowed).
@@ -15188,7 +15221,7 @@ dispatch_input_event:
 .die_no_blankkey:
 
     ; frame hotkeys on plain Mod4 (the CHasm desktop realm): n = night-
-    ; light, b = sunlight, z = magnifier lens. Server-level like
+    ; light, b = sunlight, z = magnifier lens, space = workspace overview. Server-level like
     ; blank_key — swallowed, never reach clients. r12d is the X keycode
     ; (evdev+8): 'b'=56, 'n'=57, 'z'=52.
     movzx eax, byte [mod_state]
@@ -15201,6 +15234,8 @@ dispatch_input_event:
     je .die_gamma_sun
     cmp r12d, 52                             ; 'z'
     je .die_lens_toggle
+    cmp r12d, 65                             ; space
+    je .die_ov_open
     jmp .die_no_gammakey
 .die_gamma_night:
     cmp r13d, 1
@@ -15218,6 +15253,11 @@ dispatch_input_event:
     cmp r13d, 1
     jne .die_done
     call lens_toggle
+    jmp .die_done
+.die_ov_open:
+    cmp r13d, 1
+    jne .die_done
+    call ov_open
     jmp .die_done
 .die_no_gammakey:
 
@@ -15650,6 +15690,8 @@ dispatch_input_event:
     jne .die_tap_emit
     mov esi, 3                                ; 2-finger tap → right button
 .die_tap_emit:
+    cmp byte [ov_on], 0
+    jne .die_ov_tap
     ; A tap is a press and a release in one go. The release must still say
     ; that its own button was held, as every X release does. GTK4 lets go of
     ; the clicked widget only when it reads exactly one held button there.
@@ -15696,6 +15738,8 @@ dispatch_input_event:
 .die_btn_middle:
     mov esi, 2
 .die_btn_have:
+    cmp byte [ov_on], 0
+    jne .die_ov_btn
     ; Send first (so 'state' reflects pre-event mask), then update the mask.
     test r13d, r13d
     jz .die_btn_release
@@ -15723,6 +15767,12 @@ dispatch_input_event:
     shl eax, cl
     not eax
     and [button_state], eax
+    jmp .die_done
+.die_ov_btn:
+    test r13d, r13d                          ; the overview picks on the
+    jnz .die_done                            ; release; neither reaches a client
+.die_ov_tap:
+    call ov_click
     jmp .die_done
 
 .die_done:
@@ -20261,6 +20311,8 @@ recomposite_screen:
     test eax, eax
     jz .rs_done_pop                           ; buffer already clean → nothing
     inc dword [rs_counter]                    ; DIAG (clobbers flags!)
+    cmp byte [ov_on], 0
+    jne .rs_overview
     cmp eax, 0
     jl .rs_full                               ; -1 → whole-screen repaint
 
@@ -20397,6 +20449,10 @@ recomposite_screen:
     call warn_band_apply                      ; and the out-of-slots warning
     call rect_blend_finish
     call lens_draw                            ; magnifier overlay
+    jmp .rs_full_flush
+.rs_overview:
+    call ov_draw                              ; the overview, the whole screen
+.rs_full_flush:
     mov rdi, [drm_dumb_addr]
     mov rcx, [drm_dumb_size]
     add [comp_px_flush], rcx                  ; PERF counter
@@ -25314,6 +25370,735 @@ lens_damage:
     pop rcx
     pop rax
     ret
+
+; ----------------------------------------------------------------------------
+; Workspace overview — Mod4+space. Every workspace as a live picture, two
+; rows of five; arrows or a digit pick one, Enter or a click goes there,
+; Esc or Mod4+space again closes. While it is up it owns the whole back
+; buffer (recomposite_screen calls ov_draw instead of the window walk);
+; while it is down the only cost is a byte test per key, per composite and
+; per click, and a counter bump per unmap.
+; ----------------------------------------------------------------------------
+%define OV_BACK     0x000b0b10             ; backdrop around the cells
+%define OV_CELL     0x001a1d24             ; an empty workspace, no wallpaper
+%define OV_RING     0x003a3f4a             ; ring of a cell
+%define OV_PICK     0x00ff9900             ; ring and number of the picked cell
+%define OV_NUM      0x00cccccc             ; number of the other cells
+
+ov_open:
+    cmp byte [compositor_active], 0
+    je .oo_ret
+    mov byte [ov_on], 1
+    mov dword [ov_sel], 0
+    lea rdi, [ov_atom_cur]                   ; start on the workspace in view
+    mov esi, ov_atom_cur_len
+    call atom_lookup
+    test eax, eax
+    jz ov_repaint
+    mov esi, eax
+    mov edi, X_ROOT_WINDOW
+    call property_find
+    test rax, rax
+    jz ov_repaint
+    mov ecx, [rax + 20]
+    mov eax, [property_values + rcx]
+    cmp eax, 10
+    jae ov_repaint
+    mov [ov_sel], eax
+    jmp ov_repaint
+.oo_ret:
+    ret
+
+ov_close:
+    mov byte [ov_on], 0
+ov_repaint:
+    mov dword [dmg_count0], -1               ; whole screen, both buffers
+    mov dword [dmg_count1], -1
+    mov byte [comp_dirty], 1
+    ret
+
+; ov_pick — edi = workspace, 0-based. Closes the overview and asks the WM
+; to show that workspace with the EWMH request a pager sends (the root
+; ClientMessage _NET_CURRENT_DESKTOP), so tile does the switch itself.
+ov_pick:
+    push rbx
+    mov ebx, edi
+    call ov_close
+    lea rdi, [ov_atom_cur]
+    mov esi, ov_atom_cur_len
+    call atom_lookup
+    test eax, eax
+    jz .op_ret
+    lea rsi, [ov_ev]
+    pxor xmm0, xmm0
+    movdqu [rsi], xmm0
+    movdqu [rsi + 16], xmm0
+    mov byte [rsi], 33                       ; ClientMessage
+    mov byte [rsi + 1], 32                   ; format
+    mov dword [rsi + 4], X_ROOT_WINDOW
+    mov [rsi + 8], eax                       ; message type
+    mov [rsi + 12], ebx                      ; data.l[0] = the workspace
+    mov edi, X_ROOT_WINDOW
+    call window_lookup
+    test rax, rax
+    jz .op_ret
+    movsx edi, byte [rax + 30]               ; root → redirect owner (the WM)
+    test edi, edi
+    js .op_ret
+    lea rsi, [ov_ev]
+    call send_event_to_slot
+.op_ret:
+    pop rbx
+    ret
+
+; ov_key — a key press or repeat while the overview is up. r12d = X
+; keycode, r13d = 1 press / 2 repeat. Arrows move (repeat too), the rest
+; act on a press only.
+ov_key:
+    mov eax, [ov_sel]
+    cmp r12d, 113                            ; Left
+    je .ok_left
+    cmp r12d, 114                            ; Right
+    je .ok_right
+    cmp r12d, 111                            ; Up and Down: the other row
+    je .ok_row
+    cmp r12d, 116
+    je .ok_row
+    cmp r13d, 1
+    jne .ok_ret
+    cmp r12d, 36                             ; Return
+    je .ok_go
+    cmp r12d, 104                            ; KP_Enter
+    je .ok_go
+    cmp r12d, 9                              ; Esc
+    je ov_close
+    cmp r12d, 65                             ; space (Mod4+space again)
+    je ov_close
+    cmp r12d, 10                             ; digits 1..9, 0 = keycodes 10..19
+    jb .ok_ret
+    cmp r12d, 19
+    ja .ok_ret
+    lea edi, [r12d - 10]
+    jmp ov_pick
+.ok_go:
+    mov edi, eax
+    jmp ov_pick
+.ok_left:
+    add eax, 9
+    jmp .ok_set
+.ok_right:
+    inc eax
+    jmp .ok_set
+.ok_row:
+    add eax, 5
+.ok_set:
+    xor edx, edx
+    mov ecx, 10
+    div ecx
+    mov [ov_sel], edx
+    jmp ov_repaint
+.ok_ret:
+    ret
+
+; ov_click — a click (or tap) while the overview is up: the cell under the
+; pointer is picked; a click beside every cell closes the overview.
+ov_click:
+    push rbx
+    xor ebx, ebx
+.ocl_cell:
+    mov edi, ebx
+    call ov_cell_xy
+    mov eax, [cursor_x]
+    sub eax, [ov_cx]
+    js .ocl_next
+    cmp eax, [ov_cw]
+    jge .ocl_next
+    mov eax, [cursor_y]
+    sub eax, [ov_cy]
+    js .ocl_next
+    cmp eax, [ov_ch]
+    jge .ocl_next
+    mov edi, ebx
+    pop rbx
+    jmp ov_pick
+.ocl_next:
+    inc ebx
+    cmp ebx, 10
+    jb .ocl_cell
+    pop rbx
+    jmp ov_close
+
+; ov_cell_xy — edi = cell 0..9 → ov_cx, ov_cy (its top-left on screen).
+; Needs the layout ov_draw computes.
+ov_cell_xy:
+    mov eax, edi
+    xor edx, edx
+    mov ecx, 5
+    div ecx                                  ; eax = row, edx = column
+    mov ecx, [ov_cw]
+    add ecx, [ov_gap]
+    imul edx, ecx
+    add edx, [ov_gap]
+    mov [ov_cx], edx
+    mov ecx, [ov_ch]
+    add ecx, [ov_gap]
+    imul eax, ecx
+    add eax, [ov_top]
+    mov [ov_cy], eax
+    ret
+
+; ov_draw — paint the overview into the back buffer (drm_dumb_addr): the
+; backdrop, ten cells with their rings, each workspace's windows scaled
+; into its cell, then the numbers.
+ov_draw:
+    push rbx
+    push r12
+    push r13
+    push r14
+    ; Layout: a gap of 1/80 of the width; five cells across, each the
+    ; screen's shape; two rows centred.
+    mov eax, [screen_w]
+    xor edx, edx
+    mov ecx, 80
+    div ecx
+    mov [ov_gap], eax
+    imul ecx, eax, 6
+    mov eax, [screen_w]
+    sub eax, ecx
+    xor edx, edx
+    mov ecx, 5
+    div ecx
+    mov [ov_cw], eax
+    imul eax, [screen_h]
+    xor edx, edx
+    div dword [screen_w]
+    mov [ov_ch], eax
+    mov eax, [screen_h]
+    sub eax, [ov_ch]
+    sub eax, [ov_ch]
+    sub eax, [ov_gap]
+    sar eax, 1
+    mov [ov_top], eax
+    mov eax, [screen_h]                      ; number size: 1/360 of the height
+    xor edx, edx
+    mov ecx, 360
+    div ecx
+    cmp eax, 2
+    jae .od_scale
+    mov eax, 2
+.od_scale:
+    mov [ov_px], eax
+
+    xor eax, eax
+    xor esi, esi
+    mov edi, [screen_w]
+    mov ecx, [screen_h]
+    mov edx, OV_BACK
+    call draw_rect
+
+    xor ebx, ebx
+.od_cell:
+    mov edi, ebx
+    call ov_cell_xy
+    mov r12d, 1                              ; ring width
+    mov edx, OV_RING
+    cmp ebx, [ov_sel]
+    jne .od_ring
+    mov r12d, 4
+    mov edx, OV_PICK
+.od_ring:
+    mov eax, [ov_cx]
+    sub eax, r12d
+    mov esi, [ov_cy]
+    sub esi, r12d
+    mov edi, [ov_cw]
+    lea edi, [edi + r12d*2]
+    mov ecx, [ov_ch]
+    lea ecx, [ecx + r12d*2]
+    call draw_rect
+    mov rdi, [wallpaper_ptr]                 ; the wallpaper, small
+    test rdi, rdi
+    jz .od_plain
+    xor esi, esi
+    xor edx, edx
+    mov ecx, [screen_w]
+    mov r8d, [screen_h]
+    mov r9d, ecx
+    call ov_scale
+    jmp .od_cell_next
+.od_plain:
+    mov eax, [ov_cx]
+    mov esi, [ov_cy]
+    mov edi, [ov_cw]
+    mov ecx, [ov_ch]
+    mov edx, OV_CELL
+    call draw_rect
+.od_cell_next:
+    inc ebx
+    cmp ebx, 10
+    jb .od_cell
+
+    call ov_collect
+    xor ebx, ebx
+.od_win:
+    cmp ebx, [ov_n]
+    jae .od_nums
+    movzx edi, byte [ov_ldesk + rbx]
+    call ov_cell_xy
+    mov eax, [ov_list + rbx*4]
+    shl rax, 6                               ; slot → record
+    lea r12, [windows + rax]
+    mov rdi, r12
+    call ov_blit
+    mov edi, [r12]
+    call ov_children
+    inc ebx
+    jmp .od_win
+
+.od_nums:
+    xor ebx, ebx
+.od_num:
+    mov edi, ebx
+    call ov_cell_xy
+    mov r13d, [ov_px]
+    lea r12d, [ebx + 1]                      ; the label: 1..10
+    mov r14d, 1                              ; digits in it
+    cmp r12d, 10
+    jb .od_box
+    mov r14d, 2
+.od_box:
+    mov eax, [ov_cx]                         ; dark box behind the number
+    mov esi, [ov_cy]
+    imul edi, r14d, 6
+    inc edi
+    imul edi, r13d
+    imul ecx, r13d, 9
+    xor edx, edx
+    call draw_rect
+    mov ecx, OV_NUM
+    cmp ebx, [ov_sel]
+    jne .od_col
+    mov ecx, OV_PICK
+.od_col:
+    mov esi, [ov_cx]
+    add esi, r13d
+    mov edx, [ov_cy]
+    add edx, r13d
+    mov edi, r12d
+    cmp r14d, 1
+    je .od_last
+    mov edi, 1                               ; "10": a 1, then a 0
+    push rcx
+    push rdx
+    push rsi
+    call ov_digit
+    pop rsi
+    pop rdx
+    pop rcx
+    imul eax, r13d, 6
+    add esi, eax
+    xor edi, edi
+.od_last:
+    call ov_digit
+    inc ebx
+    cmp ebx, 10
+    jb .od_num
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ov_digit — edi = digit, esi = x, edx = y, ecx = colour. A 5×7 digit,
+; each dot ov_px square.
+ov_digit:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    lea rbx, [ov_font]
+    imul edi, edi, 7
+    add rbx, rdi                             ; this digit's seven rows
+    mov r12d, esi                            ; left
+    mov r13d, edx                            ; top of the current row
+    mov ebp, ecx
+    xor r14d, r14d                           ; row
+.odg_row:
+    movzx r15d, byte [rbx + r14]
+    xor ecx, ecx                             ; column
+.odg_col:
+    mov eax, 4
+    sub eax, ecx
+    bt r15d, eax
+    jnc .odg_next
+    push rcx
+    mov eax, [ov_px]
+    imul eax, ecx
+    add eax, r12d
+    mov esi, r13d
+    mov edi, [ov_px]
+    mov ecx, edi
+    mov edx, ebp
+    call draw_rect
+    pop rcx
+.odg_next:
+    inc ecx
+    cmp ecx, 5
+    jb .odg_col
+    add r13d, [ov_px]
+    inc r14d
+    cmp r14d, 7
+    jb .odg_row
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ov_collect — list the windows to paint: top-level, InputOutput, managed
+; (not override-redirect), with a _NET_WM_DESKTOP of 0..9 from the WM.
+; Sorted for painting: hidden windows by when they were unmapped (a hidden
+; workspace's front tab was unmapped last), then the mapped ones by stack.
+; ov_list = record slots, ov_ldesk = their workspaces, ov_n = the count.
+ov_collect:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov dword [ov_n], 0
+    lea rdi, [ov_atom_desk]
+    mov esi, ov_atom_desk_len
+    call atom_lookup
+    test eax, eax
+    jz .oc_ret
+    mov r13d, eax
+    xor ebx, ebx                             ; slot
+.oc_slot:
+    mov rax, rbx
+    shl rax, 6
+    lea r12, [windows + rax]
+    mov edi, [r12]
+    test edi, edi
+    jz .oc_next
+    cmp edi, X_ROOT_WINDOW
+    je .oc_next
+    cmp dword [r12 + 4], X_ROOT_WINDOW
+    jne .oc_next
+    cmp byte [r12 + 19], 2                   ; InputOnly
+    je .oc_next
+    cmp byte [r12 + 29], 0                   ; override-redirect
+    jne .oc_next
+    mov esi, r13d
+    call property_find
+    test rax, rax
+    jz .oc_next
+    cmp dword [rax + 16], 4
+    jb .oc_next
+    mov ecx, [rax + 20]
+    mov r14d, [property_values + rcx]        ; workspace, 0-based
+    cmp r14d, 10
+    jae .oc_next
+    mov edx, [win_unmap_serial + rbx*4]      ; sort key
+    cmp byte [r12 + 28], 0
+    je .oc_ins
+    mov edx, [r12 + 48]
+    or edx, 0x80000000                       ; mapped: above every hidden one
+.oc_ins:
+    mov ecx, [ov_n]                          ; insertion sort, by key
+.oc_shift:
+    test ecx, ecx
+    jz .oc_put
+    cmp [ov_keys + rcx*4 - 4], edx
+    jbe .oc_put
+    mov eax, [ov_keys + rcx*4 - 4]
+    mov [ov_keys + rcx*4], eax
+    mov eax, [ov_list + rcx*4 - 4]
+    mov [ov_list + rcx*4], eax
+    mov al, [ov_ldesk + rcx - 1]
+    mov [ov_ldesk + rcx], al
+    dec ecx
+    jmp .oc_shift
+.oc_put:
+    mov [ov_keys + rcx*4], edx
+    mov [ov_list + rcx*4], ebx
+    mov [ov_ldesk + rcx], r14b
+    inc dword [ov_n]
+.oc_next:
+    inc ebx
+    cmp ebx, MAX_WINDOWS
+    jb .oc_slot
+.oc_ret:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ov_children — edi = parent xid. Paints its mapped children into the
+; current cell in stack order, each followed by its own children (the
+; same walk as rs_composite_children).
+ov_children:
+    push rbx
+    push r13
+    push r14
+    push r15
+    mov ebx, edi
+    xor r13d, r13d                           ; last stk painted at this level
+.och_pass:
+    xor r14, r14
+    mov r15d, 0xFFFFFFFF
+    xor ecx, ecx
+.och_find:
+    mov rax, rcx
+    shl rax, 6
+    lea rax, [windows + rax]
+    cmp dword [rax], 0
+    je .och_next
+    cmp [rax + 4], ebx
+    jne .och_next
+    cmp byte [rax + 28], 0
+    je .och_next
+    mov edx, [rax + 48]
+    cmp edx, r13d
+    jbe .och_next
+    cmp edx, r15d
+    jae .och_next
+    mov r15d, edx
+    mov r14, rax
+.och_next:
+    inc ecx
+    cmp ecx, MAX_WINDOWS
+    jb .och_find
+    test r14, r14
+    jz .och_done
+    mov r13d, r15d
+    mov rdi, r14
+    call ov_blit
+    mov edi, [r14]
+    call ov_children
+    jmp .och_pass
+.och_done:
+    pop r15
+    pop r14
+    pop r13
+    pop rbx
+    ret
+
+; ov_blit — rdi = window record. Its backing, scaled into the current cell.
+ov_blit:
+    cmp byte [rdi + 31], 0                   ; no backing: nothing to paint
+    je .ob_ret
+    push rbx
+    mov rbx, rdi
+    mov edi, [rbx]
+    call window_abs_xy
+    movzx ecx, word [rbx + 12]               ; size, never past the backing
+    movzx eax, word [rbx + 40]
+    cmp ecx, eax
+    cmova ecx, eax
+    movzx r8d, word [rbx + 14]
+    movzx eax, word [rbx + 42]
+    cmp r8d, eax
+    cmova r8d, eax
+    movzx r9d, word [rbx + 40]
+    mov rdi, [rbx + 32]
+    mov esi, r10d
+    mov edx, r11d
+    pop rbx
+    jmp ov_scale
+.ob_ret:
+    ret
+
+; ov_scale — rdi = pixels, esi/edx = where they sit on the screen, ecx ×
+; r8d = their size, r9d = their stride in pixels. Scales them into the
+; current cell (ov_cx/ov_cy; ov_cw × ov_ch stands for the whole screen).
+; Each cell pixel is the average of four source pixels, so text shrinks to
+; an even grey instead of broken dots.
+ov_scale:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 56
+    mov rbx, rdi
+    mov [rsp + 0], esi                       ; x on screen
+    mov [rsp + 4], edx                       ; y
+    sub ecx, 1
+    js .ob_done
+    mov [rsp + 8], ecx                       ; last column
+    sub r8d, 1
+    js .ob_done
+    mov [rsp + 12], r8d                      ; last row
+    mov eax, r9d
+    shl eax, 2
+    mov [rsp + 40], rax                      ; stride in bytes
+    mov eax, [screen_w]                      ; screen pixels per cell pixel,
+    shl rax, 16                              ; 16.16
+    xor edx, edx
+    mov ecx, [ov_cw]
+    test ecx, ecx
+    jz .ob_done
+    div rcx
+    mov [rsp + 16], eax
+    mov eax, [screen_h]
+    shl rax, 16
+    xor edx, edx
+    mov ecx, [ov_ch]
+    test ecx, ecx
+    jz .ob_done
+    div rcx
+    mov [rsp + 20], eax
+    ; The span in the cell, clipped to the cell.
+    mov esi, [rsp + 0]
+    mov edi, [rsp + 8]
+    mov edx, [ov_cw]
+    mov ecx, [screen_w]
+    call ov_span
+    mov [rsp + 24], eax                      ; first cell column
+    mov [rsp + 28], edx                      ; past the last
+    cmp eax, edx
+    jge .ob_done
+    mov esi, [rsp + 4]
+    mov edi, [rsp + 12]
+    mov edx, [ov_ch]
+    mov ecx, [screen_h]
+    call ov_span
+    mov [rsp + 32], eax
+    mov [rsp + 36], edx
+    cmp eax, edx
+    jge .ob_done
+    mov r12d, [rsp + 32]                     ; cell row
+.ob_row:
+    cmp r12d, [rsp + 36]
+    jge .ob_done
+    ; The two backing rows this cell row averages.
+    mov eax, r12d
+    mov ecx, [rsp + 20]
+    imul rax, rcx
+    shr ecx, 1
+    lea rdx, [rax + rcx]
+    shr rax, 16
+    shr rdx, 16
+    xor ecx, ecx
+    sub eax, [rsp + 4]
+    cmovs eax, ecx
+    cmp eax, [rsp + 12]
+    cmovg eax, [rsp + 12]
+    sub edx, [rsp + 4]
+    cmovs edx, ecx
+    cmp edx, [rsp + 12]
+    cmovg edx, [rsp + 12]
+    imul rax, [rsp + 40]
+    lea r8, [rbx + rax]
+    imul rdx, [rsp + 40]
+    lea r9, [rbx + rdx]
+    mov eax, [ov_cy]                         ; where the row lands
+    add eax, r12d
+    imul eax, [drm_dumb_pitch]
+    mov rdi, [drm_dumb_addr]
+    add rdi, rax
+    mov eax, [ov_cx]
+    add eax, [rsp + 24]
+    lea rdi, [rdi + rax*4]
+    mov r14d, [rsp + 24]                     ; cell column
+    mov ebp, [rsp + 16]
+    mov eax, r14d
+    imul rax, rbp
+    mov r15, rax                             ; its screen x, 16.16
+    mov esi, ebp
+    shr esi, 1
+    mov r10d, [rsp + 0]
+    mov r11d, [rsp + 8]
+.ob_px:
+    xor ecx, ecx
+    mov rax, r15
+    shr rax, 16
+    sub eax, r10d
+    cmovs eax, ecx
+    cmp eax, r11d
+    cmovg eax, r11d
+    lea rdx, [r15 + rsi]
+    shr rdx, 16
+    sub edx, r10d
+    cmovs edx, ecx
+    cmp edx, r11d
+    cmovg edx, r11d
+    movd xmm0, [r8 + rax*4]
+    movd xmm1, [r8 + rdx*4]
+    pavgb xmm0, xmm1
+    movd xmm2, [r9 + rax*4]
+    movd xmm3, [r9 + rdx*4]
+    pavgb xmm2, xmm3
+    pavgb xmm0, xmm2
+    movd [rdi], xmm0
+    add rdi, 4
+    add r15, rbp
+    inc r14d
+    cmp r14d, [rsp + 28]
+    jl .ob_px
+    inc r12d
+    jmp .ob_row
+.ob_done:
+    add rsp, 56
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+; ov_span — the cells a window covers along one axis. esi = window origin
+; on screen, edi = its last pixel (size - 1), edx = cell size, ecx = screen
+; size. eax = first cell pixel, edx = one past the last, both clipped to
+; the cell.
+ov_span:
+    push rbx
+    movsxd r9, edx
+    movsxd r8, ecx
+    movsxd rax, esi
+    imul rax, r9
+    cqo
+    idiv r8
+    mov ebx, eax
+    movsxd rax, esi
+    add rax, rdi
+    inc rax
+    imul rax, r9
+    cqo
+    idiv r8
+    xor edx, edx
+    test ebx, ebx
+    cmovs ebx, edx
+    cmp eax, r9d
+    cmovg eax, r9d
+    mov edx, eax
+    mov eax, ebx
+    pop rbx
+    ret
+
+ov_atom_desk:       db "_NET_WM_DESKTOP"
+ov_atom_desk_len    equ $ - ov_atom_desk
+ov_atom_cur:        db "_NET_CURRENT_DESKTOP"
+ov_atom_cur_len     equ $ - ov_atom_cur
+ov_font:                                     ; 5x7 digits, bit 4 = left column
+    db 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E  ; 0
+    db 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E  ; 1
+    db 0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F  ; 2
+    db 0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E  ; 3
+    db 0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02  ; 4
+    db 0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E  ; 5
+    db 0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E  ; 6
+    db 0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08  ; 7
+    db 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E  ; 8
+    db 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C  ; 9
+    align 16
 
 ; ----------------------------------------------------------------------------
 ; lens_toggle — Mod4+z. Show/hide the magnifier. Damages the old rect on
@@ -31144,7 +31929,8 @@ ds_hold:
 
 ; ds_covers — edi = window xid. eax = 1 when that window can own the panel:
 ; top-level, at 0,0, panel-sized, no border, opaque, nothing above it, and
-; nothing frame itself paints on top (rubber band, slot warning, lens).
+; nothing frame itself paints on top (rubber band, slot warning, lens,
+; workspace overview).
 ds_covers:
     xor eax, eax
     cmp byte [ds_off], 0
@@ -31162,6 +31948,8 @@ ds_covers:
     cmp byte [slots_full], 0
     jne .dco_ret
     cmp dword [lens_active], 0
+    jne .dco_ret
+    cmp byte [ov_on], 0
     jne .dco_ret
     push rdi
     call window_lookup

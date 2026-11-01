@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.50-blue)
+![Version](https://img.shields.io/badge/version-0.1.51-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -349,6 +349,15 @@ showing the area under it enlarged by the `magnify` factor (2..8). Toggle
 again to hide. It's drawn as a compositor overlay — moving it just damages
 the old and new rects, so the desktop under it restores for free with no
 backing store. Runs only while the lens is up; off costs one compare.
+
+**`Mod4+space`**: the workspace overview. Every workspace shows as a small
+live picture of its windows on the wallpaper, two rows of five, numbered 1
+to 10. The arrows move the orange ring, Enter or a click goes there, a digit
+goes straight to that workspace, and Esc or `Mod4+space` again closes it.
+frame asks the window manager for the switch the way a pager does
+(`_NET_CURRENT_DESKTOP`), so it works with tile or any EWMH window manager
+that sets `_NET_WM_DESKTOP` on its windows. A repaint costs about 8 ms at
+1920x1080, only while it is up; closed, it costs a byte compare per key.
 
 `cursor_color` / `cursor_transparency`: the arrow's interior fill and how
 see-through it is. The black outline is always kept for contrast. Colour

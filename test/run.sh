@@ -29,6 +29,7 @@ gcc -O1 -o "$T/image-shape" "$here/image-shape.c" -lXrender -lX11 || exit 1
 gcc -O1 -o "$T/core-text" "$here/core-text.c" -lX11 || exit 1
 gcc -O1 -o "$T/fill-poly" "$here/fill-poly.c" -lX11 || exit 1
 gcc -O1 -o "$T/beam-in" "$here/beam-in.c" -lX11 || exit 1
+gcc -O1 -o "$T/overview" "$here/overview.c" -lX11 || exit 1
 mkfifo "$T/pad"
 printf 'keymap = no\n' > "$T/home/.framerc"   # caps-lock types AltGr+e = euro sign
 
@@ -127,6 +128,14 @@ printf 'keymap = no\nbeam = 0\n' > "$T/home2/.framerc"
 kill -USR2 $F2PID; sleep 0.3
 is "after beam = 0 and SIGUSR2, a window shows whole at once" \
    "$(DISPLAY=:$D2 "$T/beam-in")" "at 0.3 s all, at 1.2 s all"
+
+# Mod4+space shows every workspace as a small picture: red and green on
+# workspace 1, the hidden blue one on 3, the rest empty. Two Right presses
+# move the orange ring to 3, and Enter asks the WM for it (0-based: 2).
+echo "== v0.1.51: Mod4+space shows the workspaces, and Enter picks one"
+is "the cells, their rings, a hidden workspace and the request to the WM" \
+   "$("$T/overview" "$T/pad")" \
+   "open: 0b0b10 ff0000 00ff00 1a1d24 0000ff ff9900 3a3f4a, right 2: 0b0b10 ff9900, enter: ff0000 00ff00, asked for 2"
 
 echo
 if [ $fails -eq 0 ]; then echo "frame tests: all good"; else echo "frame tests: $fails failed"; fi
