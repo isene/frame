@@ -16,3 +16,4 @@ pkgroot/
 !/test/fill-poly.c
 !/test/overview.c
 !/test/held-key.c
+!/test/id-reuse.c

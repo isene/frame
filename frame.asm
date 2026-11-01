@@ -675,6 +675,13 @@ pls_err:            resd 1
 win_stk_next:       resd 1               ; monotonic z-order; ++ on each map/raise
 rs_last_stk:        resd 1               ; recomposite: stk of last window drawn
 rs_counter:         resd 1               ; DIAG: recomposite invocation count
+; Lookups by id scan 512 window and 1024 pixmap slots. Each draw into a
+; pixmap first misses every window, so the last hit of each table and
+; the last id that was no window are kept. A hit is checked against the
+; slot's id before use; window_alloc clears the miss.
+wl_last:            resq 1               ; window record found last
+wl_miss_xid:        resd 1               ; an id no window had, or 0
+pxl_last:           resq 1               ; pixmap record found last
 rs_min_stk:         resd 1               ; recomposite: min stk found this pass
 
 ; ---- Phase 4g graphics-context table --------------------------------------
@@ -11390,10 +11397,18 @@ window_lookup:
     push rbx
     test edi, edi                            ; xid 0 = None — never a window, and
     jz .wl_miss                              ; would falsely match an empty slot
+    mov rax, [wl_last]                       ; the window found last time, if
+    test rax, rax                            ; it still has this id
+    jz .wl_scan
+    cmp [rax], edi
+    je .wl_ret
+.wl_scan:
+    cmp edi, [wl_miss_xid]                   ; no window had this id last time
+    je .wl_miss                              ; (window_alloc clears it)
     xor ebx, ebx
 .wl_loop:
     cmp ebx, MAX_WINDOWS
-    jge .wl_miss
+    jge .wl_miss_note
     mov rax, rbx
     imul rax, WINDOW_REC_SIZE
     lea rax, [windows + rax]
@@ -11402,8 +11417,12 @@ window_lookup:
     inc ebx
     jmp .wl_loop
 .wl_hit:
+    mov [wl_last], rax
+.wl_ret:
     pop rbx
     ret
+.wl_miss_note:
+    mov [wl_miss_xid], edi
 .wl_miss:
     xor eax, eax
     pop rbx
@@ -11428,6 +11447,7 @@ window_alloc:
     jmp .wa_loop
 .wa_take:
     mov [rax], edi
+    mov dword [wl_miss_xid], 0               ; this id may have missed before
     pop rbx
     ret
 .wa_full:
@@ -24355,6 +24375,14 @@ init_pixmaps:
 ; ----------------------------------------------------------------------------
 pixmap_lookup:
     push rbx
+    test edi, edi                            ; 0 finds an empty slot: scan
+    jz .pxl_scan
+    mov rax, [pxl_last]                      ; the pixmap found last time, if
+    test rax, rax                            ; it still has this id
+    jz .pxl_scan
+    cmp [rax], edi
+    je .pxl_ret
+.pxl_scan:
     xor ebx, ebx
 .pxl_loop:
     cmp ebx, MAX_PIXMAPS
@@ -24367,6 +24395,8 @@ pixmap_lookup:
     inc ebx
     jmp .pxl_loop
 .pxl_hit:
+    mov [pxl_last], rax
+.pxl_ret:
     pop rbx
     ret
 .pxl_miss:
