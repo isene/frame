@@ -49,6 +49,12 @@ is() {                                  # is NAME GOT WANT
     else echo "  FAIL  $1: got '$2', want '$3'"; fails=$((fails + 1)); fi
 }
 
+# frame --version said 0.1.52 through three releases; the README is the
+# version each release bumps.
+echo "== v0.1.55: frame --version is the README's version"
+badge=$(< "$here/../README.md"); badge=${badge#*version-}; badge=${badge%%-blue*}
+is "frame --version names the release" "$("$FRAME" --version 2>&1)" "frame $badge"
+
 # The third field is the buttons held just before the event: 0x100 is the
 # left button, 0x400 the right. A release always has its own button there.
 # GTK4 keeps the mouse pinned to the clicked widget until it reads that.
