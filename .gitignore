@@ -17,3 +17,4 @@ pkgroot/
 !/test/overview.c
 !/test/held-key.c
 !/test/id-reuse.c
+!/test/regrab.c

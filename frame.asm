@@ -6589,6 +6589,7 @@ dispatch_request:
     jmp .dr_done
 
 .dr_ungrab_key:
+    mov edi, ebx
     mov rsi, r12
     call handle_ungrab_key
     jmp .dr_done
@@ -14668,17 +14669,22 @@ handle_grab_key:
     ret
 
 ; ============================================================================
-; handle_ungrab_key — rsi = req ptr. Clears matching grab(s). No reply.
+; handle_ungrab_key — edi = slot, rsi = req ptr. Clears this client's
+; matching grab(s). No reply. Key 0 is AnyKey and modifiers 0x8000 are
+; AnyModifier: tile's reload sends both to drop every bind before it grabs
+; the new ones. frame matched them as a real key and mask, so it dropped
+; none; the old binds kept their keys and the table filled.
 ; ============================================================================
 handle_ungrab_key:
     push rbx
     push r12
     push r13
+    push r14
+    mov r14d, edi                            ; client slot
     mov rbx, rsi
-    mov r12d, [rbx + 4]
-    movzx r13d, byte [rbx + 1]
-    movzx eax, word [rbx + 8]
-    mov esi, eax
+    mov r12d, [rbx + 4]                      ; grab window
+    movzx r13d, byte [rbx + 1]               ; key, 0 = AnyKey
+    movzx esi, word [rbx + 8]                ; modifiers, 0x8000 = AnyModifier
     xor ecx, ecx
 .uk_loop:
     cmp ecx, MAX_KEY_GRABS
@@ -14688,17 +14694,26 @@ handle_ungrab_key:
     lea rdx, [key_grabs + rdx]
     cmp dword [rdx], r12d
     jne .uk_next
+    cmp [rdx + 4], r14d
+    jne .uk_next
+    test r13d, r13d
+    jz .uk_key_ok
     movzx eax, byte [rdx + 8]
     cmp eax, r13d
     jne .uk_next
+.uk_key_ok:
+    cmp esi, 0x8000
+    je .uk_clear
     movzx eax, word [rdx + 10]
     cmp eax, esi
     jne .uk_next
+.uk_clear:
     mov dword [rdx], 0
 .uk_next:
     inc ecx
     jmp .uk_loop
 .uk_done:
+    pop r14
     pop r13
     pop r12
     pop rbx

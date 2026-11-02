@@ -32,6 +32,7 @@ gcc -O1 -o "$T/beam-in" "$here/beam-in.c" -lX11 || exit 1
 gcc -O1 -o "$T/overview" "$here/overview.c" -lX11 || exit 1
 gcc -O1 -o "$T/held-key" "$here/held-key.c" -lX11 || exit 1
 gcc -O1 -o "$T/id-reuse" "$here/id-reuse.c" -lX11 || exit 1
+gcc -O1 -o "$T/regrab" "$here/regrab.c" -lX11 || exit 1
 mkfifo "$T/pad"
 printf 'keymap = no\n' > "$T/home/.framerc"   # caps-lock types AltGr+e = euro sign
 
@@ -153,6 +154,13 @@ is "the WM reads one press and the focused window none" "$("$T/held-key" "$T/pad
 
 echo "== v0.1.54: an id freed by a pixmap and given to a window finds the window"
 is "the window takes the id and shows its red fill" "$("$T/id-reuse")" "same id yes, ff0000"
+
+# tile's reload drops every bind with UngrabKey(AnyKey, AnyModifier).
+# frame read those as a real key and mask, so the old binds stayed and
+# a bind added to ~/.tilerc worked only after a restart.
+echo "== v0.1.55: a WM's ungrab of every key frees them all"
+is "the dropped key reaches the window, the kept ones their owners" \
+   "$("$T/regrab" "$T/pad")" "g: wm 0 window 1, h: wm 1, j: other 1"
 
 echo
 if [ $fails -eq 0 ]; then echo "frame tests: all good"; else echo "frame tests: $fails failed"; fi
