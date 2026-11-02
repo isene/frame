@@ -33,6 +33,7 @@ gcc -O1 -o "$T/overview" "$here/overview.c" -lX11 || exit 1
 gcc -O1 -o "$T/held-key" "$here/held-key.c" -lX11 || exit 1
 gcc -O1 -o "$T/id-reuse" "$here/id-reuse.c" -lX11 || exit 1
 gcc -O1 -o "$T/regrab" "$here/regrab.c" -lX11 || exit 1
+gcc -O1 -o "$T/fill-over" "$here/fill-over.c" -lXrender -lX11 || exit 1
 mkfifo "$T/pad"
 printf 'keymap = no\n' > "$T/home/.framerc"   # caps-lock types AltGr+e = euro sign
 
@@ -167,6 +168,11 @@ is "the window takes the id and shows its red fill" "$("$T/id-reuse")" "same id 
 echo "== v0.1.55: a WM's ungrab of every key frees them all"
 is "the dropped key reaches the window, the kept ones their owners" \
    "$("$T/regrab" "$T/pad")" "g: wm 0 window 1, h: wm 1, j: other 1"
+
+# glass dims an idle window with a half-black RENDER fill, op Over. frame
+# copied every fill as if the op were Src, so the window went black.
+echo "== v0.1.56: a see-through RENDER fill is laid Over, not copied"
+is "half-black halves the colour, an invisible one leaves it" "$("$T/fill-over")" "633100 c86400"
 
 echo
 if [ $fails -eq 0 ]; then echo "frame tests: all good"; else echo "frame tests: $fails failed"; fi

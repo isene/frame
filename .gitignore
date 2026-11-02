@@ -14,6 +14,7 @@ pkgroot/
 !/test/image-shape.c
 !/test/core-text.c
 !/test/fill-poly.c
+!/test/fill-over.c
 !/test/overview.c
 !/test/held-key.c
 !/test/id-reuse.c

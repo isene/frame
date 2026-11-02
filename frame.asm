@@ -733,7 +733,8 @@ gc_clips:           resb MAX_GCS * CLIP_ENTRY_SIZE
 cur_clip:           resq 1               ; active clip entry for the op in
                                          ; flight (0 = unclipped); set by each
                                          ; consumer right before drawing
-txt_buf:            resq 1               ; text requests: backing drawn on,
+fill_over:          resb 1               ; 1 = fb_fill blends its colour Over
+txt_buf:           resq 1               ; text requests: backing drawn on,
 txt_stride:         resd 1               ; its width and height, the GC's
 txt_h:              resd 1               ; colours, and 1 for 16-bit chars
 txt_fg:             resd 1
@@ -2125,7 +2126,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.55", 10
+version_str:        db "frame 0.1.56", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -23176,6 +23177,8 @@ fb_fill:
     ; Draw. r14 = x, r15 = current y, r10 = rows remaining.
     mov r14d, eax                            ; x
     mov r15d, r8d                            ; y
+    cmp byte [fill_over], 0
+    jne .fbf_over
 .fbf_row:
     test r10d, r10d
     jz .fbf_ret
@@ -23189,6 +23192,49 @@ fb_fill:
     inc r15d
     dec r10d
     jmp .fbf_row
+.fbf_over:
+    ; A see-through colour, premultiplied as RENDER sends it, laid Over:
+    ; each channel becomes src + dst*(255-a)/255. glass's dim is a half-
+    ; black fill, which this halves; the copy above made it solid black.
+    ; /255 is (v*257+257)>>16, as in render_composite.
+    mov r11d, ebp
+    shr r11d, 24
+    xor r11d, 255                            ; 255 - a
+    movd xmm1, ebp
+.fbf_over_row:
+    test r10d, r10d
+    jz .fbf_ret
+    mov eax, r15d
+    imul eax, r12d
+    add eax, r14d
+    lea rdi, [rbx + rax*4]
+    mov r13d, r9d                            ; pixels in the row
+.fbf_over_px:
+    mov edx, [rdi]
+    xor esi, esi
+    xor ecx, ecx                             ; shift: 0, 8, 16, 24
+.fbf_over_ch:
+    mov eax, edx
+    shr eax, cl
+    and eax, 0xFF
+    imul eax, r11d
+    imul eax, 257
+    add eax, 257
+    shr eax, 16
+    shl eax, cl
+    or esi, eax
+    add ecx, 8
+    cmp ecx, 32
+    jb .fbf_over_ch
+    movd xmm0, esi
+    paddusb xmm0, xmm1                       ; + src, no carry between channels
+    movd [rdi], xmm0
+    add rdi, 4
+    dec r13d
+    jnz .fbf_over_px
+    inc r15d
+    dec r10d
+    jmp .fbf_over_row
 .fbf_ret:
     pop rbp
     pop r15
@@ -27890,7 +27936,7 @@ render_change_picture:
 ;   +4 op   +8 dst(PICTURE)   +12 RENDERCOLOR(red,green,blue,alpha u16 each)
 ;   +20 rects (x s16, y s16, w u16, h u16)
 ; Fills each rect into the dst Picture's drawable backing with the colour.
-; PictOp is treated as Src (overwrite) for now. No reply.
+; Over blends a see-through colour; every other op overwrites. No reply.
 ;
 ;   rbx = req ptr   r12 = backing ptr   r13d = stride   r14d = bufh
 ;   r15d = ARGB pixel   rbp = rect cursor   [rsp]=remaining rects
@@ -27937,6 +27983,16 @@ render_fill_rectangles:
     shl eax, 24
     or r15d, eax
 
+    ; Over with a see-through colour blends (glass's dim), and with an
+    ; invisible one draws nothing. Other ops and opaque colours copy.
+    cmp byte [rbx + 4], 3                     ; PictOpOver
+    jne .rfr_count
+    cmp r15d, 0xFF000000
+    jae .rfr_count
+    cmp r15d, 0x01000000
+    jb .rfr_done                              ; alpha 0
+    mov byte [fill_over], 1
+.rfr_count:
     ; rect count = (length*4 - 20) / 8
     movzx eax, word [rbx + 2]                 ; request length (4-byte units)
     shl eax, 2                                 ; bytes
@@ -27977,6 +28033,7 @@ render_fill_rectangles:
     call damage_rect_list
 .rfr_done:
     mov qword [cur_clip], 0
+    mov byte [fill_over], 0
     add rsp, 16
     pop rbp
     pop r15
