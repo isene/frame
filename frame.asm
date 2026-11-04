@@ -2126,7 +2126,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.57", 10
+version_str:        db "frame 0.1.58", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -18981,6 +18981,8 @@ compositor_reconfigure:
     mov [cursor_y], eax
 .crc_yok:
     call cursor_move_hw
+    call load_wallpaper                      ; size changed: the old image no
+                                             ; longer fits; reload or go solid
     mov byte [flip_pending], 0
     mov dword [dmg_count0], -1               ; full repaint, both buffers
     mov dword [dmg_count1], -1
@@ -20813,7 +20815,8 @@ draw_rect:
 ; file (screen_w*screen_h*4 bytes) into wallpaper_buf and point wallpaper_ptr
 ; at it. Any failure (no path, can't open, wrong size, too big) leaves
 ; wallpaper_ptr = 0 → the compositor falls back to the solid COMP_BG_COLOR.
-; Called once at startup, after init_compositor has set screen_w/screen_h.
+; Called at startup, on SIGUSR2 and after a monitor change sets a new
+; screen_w/screen_h.
 ; ----------------------------------------------------------------------------
 load_wallpaper:
     mov qword [wallpaper_ptr], 0
