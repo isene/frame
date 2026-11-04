@@ -34,6 +34,7 @@ gcc -O1 -o "$T/held-key" "$here/held-key.c" -lX11 || exit 1
 gcc -O1 -o "$T/id-reuse" "$here/id-reuse.c" -lX11 || exit 1
 gcc -O1 -o "$T/regrab" "$here/regrab.c" -lX11 || exit 1
 gcc -O1 -o "$T/fill-over" "$here/fill-over.c" -lXrender -lX11 || exit 1
+gcc -O1 -o "$T/print-grab" "$here/print-grab.c" -lX11 || exit 1
 mkfifo "$T/pad"
 printf 'keymap = no\n' > "$T/home/.framerc"   # caps-lock types AltGr+e = euro sign
 
@@ -173,6 +174,12 @@ is "the dropped key reaches the window, the kept ones their owners" \
 # copied every fill as if the op were Src, so the window went black.
 echo "== v0.1.56: a see-through RENDER fill is laid Over, not copied"
 is "half-black halves the colour, an invisible one leaves it" "$("$T/fill-over")" "633100 c86400"
+
+# An open GTK menu holds the whole keyboard, and frame sent it every key,
+# Print too. tile's PrtSc bind never ran, so no screenshot showed a menu.
+echo "== v0.1.57: Print reaches the WM while a popup holds the keyboard"
+is "Print goes to the WM's bind, other keys to the popup" \
+   "$("$T/print-grab" "$T/pad")" "print: wm 1 popup 0, a: wm 0 popup 1"
 
 echo
 if [ $fails -eq 0 ]; then echo "frame tests: all good"; else echo "frame tests: $fails failed"; fi

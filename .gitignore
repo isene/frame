@@ -15,6 +15,7 @@ pkgroot/
 !/test/core-text.c
 !/test/fill-poly.c
 !/test/fill-over.c
+!/test/print-grab.c
 !/test/overview.c
 !/test/held-key.c
 !/test/id-reuse.c

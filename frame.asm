@@ -2126,7 +2126,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.56", 10
+version_str:        db "frame 0.1.57", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -15315,7 +15315,16 @@ dispatch_input_event:
     ; grabs (X semantics) — while rofi holds the keyboard, Mod4 combos go
     ; to rofi, not tile. deliver_to_focus routes to the grab holder.
     cmp dword [active_kbd_slot], 0
-    jge .die_focus_press
+    jl .die_passive
+    ; Print alone breaks that rule, so tile's PrtSc bind runs and the
+    ; screenshot shows the open menu. Found by meaning, so a remap counts.
+    lea ecx, [r12d - X_MIN_KEYCODE]
+    cmp ecx, KEYCODE_RANGE
+    jae .die_focus_press
+    imul ecx, ecx, 24
+    cmp dword [keysym_table + rcx], 0xff61   ; XK_Print
+    jne .die_focus_press
+.die_passive:
     ; ...else a matching passive key-grab wins (WM hotkeys); else focus.
     mov edi, r12d
     movzx esi, byte [mod_state]
