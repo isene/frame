@@ -35,6 +35,7 @@ gcc -O1 -o "$T/id-reuse" "$here/id-reuse.c" -lX11 || exit 1
 gcc -O1 -o "$T/regrab" "$here/regrab.c" -lX11 || exit 1
 gcc -O1 -o "$T/fill-over" "$here/fill-over.c" -lXrender -lX11 || exit 1
 gcc -O1 -o "$T/print-grab" "$here/print-grab.c" -lX11 || exit 1
+gcc -O1 -o "$T/dri3-copy" "$here/dri3-copy.c" -lxcb -l:libxcb-dri3.so.0 || exit 1
 mkfifo "$T/pad"
 printf 'keymap = no\n' > "$T/home/.framerc"   # caps-lock types AltGr+e = euro sign
 
@@ -180,6 +181,13 @@ is "half-black halves the colour, an invisible one leaves it" "$("$T/fill-over")
 echo "== v0.1.57: Print reaches the WM while a popup holds the keyboard"
 is "Print goes to the WM's bind, other keys to the popup" \
    "$("$T/print-grab" "$T/pad")" "print: wm 1 popup 0, a: wm 0 popup 1"
+
+# Mesa copies a GL window into a buffer it handed frame through DRI3 (a
+# front buffer). frame had mapped that buffer read-only, so the copy crashed
+# frame and the whole session (Blender, 2026-11-06). Kept last: a crash here
+# would fail every check after it.
+echo "== v0.1.59: a copy into a GL client's buffer lands there"
+is "CopyArea into a DRI3 pixmap fills the client's buffer" "$("$T/dri3-copy")" "copy: ff8000"
 
 echo
 if [ $fails -eq 0 ]; then echo "frame tests: all good"; else echo "frame tests: $fails failed"; fi

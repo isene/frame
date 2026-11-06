@@ -2126,7 +2126,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.58", 10
+version_str:        db "frame 0.1.59", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -31299,16 +31299,28 @@ dma_pixmap_create:
     add eax, [dp_args + 16]                  ; offset + stride*h must fit
     cmp rax, r12
     ja .dpc_fail
+    ; Read-write: Mesa asks frame to CopyArea a window INTO a buffer it
+    ; shared (a GL front buffer). A read-only map made that copy crash frame
+    ; and the whole session (Blender, 2026-11-06). An fd the client shared
+    ; read-only still maps read-only, as before.
+    mov edx, PROT_RW
+.dpc_map:
     mov eax, SYS_MMAP
     xor edi, edi
     mov rsi, r12
-    mov edx, PROT_READ
     mov r10d, MAP_SHARED
     mov r8d, [dp_args + 20]
     xor r9d, r9d
     syscall
     cmp rax, -4096
-    ja .dpc_fail
+    jbe .dpc_mapped
+    cmp edx, PROT_READ                       ; read-only failed too
+    je .dpc_fail
+    cmp rax, -13                             ; EACCES: a read-only fd
+    jne .dpc_fail
+    mov edx, PROT_READ
+    jmp .dpc_map
+.dpc_mapped:
     mov r13, rax
     xor ecx, ecx
 .dpc_find:
