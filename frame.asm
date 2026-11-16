@@ -2126,7 +2126,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.59", 10
+version_str:        db "frame 0.1.60", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -21073,8 +21073,8 @@ bg_fill_rect:
     mov r13d, edi
     mov r14d, ecx
     mov r15, [drm_dumb_addr]
-    mov ebp, [panel_w]
-    shl ebp, 2                                ; wallpaper stride = panel_w*4
+    mov ebp, [screen_w]
+    shl ebp, 2                                ; wallpaper stride = screen_w*4
 .bfr_row:
     test r14d, r14d
     jz .bfr_done
@@ -21086,14 +21086,13 @@ bg_fill_rect:
     mov eax, ebx
     shl eax, 2
     add rdi, rax
-    ; The wallpaper is PANEL-sized (the wp-set / .framebg contract), not
-    ; screen-sized: on a dual-head wide fb, sampling it with screen_w
-    ; stride read every row at double pitch and far past the buffer —
-    ; the "dragon got messed up" garble. Rows beyond panel_h and columns
-    ; beyond panel_w (the external monitor's area) get the solid bg.
-    cmp r12d, [panel_h]
+    ; The wallpaper is SCREEN-sized, as load_wallpaper demands: with a
+    ; second monitor it spans both, side by side (astro --wall draws it
+    ; so). It was sampled with panel_w stride, which drew a two-screen
+    ; picture as stripes on the panel and left the monitor plain.
+    cmp r12d, [screen_h]
     jge .bfr_solid_row
-    mov ecx, [panel_w]
+    mov ecx, [screen_w]
     sub ecx, ebx                              ; image pixels left of panel edge
     jle .bfr_solid_row                        ; rect starts right of the image
     cmp ecx, r13d

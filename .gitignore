@@ -13,6 +13,7 @@ pkgroot/
 !/test/caps-lock.c
 !/test/image-shape.c
 !/test/core-text.c
+!/test/wall-two-screens.sh
 !/test/fill-poly.c
 !/test/fill-over.c
 !/test/print-grab.c
