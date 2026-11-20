@@ -1160,6 +1160,7 @@ dmg_lat:            resd 4               ; per-handler damage rect latch
 cg_dmg:             resd 4               ; glyph-run damage bbox (x1,y1,x2,y2)
 flip_pending:       resb 1               ; PAGE_FLIP in flight; don't composite
 cursor_move_held:   resb 1               ; pointer move waits for the flip to land
+cursor_sync_held:   resb 1               ; shape change waits for the flip to land
 motion_pending:     resb 1               ; pointer moved in this evdev report
                                          ; until its completion event arrives
 drm_poll_dead:      resb 1               ; drm fd hit POLLERR/POLLHUP: stop
@@ -2128,7 +2129,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.62", 10
+version_str:        db "frame 0.1.63", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -19612,6 +19613,11 @@ cursor_sync:
 .csy_apply:
     cmp eax, [cur_shape]
     je .csy_out
+    cmp byte [flip_pending], 0               ; a new shape while a flip is in
+    je .csy_draw                             ; flight waits for the flip too,
+    mov byte [cursor_sync_held], 1           ; like a move (cursor_move_hw);
+    jmp .csy_out                             ; cursor_release redoes this sync
+.csy_draw:
     mov [cur_shape], eax
     mov edi, eax
     call draw_cursor_shape
@@ -19724,6 +19730,7 @@ cursor_move_hw:
     mov byte [cursor_move_held], 1
     ret
 .cmh_go:
+    mov byte [cursor_move_held], 0           ; this move carries the latest spot
     mov dword [drm_cursor + 0], DRM_MODE_CURSOR_MOVE
     mov [drm_cursor + 4], ecx                ; crtc_id
     sub edx, [cur_hot_x]                     ; hotspot (I-beam/cross centre)
@@ -19739,14 +19746,20 @@ cursor_move_hw:
 .cmh_done:
     ret
 
-; cursor_release — send the pointer move cursor_move_hw held back, once no
-; flip is in flight. Two compares when nothing is held.
+; cursor_release — once no flip is in flight, send the shape change
+; cursor_sync held back, then the pointer move cursor_move_hw held back
+; (a shape change moves the pointer too, which clears the held move).
+; Three compares when nothing is held.
 cursor_release:
-    cmp byte [cursor_move_held], 0
-    je .crl_done
     cmp byte [flip_pending], 0
     jne .crl_done
-    mov byte [cursor_move_held], 0
+    cmp byte [cursor_sync_held], 0
+    je .crl_move
+    mov byte [cursor_sync_held], 0
+    call cursor_sync
+.crl_move:
+    cmp byte [cursor_move_held], 0
+    je .crl_done
     call cursor_move_hw
 .crl_done:
     ret
