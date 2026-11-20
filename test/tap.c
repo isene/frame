@@ -3,6 +3,7 @@
      tap1   one finger down and up in 60 ms
      tap2   the same with two fingers
      quick  touch, press the pad's button, let go, lift, all in 130 ms
+     move   ten mouse reports that each move x and y; prints the motions
    FIFO is the pipe frame reads through --testinput. */
 #include <X11/Xlib.h>
 #include <fcntl.h>
@@ -28,8 +29,10 @@ int main(int argc, char **argv) {
     pad = open(argv[1], O_WRONLY);
     if (!d || pad < 0) return 2;
 
+    int move = !strcmp(kind, "move"), motions = 0;
     XSetWindowAttributes a = { .override_redirect = True,
-                               .event_mask = ButtonPressMask | ButtonReleaseMask };
+                               .event_mask = ButtonPressMask | ButtonReleaseMask |
+                                             (move ? PointerMotionMask : 0) };
     Window w = XCreateWindow(d, DefaultRootWindow(d), 0, 0, 400, 300, 0, CopyFromParent,
                              InputOutput, CopyFromParent, CWOverrideRedirect | CWEventMask, &a);
     XMapWindow(d, w);
@@ -37,6 +40,17 @@ int main(int argc, char **argv) {
     XSync(d, False);
     usleep(200000);
 
+    if (move) {
+        XEvent e;
+        while (XPending(d)) XNextEvent(d, &e);  /* the warp's own motion */
+        for (int i = 0; i < 10; i++) {
+            ev(EV_REL, REL_X, 3);
+            ev(EV_REL, REL_Y, 2);
+            ev(EV_SYN, SYN_REPORT, 0);
+            usleep(10000);
+        }
+        goto listen;
+    }
     int two = !strcmp(kind, "tap2");
     ev(EV_KEY, BTN_TOUCH, 1);
     if (two) ev(EV_KEY, BTN_TOOL_DOUBLETAP, 1);
@@ -51,11 +65,13 @@ int main(int argc, char **argv) {
     ev(EV_KEY, BTN_TOUCH, 0);
     ev(EV_SYN, SYN_REPORT, 0);
 
+listen:;
     const char *sep = "";
     for (;;) {                                  /* print until 500 ms pass with no event */
         while (XPending(d)) {
             XEvent e;
             XNextEvent(d, &e);
+            if (e.type == MotionNotify) motions++;
             if (e.type != ButtonPress && e.type != ButtonRelease) continue;
             printf("%s%s %u 0x%03x", sep, e.type == ButtonPress ? "press" : "release",
                    e.xbutton.button, e.xbutton.state);
@@ -67,6 +83,7 @@ int main(int argc, char **argv) {
         struct timeval wait = { 0, 500000 };
         if (select(ConnectionNumber(d) + 1, &r, NULL, NULL, &wait) <= 0) break;
     }
+    if (move) printf("%d motions", motions);
     printf("\n");
     return 0;
 }

@@ -69,6 +69,10 @@ is "a two-finger tap lets go with the right button held" \
 is "a quick press of the pad's button is one click, with no tap after it" \
    "$("$T/tap" "$T/pad" quick)" "press 1 0x000, release 1 0x100"
 
+echo "== v0.1.61: one pointer move per input report"
+is "a report that moves x and y is one motion event, not two" \
+   "$("$T/tap" "$T/pad" move)" "10 motions"
+
 # tile hides the old workspace before it moves the keyboard. The hidden
 # window was never told, so glass kept a held arrow key down and a game
 # went on turning after the switch back.

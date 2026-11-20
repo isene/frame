@@ -1159,6 +1159,8 @@ cfgw_resized:       resb 1               ; configure changed w/h this call
 dmg_lat:            resd 4               ; per-handler damage rect latch
 cg_dmg:             resd 4               ; glyph-run damage bbox (x1,y1,x2,y2)
 flip_pending:       resb 1               ; PAGE_FLIP in flight; don't composite
+cursor_move_held:   resb 1               ; pointer move waits for the flip to land
+motion_pending:     resb 1               ; pointer moved in this evdev report
                                          ; until its completion event arrives
 drm_poll_dead:      resb 1               ; drm fd hit POLLERR/POLLHUP: stop
                                          ; polling it, flips fire-and-forget
@@ -5563,6 +5565,7 @@ serve_loop:
     je .sl_poll_done                         ; unstick + re-poll. Else this was the
     mov byte [flip_pending], 0               ; 16ms bg-defer fallback → fall to the
     call ds_landed                           ; composite check and paint it.
+    call cursor_release
     jmp .sl_iter
 .sl_poll_done:
 
@@ -5759,6 +5762,8 @@ serve_loop:
     cmp rcx, rax
     jl .sl_drm_ev
 .sl_composite:
+    call cursor_release                      ; a flip landed: the held move goes
+                                             ; out before the next flip starts
     ; Coalesced, flip-paced repaint: at most ONE damage repaint + async
     ; page-flip per poll cycle, and none while a flip is still in flight
     ; (its completion event re-runs this check). Drawing handlers set
@@ -15098,6 +15103,7 @@ dispatch_input_event:
     jnz .die_not_syn                         ; a report, the scroll is decided
     cmp word [rbx + 18], 0
     jne .die_done
+    call motion_flush                        ; the report's motion, once
     call scroll_report
     jmp .die_done
 .die_not_syn:
@@ -15409,19 +15415,8 @@ dispatch_input_event:
     cmovg eax, ecx
     mov [cursor_y], eax
 .die_motion:
-    call cursor_move_hw                      ; move the sprite (one cheap ioctl)
-    ; Real motion un-hides a typing-blanked cursor (cursor_sync substitutes
-    ; the last visible shape once blank_moved is set). One compare when the
-    ; cursor is visible — the common case.
-    cmp dword [cur_shape], CUR_BLANK
-    jne .die_motion_vis
-    mov byte [blank_moved], 1
-    call cursor_sync
-.die_motion_vis:
-    call shake_update                        ; wiggle-to-magnify (cheap; no-op off)
-    call lens_motion                         ; move the magnifier (no-op when off)
-    call deliver_pointer_motion
-    jmp .die_done
+    mov byte [motion_pending], 1             ; x and y of one report move the
+    jmp .die_done                            ; pointer once, at SYN_REPORT
 .die_wheel:
     test edx, edx
     jz .die_done
@@ -15429,6 +15424,7 @@ dispatch_input_event:
     jns .die_wheel_send
     mov r12d, 5                              ; wheel down → button 5
 .die_wheel_send:
+    call motion_flush                        ; the wheel turns where the pointer is
     mov edi, 4                               ; ButtonPress
     mov esi, r12d
     call deliver_pointer_button
@@ -15647,6 +15643,7 @@ dispatch_input_event:
 
     ; --- Mouse / touchpad buttons (EV_KEY, code >= 0x100) -----------------
 .die_button:
+    call motion_flush                        ; a press lands where the pointer is
     cmp r12d, 0x14a                          ; BTN_TOUCH (finger contact)
     je .die_btn_touch
     cmp r12d, 0x145                          ; BTN_TOOL_FINGER (1 finger)
@@ -19717,6 +19714,14 @@ cursor_move_hw:
     pop rcx
     mov [cursor_crtc], ecx
 .cmh_move:
+    ; A move while a page flip is in flight takes i915's slow path, which
+    ; waits for that flip: up to 8 ms with the whole loop stopped. Hold the
+    ; move; cursor_release sends it when the flip lands.
+    cmp byte [flip_pending], 0
+    je .cmh_go
+    mov byte [cursor_move_held], 1
+    ret
+.cmh_go:
     mov dword [drm_cursor + 0], DRM_MODE_CURSOR_MOVE
     mov [drm_cursor + 4], ecx                ; crtc_id
     sub edx, [cur_hot_x]                     ; hotspot (I-beam/cross centre)
@@ -19730,6 +19735,39 @@ cursor_move_hw:
     lea rdx, [drm_cursor]
     syscall
 .cmh_done:
+    ret
+
+; cursor_release — send the pointer move cursor_move_hw held back, once no
+; flip is in flight. Two compares when nothing is held.
+cursor_release:
+    cmp byte [cursor_move_held], 0
+    je .crl_done
+    cmp byte [flip_pending], 0
+    jne .crl_done
+    mov byte [cursor_move_held], 0
+    call cursor_move_hw
+.crl_done:
+    ret
+
+; motion_flush — the pointer moved during this evdev report: move the sprite
+; and tell the clients, once per report instead of once per axis.
+motion_flush:
+    cmp byte [motion_pending], 0
+    je .mf_done
+    mov byte [motion_pending], 0
+    call cursor_move_hw
+    ; Real motion un-hides a typing-blanked cursor (cursor_sync substitutes
+    ; the last visible shape once blank_moved is set). One compare when the
+    ; cursor is visible, the common case.
+    cmp dword [cur_shape], CUR_BLANK
+    jne .mf_vis
+    mov byte [blank_moved], 1
+    call cursor_sync
+.mf_vis:
+    call shake_update                        ; wiggle-to-magnify (cheap; no-op off)
+    call lens_motion                         ; move the magnifier (no-op when off)
+    call deliver_pointer_motion
+.mf_done:
     ret
 
 ; cursor_set_bo — edi = crtc id, esi = cursor BO handle (0 = hide).
