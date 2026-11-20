@@ -2128,7 +2128,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.61", 10
+version_str:        db "frame 0.1.62", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -5752,6 +5752,8 @@ serve_loop:
     push rax                                 ; a real vblank: GL frames due
     push rcx                                 ; now get copied and reported
     push rdx
+    call cursor_release                      ; the held pointer move first: the
+                                             ; GL copies below can take 8 ms
     call ds_landed
     call present_tick
     pop rdx
@@ -5762,8 +5764,8 @@ serve_loop:
     cmp rcx, rax
     jl .sl_drm_ev
 .sl_composite:
-    call cursor_release                      ; a flip landed: the held move goes
-                                             ; out before the next flip starts
+    call cursor_release                      ; flip_pending cleared elsewhere
+                                             ; (VT switch, unblank, new mode)
     ; Coalesced, flip-paced repaint: at most ONE damage repaint + async
     ; page-flip per poll cycle, and none while a flip is still in flight
     ; (its completion event re-runs this check). Drawing handlers set
