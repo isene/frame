@@ -120,6 +120,18 @@ DEFAULT REL
 %define DRM_FORMAT_XRGB8888            0x34325258   ; 'XR24'
 %define DRM_MODE_FB_MODIFIERS          2
 %define DS_REC                         24           ; direct-scanout record
+%define DRM_IOCTL_SET_CLIENT_CAP       0x4010640D   ; _IOW('d',0x0D,16)
+%define DRM_CLIENT_CAP_ATOMIC          3
+%define DRM_IOCTL_MODE_GETPLANERESOURCES 0xC01064B5 ; _IOWR('d',0xB5,16)
+%define DRM_IOCTL_MODE_GETPLANE        0xC02064B6   ; _IOWR('d',0xB6,32)
+%define DRM_IOCTL_MODE_OBJ_GETPROPERTIES 0xC02064B9 ; _IOWR('d',0xB9,32)
+%define DRM_IOCTL_MODE_GETPROPERTY     0xC04064AA   ; _IOWR('d',0xAA,64)
+%define DRM_IOCTL_MODE_ATOMIC          0xC03864BC   ; _IOWR('d',0xBC,56)
+%define DRM_MODE_OBJECT_PLANE          0xEEEEEEEE
+%define DRM_MODE_ATOMIC_NONBLOCK       0x200
+%define OVL_PROPS                      10           ; spare-layer properties set
+%define OVL_MAX_PLANES                 32
+%define OVL_MAX_PROPS                  64
 %define DRM_IOCTL_MODE_DIRTYFB         0xC01864B7
 %define DRM_IOCTL_MODE_PAGE_FLIP       0xC01864B0
 %define DRM_MODE_PAGE_FLIP_EVENT       0x01
@@ -1191,6 +1203,35 @@ ds_flips:           resq 1               ; direct flips since start (SIGUSR1)
 ds_next:            resb DS_REC          ; presented, not on the panel yet
 ds_front:           resb DS_REC          ; on the panel, or its flip in flight
 ds_old:             resb DS_REC          ; off the panel when that flip lands
+ds_ovl:             resb 1               ; ds_win is on the spare layer
+ds_mode_new:        resb 1               ; ds_hold: 0 whole panel, 1 spare layer
+; Spare layer (direct_scanout = 2): see ovl_fits.
+ovl_off:            resb 1               ; the kernel refused it: off until restart
+ovl_inited:         resb 1               ; planes looked up, for ovl_crtc
+ovl_on:             resb 1               ; the spare layer shows ds_front
+ovl_pending:        resb 1               ; a layer change goes with the next commit
+ovl_crtc:           resd 1               ; screen controller the planes are for
+ovl_plane:          resd 1               ; the spare layer (0 = none)
+ovl_primary:        resd 1               ; frame's own layer
+ovl_pfb_prop:       resd 1               ; its FB_ID property
+ovl_props:          resd OVL_PROPS       ; FB_ID CRTC_ID SRC_X/Y/W/H CRTC_X/Y/W/H
+ovl_found:          resd OVL_PROPS + 1   ; ovl_init: one plane's ids, then 'type'
+ovl_ptype:          resd 1               ; ovl_init: that plane's type
+ovl_geo:            resw 4               ; wanted x, y, w, h (ovl_fits)
+ovl_cgeo:           resw 4               ; shown x, y, w, h
+ovl_flips:          resq 1               ; spare-layer commits since start (SIGUSR1)
+ovl_objs:           resd 2               ; atomic commit: objects,
+ovl_cnts:           resd 2               ; properties per object,
+ovl_ids:            resd 1 + OVL_PROPS   ; property ids
+ovl_vals:           resq 1 + OVL_PROPS   ; and their values
+ovl_atomic:         resb 56              ; drm_mode_atomic
+ovl_res:            resq 2               ; cap / plane list request
+ovl_getplane:       resb 32              ; drm_mode_get_plane
+ovl_objprops:       resb 32              ; drm_mode_obj_get_properties
+ovl_getprop:        resb 64              ; drm_mode_get_property
+ovl_plane_ids:      resd OVL_MAX_PLANES
+ovl_prop_ids:       resd OVL_MAX_PROPS
+ovl_prop_vals:      resq OVL_MAX_PROPS
 
 ; ---- Phase 4f compositor state --------------------------------------------
 compositor_requested: resb 1               ; set by --display argv flag
@@ -1922,6 +1963,12 @@ dbg_in_y:           db " y=", 0
 dbg_in_focus:       db " focus=", 0
 log_ds_first:       db "frame: direct scanout, first flip rc=", 0
 log_ds_refused:     db "frame: direct scanout refused, off until restart, rc=", 0
+log_ovl_plane:      db "frame: spare layer plane=", 0
+log_ovl_refused:    db "frame: spare layer refused, off until restart, rc=", 0
+dbg_ovl:            db " ovl=", 0
+; Plane property names, NUL-padded to 8 bytes, in ovl_props order + 'type'.
+ovl_names:          dq 'FB_ID', 'CRTC_ID', 'SRC_X', 'SRC_Y', 'SRC_W', 'SRC_H'
+                    dq 'CRTC_X', 'CRTC_Y', 'CRTC_W', 'CRTC_H', 'type'
 dbg_pxblit:         db " blit=", 0
 dbg_pxfill:         db " fill=", 0
 dbg_pxflush:        db " flush=", 0
@@ -2129,7 +2176,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.63", 10
+version_str:        db "frame 0.1.64", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -10339,6 +10386,10 @@ handle_get_image:
     mov byte [comp_dirty], 0
     call recomposite_screen
 .gi_root_fresh:
+    cmp dword [ds_front], 0                  ; a client buffer on the panel:
+    je .gi_root_read                         ; its picture goes in first
+    call ds_paint_front
+.gi_root_read:
     mov eax, [comp_back]
     xor eax, 1
     mov r13, [comp_addr + rax*8]
@@ -13805,14 +13856,18 @@ parse_framerc:
     jmp .pf_next_line
 .pf_chk_direct:
     ; direct_scanout = 1: a GL window that fills the panel is shown from
-    ; its own buffers, no copy (default 0 while it is new)
+    ; its own buffers, no copy (default 0 while it is new); 2: a GL window
+    ; anywhere else goes on a spare layer of the panel the same way
     mov eax, [rsi]
     cmp eax, 'dire'
     jne .pf_chk_blank
     call pf_to_value
     call pf_parse_dec
-    test eax, eax
-    setnz byte [cfg_direct]
+    cmp eax, 2
+    jbe .pf_direct_ok
+    mov eax, 2
+.pf_direct_ok:
+    mov [cfg_direct], al
     jmp .pf_next_line
 .pf_chk_blank:
     ; blank_timeout = N (seconds of idle before the panel powers off;
@@ -20398,7 +20453,14 @@ recomposite_screen:
     je .rs_done
     cmp dword [ds_win], 0                     ; a GL window owns the panel?
     je .rs_composite
+    cmp byte [ds_ovl], 0                      ; or the spare layer?
+    jne .rs_ovl
     call ds_composite
+    test eax, eax
+    jnz .rs_done
+    jmp .rs_composite
+.rs_ovl:
+    call ovl_prepare
     test eax, eax
     jnz .rs_done
 .rs_composite:
@@ -20573,6 +20635,8 @@ recomposite_screen:
 
 .rs_present:
     mov dword [r15], 0                        ; this buffer is now clean
+    cmp byte [ovl_pending], 0                 ; the spare layer changes too:
+    jne .rs_atomic                            ; one commit for both
     cmp byte [fbtest_mode], 0
     jne .rs_fb_swap                           ; test mode: no DRM, just swap
 
@@ -20644,7 +20708,19 @@ recomposite_screen:
     mov eax, [comp_back]                     ; back to its client
     xor eax, 1                               ; swap: submitted buffer is the
     mov [comp_back], eax                     ; new front; render the other next
+    cmp byte [fbtest_mode], 0                ; --fbtest has no spare layer:
+    je .rs_done_pop                          ; its picture goes into the dump
+    cmp byte [ovl_on], 0
+    je .rs_done_pop
+    call ds_paint_front
     jmp .rs_done_pop
+.rs_atomic:
+    mov ebx, [comp_back]                     ; (the second output's flip reads rbx)
+    mov edi, [comp_fbid + rbx*4]
+    call ovl_flush
+    cmp byte [fbtest_mode], 0
+    jne .rs_fb_swap
+    jmp .rs_flip_logged
 .rs_no_swap:
     ; Flip rejected (VT switch / master contention): the buffer is painted
     ; but never presented, and its damage list is already cleared. Mark it
@@ -21586,6 +21662,7 @@ comp_blank:
     jne .cb_out                              ; blank_state would eat composites
     cmp byte [blank_state], 0
     jne .cb_out
+    call ovl_hide_now                        ; the spare layer goes dark first
     lea rdi, [blank_crtc_cmd]
     xor eax, eax
     mov ecx, 13
@@ -21820,6 +21897,7 @@ vt_release_display:
     je .vrd_done
     cmp byte [fbtest_mode], 0
     jne .vrd_done
+    call ovl_hide_now                        ; the spare layer goes dark first
     mov byte [blank_state], 0                ; console owns the panel now
     mov byte [flip_pending], 0
     cmp byte [ext_active], 0
@@ -21982,6 +22060,7 @@ compositor_shutdown:
     ;    framebuffer back on the panel (and off frame's soon-to-be-freed fb).
     ;    The external CRTC (which the console never used) is switched OFF
     ;    first so it doesn't keep scanning the about-to-be-freed fb.
+    call ovl_hide_now                        ; the spare layer goes dark first
     cmp byte [ext_active], 0
     je .cs_ext_off_done
     lea rdi, [blank_crtc_cmd]
@@ -30380,6 +30459,10 @@ dump_handler:
     call write_str_stderr
     mov rax, [ds_flips]
     call write_u64_stderr
+    lea rsi, [dbg_ovl]
+    call write_str_stderr
+    mov rax, [ovl_flips]
+    call write_u64_stderr
     lea rsi, [dbg_readback]
     call write_str_stderr
     mov rax, [comp_px_readback]
@@ -32053,26 +32136,43 @@ ds_hold:
     mov r15d, r8d
     test r9d, r9d                            ; drawn at 0,0 only
     jnz .dh_no
+    mov edi, r12d                            ; the whole panel (0) or the
+    call ds_covers                           ; spare layer (1)?
+    xor ecx, ecx
+    test eax, eax
+    jnz .dh_mode
+    mov edi, r12d
+    call ovl_fits
+    test eax, eax
+    jz .dh_no
+    mov ecx, 1
+.dh_mode:
+    mov [ds_mode_new], cl
     mov eax, [ds_win]
     test eax, eax
     jz .dh_win_ok
     cmp eax, r12d
     jne .dh_no                               ; another window is still leaving
+    cmp [ds_ovl], cl
+    jne .dh_no                               ; it changes layer: it leaves first
 .dh_win_ok:
-    mov edi, r12d
-    call ds_covers
-    test eax, eax
-    jz .dh_no
     mov edi, r14d
     call pixmap_lookup
     test rax, rax
     jz .dh_no
     mov rbp, rax
-    movzx eax, word [rbp + 4]                ; the buffer covers the panel
-    cmp eax, [screen_w]
+    mov ecx, [screen_w]                      ; the buffer covers its place
+    mov edx, [screen_h]
+    cmp byte [ds_mode_new], 0
+    je .dh_size
+    movzx ecx, word [ovl_geo + 4]
+    movzx edx, word [ovl_geo + 6]
+.dh_size:
+    movzx eax, word [rbp + 4]
+    cmp eax, ecx
     jb .dh_no
     movzx eax, word [rbp + 6]
-    cmp eax, [screen_h]
+    cmp eax, edx
     jb .dh_no
     mov al, [rbp + 8]
     cmp al, 24
@@ -32095,6 +32195,8 @@ ds_hold:
     mov [ds_next + 16], r15d
     mov [ds_next + 20], eax
     mov [ds_win], r12d
+    mov al, [ds_mode_new]
+    mov [ds_ovl], al
     mov byte [comp_dirty], 1
     mov edi, ebx
     mov esi, r12d
@@ -32122,30 +32224,42 @@ ds_hold:
     pop rbx
     ret
 
+; ds_panel_free — eax = 1 when a client buffer may go to the panel at all:
+; compositing, panel lit, frame owns it, one output, and nothing frame
+; itself paints on top (rubber band, slot warning, lens, workspace
+; overview). Clobbers eax only.
+ds_panel_free:
+    xor eax, eax
+    cmp byte [compositor_active], 0
+    je .dpf_ret
+    cmp byte [blank_state], 0
+    jne .dpf_ret
+    cmp byte [vt_away], 0
+    jne .dpf_ret
+    cmp byte [ext_active], 0                 ; one panel only
+    jne .dpf_ret
+    cmp byte [xb_on], 0
+    jne .dpf_ret
+    cmp byte [slots_full], 0
+    jne .dpf_ret
+    cmp dword [lens_active], 0
+    jne .dpf_ret
+    cmp byte [ov_on], 0
+    jne .dpf_ret
+    inc eax
+.dpf_ret:
+    ret
+
 ; ds_covers — edi = window xid. eax = 1 when that window can own the panel:
 ; top-level, at 0,0, panel-sized, no border, opaque, nothing above it, and
-; nothing frame itself paints on top (rubber band, slot warning, lens,
-; workspace overview).
+; ds_panel_free.
 ds_covers:
     xor eax, eax
     cmp byte [ds_off], 0
     jne .dco_ret
-    cmp byte [compositor_active], 0
-    je .dco_ret
-    cmp byte [blank_state], 0
-    jne .dco_ret
-    cmp byte [vt_away], 0
-    jne .dco_ret
-    cmp byte [ext_active], 0                 ; one panel only
-    jne .dco_ret
-    cmp byte [xb_on], 0
-    jne .dco_ret
-    cmp byte [slots_full], 0
-    jne .dco_ret
-    cmp dword [lens_active], 0
-    jne .dco_ret
-    cmp byte [ov_on], 0
-    jne .dco_ret
+    call ds_panel_free
+    test eax, eax
+    jz .dco_ret
     push rdi
     call window_lookup
     pop rdi
@@ -32249,13 +32363,13 @@ ds_fb:
     syscall
     test rax, rax
     jnz .dfb_fail
-    lea rdi, [ds_fbcmd]                      ; panel-sized, XRGB8888, linear
-    xor eax, eax
+    lea rdi, [ds_fbcmd]                      ; the buffer's size, XRGB8888,
+    xor eax, eax                             ; linear
     mov ecx, 13
     rep stosq
-    mov eax, [screen_w]
+    movzx eax, word [r12 + 4]
     mov [ds_fbcmd + 4], eax
-    mov eax, [screen_h]
+    movzx eax, word [r12 + 6]
     mov [ds_fbcmd + 8], eax
     mov dword [ds_fbcmd + 12], DRM_FORMAT_XRGB8888
     mov dword [ds_fbcmd + 16], DRM_MODE_FB_MODIFIERS
@@ -32478,6 +32592,7 @@ ds_landed:
 ; output change): the newest frame goes into its window, and every held
 ; buffer is released now.
 ds_drop:
+    call ovl_hide_now
     cmp dword [ds_win], 0
     je .dd_ret
     cmp byte [ds_leave_req], 0               ; its own buffer is newer already
@@ -32501,6 +32616,7 @@ ds_drop:
     lea rdi, [ds_old]
     call ds_release
     mov dword [ds_win], 0
+    mov byte [ds_ovl], 0
     mov byte [ds_leave_req], 0
 .dd_ret:
     ret
@@ -32631,6 +32747,668 @@ ds_rmfb:
     lea rdx, [ds_arg]
     syscall
 .drf_ret:
+    ret
+
+; ============================================================================
+; Spare layer (framerc direct_scanout = 2). The panel has spare layers
+; (DRM overlay planes) above frame's own picture. A GL window that sits
+; whole on the panel with nothing over it is shown on one of them, straight
+; from its Present buffers: frame copies, compares and flushes nothing for
+; it. The buffers move ds_next → ds_front → ds_old as for the whole panel.
+; One atomic commit changes the layer and, when frame drew too, flips
+; frame's buffer with it, so both change in the same frame.
+; ============================================================================
+
+; ovl_fits — edi = window xid. eax = 1 when the spare layer can show it:
+; top-level, mapped, opaque, wholly on the panel, no child of its own drawn,
+; nothing stacked over any part of it, not beaming in, and ds_panel_free.
+; Its place goes to ovl_geo.
+ovl_fits:
+    xor eax, eax
+    cmp byte [cfg_direct], 2
+    jne .of_ret
+    cmp byte [ovl_off], 0
+    jne .of_ret
+    cmp [beam_win], edi                      ; frame draws its beam
+    je .of_ret
+    call ds_panel_free
+    test eax, eax
+    jz .of_ret
+    cmp byte [ovl_inited], 0
+    je .of_init
+    mov eax, [drm_chosen_crtc]
+    cmp eax, [ovl_crtc]
+    je .of_planes
+.of_init:
+    push rdi
+    call ovl_init
+    pop rdi
+.of_planes:
+    xor eax, eax
+    cmp dword [ovl_plane], 0
+    je .of_ret
+    push rdi
+    call window_lookup
+    pop rdi
+    test rax, rax
+    jz .of_no
+    mov rsi, rax
+    cmp byte [rsi + 28], 1                   ; mapped
+    jne .of_no
+    cmp dword [rsi + 4], X_ROOT_WINDOW       ; top-level
+    jne .of_no
+    movsx eax, word [rsi + 8]                ; x, y: where its content starts
+    movsx edx, word [rsi + 10]
+    movzx ecx, word [rsi + 12]
+    movzx r8d, word [rsi + 14]
+    test eax, eax
+    js .of_no
+    test edx, edx
+    js .of_no
+    test ecx, ecx
+    jz .of_no
+    test r8d, r8d
+    jz .of_no
+    lea r9d, [rax + rcx]
+    cmp r9d, [screen_w]
+    ja .of_no
+    lea r9d, [rdx + r8]
+    cmp r9d, [screen_h]
+    ja .of_no
+    mov [ovl_geo], ax
+    mov [ovl_geo + 2], dx
+    mov [ovl_geo + 4], cx
+    mov [ovl_geo + 6], r8w
+    cmp byte [rsi + 18], 24                  ; opaque, or its opaque region
+    je .of_stack                             ; covers it whole
+    mov rax, rsi
+    lea rdx, [windows]
+    sub rax, rdx
+    shr eax, 6                               ; slot (WINDOW_REC_SIZE = 64)
+    mov eax, [win_opq + rax*4]
+    cmp eax, [rsi + 12]
+    jne .of_no
+.of_stack:
+    ; No mapped child of its own, and no mapped top-level stacked higher
+    ; whose outer edge (border included) reaches into its place.
+    ; InputOnly windows draw nothing and do not count.
+    mov r8d, [rsi + 48]                      ; its stk
+    xor ecx, ecx
+.of_loop:
+    cmp ecx, MAX_WINDOWS
+    jae .of_yes
+    mov eax, ecx
+    shl eax, 6
+    lea rax, [windows + rax]
+    mov edx, [rax]
+    test edx, edx
+    jz .of_next
+    cmp edx, edi
+    je .of_next
+    cmp byte [rax + 28], 1
+    jne .of_next
+    cmp byte [rax + 19], 2                   ; InputOnly
+    je .of_next
+    mov edx, [rax + 4]
+    cmp edx, edi
+    je .of_no                                ; its own child draws on top
+    cmp edx, X_ROOT_WINDOW
+    jne .of_next
+    cmp [rax + 48], r8d
+    jbe .of_next                             ; below it
+    movzx r11d, word [rax + 16]              ; border
+    movsx r9d, word [rax + 8]
+    sub r9d, r11d                            ; its left edge
+    movzx edx, word [ovl_geo]
+    movzx r10d, word [ovl_geo + 4]
+    add r10d, edx                            ; our right edge
+    cmp r9d, r10d
+    jge .of_next
+    movzx r10d, word [rax + 12]
+    add r9d, r10d
+    lea r9d, [r9 + r11*2]                    ; its right edge
+    cmp r9d, edx
+    jle .of_next
+    movsx r9d, word [rax + 10]
+    sub r9d, r11d                            ; its top
+    movzx edx, word [ovl_geo + 2]
+    movzx r10d, word [ovl_geo + 6]
+    add r10d, edx                            ; our bottom
+    cmp r9d, r10d
+    jge .of_next
+    movzx r10d, word [rax + 14]
+    add r9d, r10d
+    lea r9d, [r9 + r11*2]                    ; its bottom
+    cmp r9d, edx
+    jg .of_no                                ; it covers part of ours
+.of_next:
+    inc ecx
+    jmp .of_loop
+.of_yes:
+    mov eax, 1
+    ret
+.of_no:
+    xor eax, eax
+.of_ret:
+    ret
+
+; ovl_init — finds frame's own layer and one spare layer on frame's screen
+; controller, once per controller. ovl_plane = 0: none to use.
+ovl_init:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov byte [ovl_inited], 1
+    mov eax, [drm_chosen_crtc]
+    mov [ovl_crtc], eax
+    xor eax, eax
+    mov [ovl_plane], eax
+    mov [ovl_primary], eax
+    cmp byte [fbtest_mode], 0
+    je .oi_drm
+    mov dword [ovl_plane], 1                 ; --fbtest: no DRM, stand-in ids
+    mov dword [ovl_primary], 2
+    jmp .oi_log
+.oi_drm:
+    mov eax, [drm_chosen_crtc]               ; its bit in possible_crtcs
+    xor r15d, r15d
+.oi_idx:
+    cmp r15d, DRM_MAX_IDS
+    jae .oi_done
+    cmp [drm_crtc_ids + r15*4], eax
+    je .oi_cap
+    inc r15d
+    jmp .oi_idx
+.oi_cap:
+    mov qword [ovl_res], DRM_CLIENT_CAP_ATOMIC
+    mov qword [ovl_res + 8], 1
+    mov eax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_SET_CLIENT_CAP
+    lea rdx, [ovl_res]
+    syscall
+    test rax, rax
+    jnz .oi_done
+    lea rax, [ovl_plane_ids]
+    mov [ovl_res], rax
+    mov qword [ovl_res + 8], OVL_MAX_PLANES
+    mov eax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_GETPLANERESOURCES
+    lea rdx, [ovl_res]
+    syscall
+    test rax, rax
+    jnz .oi_done
+    mov r12d, [ovl_res + 8]
+    cmp r12d, OVL_MAX_PLANES
+    jbe .oi_count
+    mov r12d, OVL_MAX_PLANES
+.oi_count:
+    xor ebx, ebx
+.oi_plane:
+    cmp ebx, r12d
+    jae .oi_done
+    mov r13d, [ovl_plane_ids + rbx*4]
+    lea rdi, [ovl_getplane]
+    xor eax, eax
+    mov ecx, 4
+    rep stosq
+    mov [ovl_getplane], r13d
+    mov eax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_GETPLANE
+    lea rdx, [ovl_getplane]
+    syscall
+    test rax, rax
+    jnz .oi_next
+    mov eax, [ovl_getplane + 12]             ; possible_crtcs
+    bt eax, r15d
+    jnc .oi_next
+    lea rax, [ovl_prop_ids]
+    mov [ovl_objprops], rax
+    lea rax, [ovl_prop_vals]
+    mov [ovl_objprops + 8], rax
+    mov dword [ovl_objprops + 16], OVL_MAX_PROPS
+    mov [ovl_objprops + 20], r13d
+    mov dword [ovl_objprops + 24], DRM_MODE_OBJECT_PLANE
+    mov dword [ovl_objprops + 28], 0
+    mov eax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_OBJ_GETPROPERTIES
+    lea rdx, [ovl_objprops]
+    syscall
+    test rax, rax
+    jnz .oi_next
+    mov r14d, [ovl_objprops + 16]
+    cmp r14d, OVL_MAX_PROPS
+    jbe .oi_props
+    mov r14d, OVL_MAX_PROPS
+.oi_props:
+    lea rdi, [ovl_found]
+    xor eax, eax
+    mov ecx, OVL_PROPS + 1
+    rep stosd
+    mov dword [ovl_ptype], -1
+    xor ebp, ebp
+.oi_prop:
+    cmp ebp, r14d
+    jae .oi_sort
+    lea rdi, [ovl_getprop]
+    xor eax, eax
+    mov ecx, 8
+    rep stosq
+    mov eax, [ovl_prop_ids + rbp*4]
+    mov [ovl_getprop + 16], eax
+    mov eax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_GETPROPERTY
+    lea rdx, [ovl_getprop]
+    syscall
+    test rax, rax
+    jnz .oi_prop_next
+    mov rax, [ovl_getprop + 24]              ; the name's first 8 bytes
+    xor edx, edx
+.oi_name:
+    cmp edx, OVL_PROPS + 1
+    jae .oi_prop_next
+    cmp rax, [ovl_names + rdx*8]
+    je .oi_hit
+    inc edx
+    jmp .oi_name
+.oi_hit:
+    mov ecx, [ovl_prop_ids + rbp*4]
+    mov [ovl_found + rdx*4], ecx
+    cmp edx, OVL_PROPS                       ; 'type': 0 spare, 1 frame's own
+    jne .oi_prop_next
+    mov rax, [ovl_prop_vals + rbp*8]
+    mov [ovl_ptype], eax
+.oi_prop_next:
+    inc ebp
+    jmp .oi_prop
+.oi_sort:
+    cmp dword [ovl_ptype], 1
+    jne .oi_spare
+    cmp dword [ovl_primary], 0
+    jne .oi_next
+    mov eax, [ovl_found]                     ; FB_ID
+    test eax, eax
+    jz .oi_next
+    mov [ovl_primary], r13d
+    mov [ovl_pfb_prop], eax
+    jmp .oi_next
+.oi_spare:
+    cmp dword [ovl_ptype], 0
+    jne .oi_next
+    cmp dword [ovl_plane], 0
+    jne .oi_next
+    xor edx, edx                             ; all ten properties there?
+.oi_all:
+    cmp edx, OVL_PROPS
+    jae .oi_take
+    cmp dword [ovl_found + rdx*4], 0
+    je .oi_next
+    inc edx
+    jmp .oi_all
+.oi_take:
+    mov [ovl_plane], r13d
+    lea rsi, [ovl_found]
+    lea rdi, [ovl_props]
+    mov ecx, OVL_PROPS
+    rep movsd
+.oi_next:
+    inc ebx
+    jmp .oi_plane
+.oi_done:
+    cmp dword [ovl_primary], 0               ; both, or none
+    jne .oi_log
+    mov dword [ovl_plane], 0
+.oi_log:
+    call log_stamp
+    lea rsi, [log_ovl_plane]
+    call write_str_stderr
+    mov eax, [ovl_plane]
+    call write_u64_stderr
+    lea rsi, [probe_conn_nl]
+    mov edx, 1
+    call write_stderr
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ovl_prepare — recomposite_screen asks first while ds_win is on the spare
+; layer (no flip is in flight then). eax = 1: done, the layer alone
+; changed; 0: composite as usual, and .rs_present sends a layer change in
+; the same commit.
+ovl_prepare:
+    cmp byte [ds_leave_req], 0
+    jne .op_leave                            ; its own buffer is newer already
+    mov edi, [ds_win]
+    call ovl_fits
+    test eax, eax
+    jz .op_materialize
+    mov edi, [ds_next]
+    test edi, edi
+    jnz .op_new
+    cmp byte [ovl_on], 0                     ; no new frame: the layer keeps
+    je .op_frame                             ; its picture, if still in place
+    mov rax, [ovl_geo]
+    cmp rax, [ovl_cgeo]
+    jne .op_materialize                      ; moved: composited until its next frame
+.op_frame:
+    xor eax, eax
+    ret
+.op_new:
+    call pixmap_lookup
+    test rax, rax
+    jz .op_materialize
+    movzx ecx, word [rax + 4]                ; it covers the window's place
+    cmp cx, [ovl_geo + 4]
+    jb .op_materialize
+    movzx ecx, word [rax + 6]
+    cmp cx, [ovl_geo + 6]
+    jb .op_materialize
+    mov byte [ovl_pending], 1
+    mov eax, [dmg_count0]                    ; frame's back buffer changes too:
+    cmp dword [comp_back], 0                 ; one commit after the composite
+    je .op_count
+    mov eax, [dmg_count1]
+.op_count:
+    test eax, eax
+    jnz .op_frame
+    xor edi, edi                             ; the layer alone
+    call ovl_flush
+    test rax, rax
+    jnz .op_done                             ; refused: composited next pass
+    cmp byte [fbtest_mode], 0
+    jne .op_landed
+    cmp byte [drm_poll_dead], 0
+    jne .op_landed
+    mov byte [flip_pending], 1
+    jmp .op_done
+.op_landed:
+    call ds_landed                           ; no completion event will come
+    cmp byte [fbtest_mode], 0
+    je .op_done
+    call ds_paint_front                      ; --fbtest: the dump shows the layer
+.op_done:
+    mov eax, 1
+    ret
+.op_materialize:
+    mov edx, [ds_next]                       ; its newest frame goes into its
+    test edx, edx                            ; own buffer, where compositing
+    jnz .op_mat                              ; reads it
+    mov edx, [ds_front]
+    test edx, edx
+    jz .op_leave
+.op_mat:
+    mov esi, [ds_win]
+    xor ecx, ecx
+    xor r8d, r8d
+    call present_copy
+.op_leave:
+    cmp byte [ovl_on], 0                     ; the layer goes dark with the
+    je .op_gone                              ; next commit, and what frame
+    movzx eax, word [ovl_cgeo]               ; has under it repaints
+    movzx edx, word [ovl_cgeo + 2]
+    movzx ecx, word [ovl_cgeo + 4]
+    movzx r8d, word [ovl_cgeo + 6]
+    call damage_add
+    mov byte [ovl_pending], 1
+.op_gone:
+    lea rdi, [ds_next]
+    call ds_release
+    lea rdi, [ds_old]                        ; (empty: no flip is in flight)
+    lea rsi, [ds_front]
+    call ds_move
+    mov dword [ds_win], 0
+    mov byte [ds_ovl], 0
+    mov byte [ds_leave_req], 0
+    xor eax, eax
+    ret
+
+; ovl_flush — edi = frame's buffer to flip to as well (0: the layer alone).
+; One atomic commit: the spare layer shows ds_next at ovl_geo, or goes dark
+; once ds_win has left it. rax = the kernel's answer; 0 = done, and a flip
+; event follows.
+ovl_flush:
+    push rbx
+    mov byte [ovl_pending], 0
+    xor ebx, ebx                             ; objects before the layer
+    test edi, edi
+    jz .ofl_layer
+    mov eax, [ovl_primary]
+    mov [ovl_objs], eax
+    mov dword [ovl_cnts], 1
+    mov eax, [ovl_pfb_prop]
+    mov [ovl_ids], eax
+    mov eax, edi
+    mov [ovl_vals], rax
+    mov ebx, 1
+.ofl_layer:
+    mov eax, [ovl_plane]
+    mov [ovl_objs + rbx*4], eax
+    lea rdi, [ovl_ids + rbx*4]
+    lea rsi, [ovl_props]
+    mov ecx, OVL_PROPS
+    rep movsd
+    lea rdi, [ovl_vals + rbx*8]
+    xor eax, eax
+    mov ecx, OVL_PROPS
+    rep stosq                                ; FB_ID = CRTC_ID = 0: dark
+    lea rdi, [ovl_vals + rbx*8]
+    mov dword [ovl_cnts + rbx*4], 2
+    cmp dword [ds_win], 0
+    je .ofl_go
+    mov dword [ovl_cnts + rbx*4], OVL_PROPS
+    mov eax, [ds_next + 20]
+    mov [rdi], rax                           ; FB_ID
+    mov eax, [drm_chosen_crtc]
+    mov [rdi + 8], rax                       ; CRTC_ID; SRC_X = SRC_Y = 0
+    movzx eax, word [ovl_geo + 4]
+    mov [rdi + 64], rax                      ; CRTC_W
+    shl rax, 16
+    mov [rdi + 32], rax                      ; SRC_W, 16.16 fixed point
+    movzx eax, word [ovl_geo + 6]
+    mov [rdi + 72], rax                      ; CRTC_H
+    shl rax, 16
+    mov [rdi + 40], rax                      ; SRC_H
+    movzx eax, word [ovl_geo]
+    mov [rdi + 48], rax                      ; CRTC_X
+    movzx eax, word [ovl_geo + 2]
+    mov [rdi + 56], rax                      ; CRTC_Y
+.ofl_go:
+    lea esi, [rbx + 1]
+    mov edi, DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT
+    call ovl_atomic_go
+    test rax, rax
+    jnz .ofl_refused
+    inc qword [ovl_flips]
+    cmp dword [ds_win], 0
+    je .ofl_dark
+    mov byte [ovl_on], 1
+    mov rax, [ovl_geo]
+    mov [ovl_cgeo], rax
+    lea rdi, [ds_old]                        ; the buffer on the layer leaves
+    lea rsi, [ds_front]                      ; it when this flip lands
+    call ds_move
+    lea rdi, [ds_front]
+    lea rsi, [ds_next]
+    call ds_move
+    jmp .ofl_ok
+.ofl_dark:
+    mov byte [ovl_on], 0
+.ofl_ok:
+    xor eax, eax
+    pop rbx
+    ret
+.ofl_refused:
+    push rax
+    cmp byte [ovl_off], 0                    ; say so once, and stop trying
+    jne .ofl_quiet                           ; until frame restarts
+    mov byte [ovl_off], 1
+    call log_stamp
+    lea rsi, [log_ovl_refused]
+    call write_str_stderr
+    mov rax, [rsp]
+    call write_i64_stderr
+    lea rsi, [probe_conn_nl]
+    mov edx, 1
+    call write_stderr
+.ofl_quiet:
+    cmp dword [ds_win], 0                    ; going dark failed: wait for it
+    jne .ofl_again
+    call ovl_hide_now
+.ofl_again:
+    mov byte [comp_dirty], 1                 ; the next composite takes the
+    pop rax                                  ; window off the layer
+    pop rbx
+    ret
+
+; ovl_atomic_go — edi = flags, esi = objects. Sends the commit laid out in
+; ovl_objs, ovl_cnts, ovl_ids and ovl_vals. rax = the kernel's answer
+; (--fbtest: 0, nothing sent).
+ovl_atomic_go:
+    xor eax, eax
+    cmp byte [fbtest_mode], 0
+    jne .oag_ret
+    mov [ovl_atomic], edi
+    mov [ovl_atomic + 4], esi
+    lea rax, [ovl_objs]
+    mov [ovl_atomic + 8], rax
+    lea rax, [ovl_cnts]
+    mov [ovl_atomic + 16], rax
+    lea rax, [ovl_ids]
+    mov [ovl_atomic + 24], rax
+    lea rax, [ovl_vals]
+    mov [ovl_atomic + 32], rax
+    mov eax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_ATOMIC
+    lea rdx, [ovl_atomic]
+    syscall
+.oag_ret:
+    ret
+
+; ovl_hide_now — the spare layer goes dark before this returns (a blocking
+; commit), for when the panel goes off, to the console or changes size.
+ovl_hide_now:
+    cmp byte [ovl_on], 0
+    je .ohn_ret
+    mov byte [ovl_on], 0
+    mov byte [ovl_pending], 0
+    inc qword [ovl_flips]
+    mov eax, [ovl_plane]
+    mov [ovl_objs], eax
+    mov dword [ovl_cnts], 2
+    mov eax, [ovl_props]                     ; FB_ID
+    mov [ovl_ids], eax
+    mov eax, [ovl_props + 4]                 ; CRTC_ID
+    mov [ovl_ids + 4], eax
+    xor eax, eax
+    mov [ovl_vals], rax
+    mov [ovl_vals + 8], rax
+    xor edi, edi                             ; no flags: blocking
+    mov esi, 1
+    call ovl_atomic_go
+.ohn_ret:
+    ret
+
+; ds_paint_front — the client buffer on the panel (ds_front) goes into
+; frame's front buffer where the panel shows it, so a read of the root
+; window (a screenshot, a --fbtest dump) sees it. The panel never shows
+; that part of frame's buffer meanwhile; it is repainted whole before it
+; is shown again.
+ds_paint_front:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov edi, [ds_front]
+    test edi, edi
+    jz .dpf_ret
+    call pixmap_lookup
+    test rax, rax
+    jz .dpf_ret
+    mov rbx, rax
+    xor r14d, r14d                           ; x, y, w, h: the whole panel,
+    xor r15d, r15d                           ; or the spare layer's place
+    mov r12d, [screen_w]
+    mov r13d, [screen_h]
+    cmp byte [ds_ovl], 0
+    je .dpf_place
+    movzx r14d, word [ovl_cgeo]
+    movzx r15d, word [ovl_cgeo + 2]
+    movzx r12d, word [ovl_cgeo + 4]
+    movzx r13d, word [ovl_cgeo + 6]
+.dpf_place:
+    mov rax, rbx
+    lea rcx, [pixmaps]
+    sub rax, rcx
+    xor edx, edx
+    mov ecx, PIXMAP_REC_SIZE
+    div rcx
+    lea rax, [rax + rax*2]
+    lea rbp, [px_dma + rax*8]
+    mov qword [dma_sync], DMA_BUF_SYNC_READ
+    mov edi, [rbp + 16]
+    mov esi, DMA_BUF_IOCTL_SYNC
+    lea rdx, [dma_sync]
+    mov eax, SYS_IOCTL
+    syscall
+    mov rdi, rbx
+    mov esi, r12d
+    mov edx, r13d
+    call dma_flush_rows
+    mov eax, [comp_back]
+    xor eax, 1
+    mov rdi, [comp_addr + rax*8]
+    mov eax, r15d
+    imul eax, [drm_dumb_pitch]
+    add rdi, rax
+    lea rdi, [rdi + r14*4]
+    mov rsi, [rbx + 16]
+    mov r8d, r13d
+.dpf_row:
+    push rdi
+    push rsi
+    mov ecx, r12d
+    rep movsd
+    pop rsi
+    pop rdi
+    movzx eax, word [rbx + 4]
+    lea rsi, [rsi + rax*4]
+    mov eax, [drm_dumb_pitch]
+    add rdi, rax
+    dec r8d
+    jnz .dpf_row
+    mov qword [dma_sync], DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END
+    mov edi, [rbp + 16]
+    mov esi, DMA_BUF_IOCTL_SYNC
+    lea rdx, [dma_sync]
+    mov eax, SYS_IOCTL
+    syscall
+    cmp dword [comp_back], 0                 ; the front buffer holds the
+    jne .dpf_b0                              ; client's picture now: stale
+    mov dword [dmg_count1], -1               ; for frame
+    jmp .dpf_ret
+.dpf_b0:
+    mov dword [dmg_count0], -1
+.dpf_ret:
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; row_equal — rsi, rdi = two rows, ecx = pixels. ZF=1 when they match.

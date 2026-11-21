@@ -2,7 +2,7 @@
 
 <img src="img/frame.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.63-blue)
+![Version](https://img.shields.io/badge/version-0.1.64-blue)
 ![Phase](https://img.shields.io/badge/phase-4%2F14-yellow)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -299,7 +299,7 @@ cursor_accent = 00c800     # arrow fill over pressable items, RRGGBB (default gr
 background = ~/.framebg    # desktop wallpaper: a raw BGRX file at panel res
 blank_timeout = 600        # idle seconds before the panel powers off (0 = never)
 blank_key = Mod4+Escape    # hotkey that powers the panel off NOW (none = off)
-direct_scanout = 1         # full-panel GL windows go to the panel uncopied (default 0)
+direct_scanout = 1         # GL windows go to the panel uncopied: 1 full panel, 2 tiles too (default 0)
 ```
 
 `keymap`: `us` (the default, or no file) is the standard US layout. `no`
@@ -397,8 +397,14 @@ On the scratch display a 60 fps video took frame from 22-27% of a core to
 under 1%. A popup, a resize or the panel going dark puts the newest frame
 into the window once, and compositing takes over again.
 
-Limits: one active output only, and a root screenshot meanwhile shows the
-last composited frame. Default `0` while it is new.
+`direct_scanout = 2` does the same for a GL window that does not fill the
+panel, such as a browser in a tile. Its buffers go on a spare layer of the
+panel (a DRM overlay plane) at the window's place. That needs the window
+fully on screen, opaque, and with nothing over it. A popup over it puts it
+back into compositing until the popup goes. If the panel refuses the layer,
+frame logs it once and composites as before until it restarts.
+
+Limits: one active output only. Default `0` while it is new.
 
 `background`: a desktop wallpaper, drawn natively by the compositor (no feh,
 no root-pixmap). frame carries no image decoder, so the value points at a

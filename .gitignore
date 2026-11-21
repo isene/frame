@@ -18,6 +18,7 @@ pkgroot/
 !/test/fill-over.c
 !/test/print-grab.c
 !/test/dri3-copy.c
+!/test/layer.c
 !/test/overview.c
 !/test/held-key.c
 !/test/id-reuse.c
