@@ -404,7 +404,10 @@ fully on screen, opaque, and with nothing over it. A popup over it puts it
 back into compositing until the popup goes. If the panel refuses the layer,
 frame logs it once and composites as before until it restarts.
 
-Limits: one active output only. Default `0` while it is new.
+Limits: one active output only. Default `0` while it is new. A GTK 4
+program shown this way can keep an old band in its window, since GTK
+redraws only what it thinks changed: start it with `GSK_DEBUG=full-redraw`
+(gaze does that itself).
 
 `background`: a desktop wallpaper, drawn natively by the compositor (no feh,
 no root-pixmap). frame carries no image decoder, so the value points at a
