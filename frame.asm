@@ -2176,7 +2176,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.64", 10
+version_str:        db "frame 0.1.65", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -7058,6 +7058,10 @@ handle_shm_get_image:
     mov byte [comp_dirty], 0
     call recomposite_screen
 .sgi_root_fresh:
+    cmp dword [ds_front], 0                  ; a client buffer on the panel:
+    je .sgi_root_read                        ; its picture goes in first
+    call ds_paint_front
+.sgi_root_read:
     mov eax, [comp_back]
     xor eax, 1
     mov r13, [comp_addr + rax*8]             ; FRONT buffer
@@ -20708,11 +20712,6 @@ recomposite_screen:
     mov eax, [comp_back]                     ; back to its client
     xor eax, 1                               ; swap: submitted buffer is the
     mov [comp_back], eax                     ; new front; render the other next
-    cmp byte [fbtest_mode], 0                ; --fbtest has no spare layer:
-    je .rs_done_pop                          ; its picture goes into the dump
-    cmp byte [ovl_on], 0
-    je .rs_done_pop
-    call ds_paint_front
     jmp .rs_done_pop
 .rs_atomic:
     mov ebx, [comp_back]                     ; (the second output's flip reads rbx)
@@ -30540,6 +30539,10 @@ dump_handler:
     lea rsi, [probe_conn_nl]
     mov edx, 1
     call write_stderr
+    cmp dword [ds_front], 0                   ; the dump shows a client buffer
+    je .dump_fb0                              ; on the panel too
+    call ds_paint_front
+.dump_fb0:
     mov rax, SYS_OPEN                         ; fb0
     lea rdi, [dump_fb0_path]
     mov esi, 0x241
@@ -33134,9 +33137,6 @@ ovl_prepare:
     jmp .op_done
 .op_landed:
     call ds_landed                           ; no completion event will come
-    cmp byte [fbtest_mode], 0
-    je .op_done
-    call ds_paint_front                      ; --fbtest: the dump shows the layer
 .op_done:
     mov eax, 1
     ret

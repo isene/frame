@@ -36,7 +36,7 @@ gcc -O1 -o "$T/regrab" "$here/regrab.c" -lX11 || exit 1
 gcc -O1 -o "$T/fill-over" "$here/fill-over.c" -lXrender -lX11 || exit 1
 gcc -O1 -o "$T/print-grab" "$here/print-grab.c" -lX11 || exit 1
 gcc -O1 -o "$T/dri3-copy" "$here/dri3-copy.c" -lxcb -l:libxcb-dri3.so.0 || exit 1
-gcc -O1 -o "$T/layer" "$here/layer.c" -lxcb -l:libxcb-dri3.so.0 -l:libxcb-present.so.0 || exit 1
+gcc -O1 -o "$T/layer" "$here/layer.c" -lxcb -l:libxcb-dri3.so.0 -l:libxcb-present.so.0 -l:libxcb-shm.so.0 || exit 1
 mkfifo "$T/pad"
 printf 'keymap = no\ndirect_scanout = 2\n' > "$T/home/.framerc"   # caps-lock types AltGr+e = euro sign
 
@@ -191,7 +191,7 @@ is "Print goes to the WM's bind, other keys to the popup" \
 # With direct_scanout = 2 the panel shows the GL buffer on a spare layer.
 echo "== v0.1.64: a GL window in a tile goes on a spare layer of the panel"
 is "a screenshot sees the layer, then the newest frame under a popup" \
-   "$("$T/layer")" "layer 00ff00, left ffff00 under ff0000"
+   "$("$T/layer")" "layer 00ff00 shm 00ff00, left ffff00 under ff0000"
 kill -USR1 $FPID; sleep 0.3
 is "the layer showed the window, then went dark for the popup" \
    "$(grep -a FBSTATE "$T/frame.log" | tail -1 | sed -n 's/.* ovl=\([0-9]*\).*/\1/p')" 2

@@ -8,7 +8,10 @@
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 #include <xcb/xcb.h>
+#include <xcb/shm.h>
 
 xcb_void_cookie_t xcb_dri3_pixmap_from_buffer_checked(
     xcb_connection_t *c, xcb_pixmap_t pixmap, xcb_drawable_t drawable,
@@ -61,6 +64,22 @@ static uint32_t pixel(xcb_connection_t *c, xcb_window_t root, int x, int y)
     return v;
 }
 
+static uint32_t shm_pixel(xcb_connection_t *c, xcb_window_t root, int x, int y)
+{                                       // scrot (imlib2) reads the screen this way
+    int id = shmget(IPC_PRIVATE, 4, IPC_CREAT | 0600);
+    uint32_t *px = shmat(id, NULL, 0);
+    shmctl(id, IPC_RMID, NULL);
+    xcb_shm_seg_t seg = xcb_generate_id(c);
+    xcb_shm_attach(c, seg, id, 0);
+    xcb_shm_get_image_reply_t *r = xcb_shm_get_image_reply(c,
+        xcb_shm_get_image(c, root, x, y, 1, 1, ~0u, XCB_IMAGE_FORMAT_Z_PIXMAP, seg, 0), NULL);
+    uint32_t v = r ? *px & 0xffffff : 0xdead;
+    free(r);
+    xcb_shm_detach(c, seg);
+    shmdt(px);
+    return v;
+}
+
 int main(void)
 {
     xcb_connection_t *c = xcb_connect(NULL, NULL);
@@ -80,7 +99,8 @@ int main(void)
     xcb_present_pixmap(c, win, buffer(c, win, 0x00ff00), 1, 0, 0, 0, 0,
                        0, 0, 0, 0, 0, 0, 0, 0, NULL);
     settle(c);
-    uint32_t on_layer = pixel(c, s->root, X + 10, Y + 10);
+    uint32_t on_layer_shm = shm_pixel(c, s->root, X + 10, Y + 10);   // first:
+    uint32_t on_layer = pixel(c, s->root, X + 10, Y + 10);  // a read paints the layer in
 
     uint32_t over = 1;                       // override-redirect
     xcb_window_t pop = xcb_generate_id(c);
@@ -99,6 +119,6 @@ int main(void)
     settle(c);
     uint32_t left = pixel(c, s->root, X + 10, Y + 10);
     uint32_t popup = pixel(c, s->root, X + 45, Y + 5);
-    printf("layer %06x, left %06x under %06x\n", on_layer, left, popup);
+    printf("layer %06x shm %06x, left %06x under %06x\n", on_layer, on_layer_shm, left, popup);
     return 0;
 }
