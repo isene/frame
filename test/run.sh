@@ -36,6 +36,7 @@ gcc -O1 -o "$T/regrab" "$here/regrab.c" -lX11 || exit 1
 gcc -O1 -o "$T/fill-over" "$here/fill-over.c" -lXrender -lX11 || exit 1
 gcc -O1 -o "$T/print-grab" "$here/print-grab.c" -lX11 || exit 1
 gcc -O1 -o "$T/dri3-copy" "$here/dri3-copy.c" -lxcb -l:libxcb-dri3.so.0 || exit 1
+gcc -O1 -o "$T/close-flash" "$here/close-flash.c" -lX11 || exit 1
 gcc -O1 -o "$T/layer" "$here/layer.c" -lxcb -l:libxcb-dri3.so.0 -l:libxcb-present.so.0 -l:libxcb-shm.so.0 || exit 1
 mkfifo "$T/pad"
 printf 'keymap = no\ndirect_scanout = 2\n' > "$T/home/.framerc"   # caps-lock types AltGr+e = euro sign
@@ -195,6 +196,13 @@ is "a screenshot sees the layer, then the newest frame under a popup" \
 kill -USR1 $FPID; sleep 0.3
 is "the layer showed the window, then went dark for the popup" \
    "$(grep -a FBSTATE "$T/frame.log" | tail -1 | sed -n 's/.* ovl=\([0-9]*\).*/\1/p')" 2
+
+# nsxiv destroys its window and hangs up; tile then shows the terminal
+# under it. frame painted between the two, so the wallpaper flashed.
+echo "== v0.1.66: closing an app goes straight to the next tab"
+is "one paint, and it shows the terminal" \
+   "$("$T/close-flash" $FPID "$T/frame.log")" "paints 1, then 00ff00"
+rm -f /tmp/frame${D}_*.raw
 
 # Mesa copies a GL window into a buffer it handed frame through DRI3 (a
 # front buffer). frame had mapped that buffer read-only, so the copy crashed

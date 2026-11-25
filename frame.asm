@@ -1239,12 +1239,12 @@ compositor_active:    resb 1               ; set to 1 after init_compositor wins
 comp_dirty:           resb 1               ; a draw happened; repaint once per
                                            ; serve-loop cycle (coalesced) instead
                                            ; of a full repaint + page-flip per req
-defer_bg_composite:   resb 1               ; a WM-managed toplevel was just
-                                           ; removed: hold the next composite ONE
-                                           ; cycle so the WM's replacement map
-                                           ; lands in the same paint (no bg
-                                           ; flash between tabbed apps). 16ms
-                                           ; poll fallback if nothing replaces it.
+defer_bg_composite:   resb 1               ; a window just left the screen:
+                                           ; hold the composite until a toplevel
+                                           ; maps or defer_until passes, so the
+                                           ; WM's next tab lands in the same
+                                           ; paint (no wallpaper flash)
+defer_until:          resq 1               ; monotonic ms; see bg_grace
 dirtyfb_logged:       resb 1               ; log DIRTYFB return code only once
 sig_sa_buf:           resb 32              ; kernel struct sigaction
 
@@ -2176,7 +2176,7 @@ input_watch_pre:    db "frame: watching ", 0
 input_watch_pre_len equ $ - input_watch_pre - 1
 input_watch_usage:  db "usage: frame --watch-input /dev/input/eventN", 10
 input_watch_usage_len equ $ - input_watch_usage
-version_str:        db "frame 0.1.65", 10
+version_str:        db "frame 0.1.66", 10
 version_str_len     equ $ - version_str
 usage_str:          db "usage: frame [N] [--display] [--fbtest|--fbtest2] [--noinput]", 10
                     db "             [--testinput FIFO] [--probe] [--probe-input]", 10
@@ -5020,9 +5020,8 @@ client_cleanup_resources:
     je .ccr_win_unmapped
     mov byte [r15 + 28], 0
     mov byte [comp_dirty], 1
-    mov byte [defer_bg_composite], 1         ; app closed → hold one cycle so the
-                                             ; WM's next-tab map paints in the
-                                             ; same frame (no wallpaper flash)
+    call bg_grace                            ; app closed → wait for the WM's
+                                             ; next-tab map (no wallpaper flash)
     mov rdi, r15
     call damage_add_window
     mov rdi, r15
@@ -5552,11 +5551,11 @@ serve_loop:
     mov edx, -1                              ; infinite timeout when idle (no
     cmp byte [flip_pending], 0               ; wakeups → battery). But while a
     jne .sl_poll_flip                        ; PAGE_FLIP is in flight, cap at
-    cmp byte [comp_dirty], 0                 ; 100ms; and after a one-cycle bg
-    je .sl_chk_blank                         ; defer (comp_dirty held, no flip),
-    mov edx, 16                              ; wake in 16ms so the fallback
-    jmp .sl_poll_go                          ; bg-repaint still happens if the WM
-.sl_poll_flip:                               ; never maps a replacement.
+    cmp byte [comp_dirty], 0                 ; 100ms; and while a closed window
+    je .sl_chk_blank                         ; waits for its replacement (bg_grace,
+    mov edx, 16                              ; comp_dirty held, no flip), wake in
+    jmp .sl_poll_go                          ; 16ms so the repaint still happens if
+.sl_poll_flip:                               ; the WM never maps one.
     mov edx, 100                             ; a DRM completion event that never
     jmp .sl_poll_go                          ; arrives would otherwise wedge
 .sl_chk_blank:                               ; flip_pending forever = black screen.
@@ -5832,11 +5831,13 @@ serve_loop:
 .sl_blank_ok:                                ; wakeups forever. Unblank forces a
     cmp byte [flip_pending], 0               ; full repaint anyway.
     jne .sl_iter
-    cmp byte [defer_bg_composite], 0         ; a toplevel was just removed?
-    je .sl_do_composite
-    mov byte [defer_bg_composite], 0         ; consume the one-cycle grace: leave
-    jmp .sl_iter                             ; comp_dirty set, composite next time
-.sl_do_composite:                            ; (poll now uses a 16ms fallback)
+    cmp byte [defer_bg_composite], 0         ; a window just closed: wait for
+    je .sl_do_composite                      ; the WM to map the next one, or
+    call now_mono_ms                         ; for the deadline (the poll wakes
+    cmp rax, [defer_until]                   ; every 16 ms while comp_dirty is
+    jl .sl_iter                              ; set)
+    mov byte [defer_bg_composite], 0
+.sl_do_composite:
     cmp dword [beam_win], 0                  ; a window beaming in: its next
     je .sl_comp_now                          ; frame
     call beam_tick
@@ -11978,6 +11979,9 @@ handle_destroy_window:
     mov dword [active_kbd_window], 0
     mov byte [kbd_grab_xi2], 0
 .hd_nokbd:
+    mov rdi, r13                             ; an app closing its own window:
+    mov esi, ebx                             ; wait for the WM's next tab
+    call close_grace
     ; If the window is still MAPPED, send its own UnmapNotify first — Xorg
     ; unmaps before destroy, and GTK's map/unmap freeze/thaw needs the pair.
     cmp byte [r13 + 28], 0
@@ -12115,6 +12119,10 @@ handle_map_window:
     jmp .mw_done
 .mw_just_map:
     mov byte [r12 + 28], 1
+    cmp dword [r12 + 4], X_ROOT_WINDOW        ; a toplevel arrived: whatever
+    jne .mw_grace_ok                          ; replaces a closed window is
+    mov byte [defer_bg_composite], 0          ; here, so paint now
+.mw_grace_ok:
     ; A freshly mapped window must show its BACKGROUND immediately (X
     ; semantics) — backless windows let the wallpaper shine through until
     ; the client's first draw (bg flash on every glass launch).
@@ -12250,6 +12258,9 @@ handle_unmap_window:
     ; workspace, which is what sent the duplicates (fixed v0.1.4).
     cmp byte [r12 + 28], 0
     je .uw_done
+    mov rdi, r12                              ; an app hiding its own window:
+    mov esi, ebx                              ; wait for the WM's next tab
+    call close_grace
     mov byte [r12 + 28], 0
     mov rax, r12                              ; when, for the overview's order
     lea rcx, [windows]
@@ -21511,6 +21522,46 @@ apply_gamma:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; bg_grace — a window just left the screen, and the WM will likely show the
+; next tab in its place. Hold the composite until a toplevel maps or 16 ms
+; pass, so the wallpaper never shows for a frame in between. A one-pass hold
+; was too short: nsxiv destroys its window and then hangs up, and frame read
+; the hang-up and painted before tile's map arrived (2026-11-25).
+; Clobbers rax, rdx, rsi, rdi, r11.
+; ----------------------------------------------------------------------------
+bg_grace:
+    call now_mono_ms
+    add rax, 16
+    mov [defer_until], rax
+    mov byte [defer_bg_composite], 1
+    ret
+
+; ----------------------------------------------------------------------------
+; close_grace — rdi = record of a window about to be unmapped or destroyed,
+; esi = slot of the client asking. A mapped window whose parent belongs to a
+; WM other than the asker is an app closing its own window: start bg_grace.
+; The WM's own unmaps skip it, since its maps come in the same batch.
+; Clobbers rax, rdx, rsi, rdi, r11.
+; ----------------------------------------------------------------------------
+close_grace:
+    cmp byte [rdi + 28], 0                   ; not on screen: no hole to hide
+    je .cg_ret
+    cmp byte [rdi + 29], 0                   ; override-redirect (menus): the
+    jne .cg_ret                              ; WM puts nothing in its place
+    mov edi, [rdi + 4]                       ; parent
+    call window_lookup                       ; (keeps rsi)
+    test rax, rax
+    jz .cg_ret
+    movsx eax, byte [rax + 30]               ; the parent's WM, -1 = none
+    test eax, eax
+    js .cg_ret
+    cmp eax, esi
+    je .cg_ret
+    call bg_grace
+.cg_ret:
     ret
 
 now_mono_ms:

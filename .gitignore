@@ -23,3 +23,4 @@ pkgroot/
 !/test/held-key.c
 !/test/id-reuse.c
 !/test/regrab.c
+!/test/close-flash.c
